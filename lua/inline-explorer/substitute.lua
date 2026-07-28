@@ -1,13 +1,16 @@
 -- C inline substitution: replace a call `f(args)` with the effect of f's body,
 -- as a compilable source transform (GNU C).
 --
---   * parameters      -> `__typeof__(arg) param = (arg);` bindings (no type
---                        reconstruction needed, handles pointers/arrays/fn-ptrs)
+--   * parameters      -> bindings that reconstruct each parameter's declared
+--                        type (arrays decay to pointers, handles pointers/
+--                        fn-ptrs); falls back to `__auto_type` for exotic
+--                        declarators
 --   * single-return    -> "pretty" hoist: setup statements lifted above the call
 --     straight-line       statement, the returned expression spliced in place
 --   * anything else    -> GNU statement expression `({ ... })` with each
---                        `return E;` rewritten to `{ __ie_ret_N = E; goto end; }`
---                        and `__typeof__(first-return) __ie_ret_N;` as the slot
+--                        `return E;` rewritten to `{ __ie_retN = E; goto end; }`
+--                        and the reconstructed declared return type as
+--                        `__ie_retN`'s slot
 --   * callee labels    -> suffixed `label__ieN` (labels are function-scoped, so
 --                        inlining twice would otherwise collide)
 --   * name collisions  -> hoisted locals that clash with the caller scope are
@@ -285,6 +288,8 @@ end
 --   has_value       whether returns carry an expression
 --   simple          straight-line body with a single trailing return
 --   ret_var/end_label  injected names, unique per expansion id N
+--   binds           bound-parameter lines, populated by inline_call after the
+--                   arity check (nil in _probe results)
 local function analyze_callee(callee_src, fname, N, scope)
   local fdef, fd = find_function_def(parse(callee_src), callee_src, fname)
   if not fdef then

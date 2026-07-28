@@ -60,14 +60,16 @@ and prettier output is only chosen when the analysis proves it safe.
 
 Mechanism:
 
-- Parameters bind via `__typeof__(arg) param = (arg);` — dodges declarator
-  reconstruction and preserves call-by-value.
+- Parameters bind by reconstructing each parameter's declared type (arrays
+  decay to pointers), so a NULL/`0` argument keeps the right pointer type;
+  `__auto_type` is a fallback for exotic declarators (e.g. function pointers).
+  This preserves call-by-value.
 - Straight-line single-return functions render as a *pretty hoist* (setup lifted
   above the call statement, return expression spliced in, parenthesised).
 - Everything else renders as a GNU statement expression `({ ... })` with each
-  `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and
-  `__typeof__(first-return) __ie_retN;` as the value slot. This makes *any*
-  function inlinable as an expression, so there is no block-paste fallback.
+  `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and the
+  reconstructed declared return type as `__ie_retN`'s value slot. This makes
+  *any* function inlinable as an expression, so there is no block-paste fallback.
 - Callee labels (function-scoped) and hoisted locals that collide with the caller
   scope are suffixed `name__ieN`, keyed by a per-expansion id N, so repeated and
   nested inlining stays correct.

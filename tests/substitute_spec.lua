@@ -447,7 +447,7 @@ static int caller(int n)
 }]]
   local t3 = transform(caller_fp, callee_fp, "apply", { { N = 1 } })
   local main3 = "int main(void){ return (caller(4)==7)?0:1; }\n"
-  check("case15 function-pointer param falls back to __auto_type", t3:find("__auto_type fp =") ~= nil, t3)
+  check("case15 function-pointer param falls back to __auto_type, name kept", t3:find("__auto_type fp =") ~= nil, t3)
   check("case15 fn-pointer compiles", (compiles(callee_fp .. "\n" .. t3 .. main3, "c15c")))
   check("case15 fn-pointer runs equal", (run_ok(callee_fp .. "\n" .. t3 .. main3, "c15c")))
 end
