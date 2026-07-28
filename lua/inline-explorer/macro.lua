@@ -170,6 +170,117 @@ function M._edit_lines(workspace_edit, uri)
   return out
 end
 
+-- How long after a fetch ends a straggling applyEdit for that same macro is
+-- still swallowed rather than delegated (a slow tweak that lands after the
+-- timeout must never reach the real buffer).
+local GRACE_MS = 10000
+
+-- client.id -> { uri, pos, on_edit = fn|nil, expires = nil|uv-ms }.
+-- on_edit set   : a fetch is in flight and wants the matching edit.
+-- on_edit nil   : tombstone -- the fetch is over, swallow a late match until
+--                 `expires`, then fall through to the real handler again.
+local pending = {}
+-- client.id -> true once the persistent interceptor is installed.
+local intercepting = {}
+
+-- Is `pos` inside `range` (inclusive on both ends)?
+local function pos_in_range(pos, range)
+  if type(range) ~= "table" or type(range.start) ~= "table" or type(range["end"]) ~= "table" then
+    return false
+  end
+  local function ge(a, b)
+    if a.line ~= b.line then
+      return (a.line or 0) > (b.line or 0)
+    end
+    return (a.character or 0) >= (b.character or 0)
+  end
+  return ge(pos, range.start) and ge(range["end"], pos)
+end
+
+-- Does this WorkspaceEdit look like OUR ExpandMacro tweak's edit? True iff it
+-- touches exactly the one document `uri` (nothing else) AND at least one of its
+-- ranges contains `pos` -- i.e. it rewrites the macro invocation we asked
+-- about. Foreign edits (a rename spanning several files, another plugin's code
+-- action, an edit elsewhere in this file) fail one of the two tests and are
+-- delegated to the original handler untouched.
+function M._edit_matches(workspace_edit, uri, pos)
+  if type(workspace_edit) ~= "table" or type(uri) ~= "string" or type(pos) ~= "table" then
+    return false
+  end
+  local edits
+  if type(workspace_edit.changes) == "table" then
+    for k, v in pairs(workspace_edit.changes) do
+      if k ~= uri then
+        return false -- a second document -> not ours
+      end
+      edits = v
+    end
+  elseif type(workspace_edit.documentChanges) == "table" then
+    for _, dc in ipairs(workspace_edit.documentChanges) do
+      if type(dc) ~= "table" or type(dc.textDocument) ~= "table" or dc.textDocument.uri ~= uri then
+        return false -- a foreign uri, or a create/rename/delete op -> not ours
+      end
+      if type(dc.edits) == "table" then
+        edits = edits or {}
+        for _, e in ipairs(dc.edits) do
+          edits[#edits + 1] = e
+        end
+      end
+    end
+  end
+  if type(edits) ~= "table" then
+    return false
+  end
+  for _, e in ipairs(edits) do
+    if type(e) == "table" and pos_in_range(pos, e.range) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Install the persistent workspace/applyEdit interceptor on `client` (once).
+--
+-- It is deliberately NEVER uninstalled. The previous per-client handler is
+-- captured a single time and every applyEdit that is not a match for a pending
+-- fetch is delegated to it (or to the global handler), so the interceptor is
+-- transparent: renames, other plugins' code actions and edits elsewhere in the
+-- file all behave exactly as before, even while a fetch is in flight. Nothing
+-- is ever restored, so there is no window in which a late edit escapes to the
+-- real buffer, no foreign handler can be nil'd out by a restore, and
+-- overlapping fetches cannot leak a stale override.
+local function install_interceptor(client)
+  if intercepting[client.id] then
+    return
+  end
+  intercepting[client.id] = true
+  local prev = client.handlers["workspace/applyEdit"]
+  client.handlers["workspace/applyEdit"] = function(err, params, ctx, config)
+    local p = pending[client.id]
+    local edit = params and params.edit
+    if p and M._edit_matches(edit, p.uri, p.pos) then
+      if p.on_edit then
+        -- Active fetch: consume the edit, and never apply it anywhere.
+        local on_edit = p.on_edit
+        pending[client.id] = nil
+        on_edit(edit)
+        return { applied = true }
+      end
+      if p.expires and vim.uv.now() < p.expires then
+        -- The fetch already gave up, but this is still its edit: swallow it so
+        -- the expansion is not written into the user's real source buffer.
+        return { applied = true }
+      end
+      pending[client.id] = nil -- tombstone expired; fall through
+    end
+    local fallback = prev or vim.lsp.handlers["workspace/applyEdit"]
+    return fallback(err, params, ctx, config)
+  end
+end
+
+M._install_interceptor = install_interceptor
+M._pending = pending
+
 -- client.request became a colon-method in 0.11; 0.10 uses the dot form.
 local function client_request(client, method, params, handler, bufnr)
   if vim.fn.has("nvim-0.11") == 1 then
@@ -193,20 +304,25 @@ local function fetch_via_tweak(st, row, col, cb)
     return cb(nil)
   end
 
+  install_interceptor(client)
+
   local uri = vim.uri_from_bufnr(st.source_bufnr)
   local pos = { line = row, character = col }
 
   -- Exactly-once guard shared by the success path, every error path, and the
-  -- timeout; also restores the intercepted applyEdit handler.
+  -- timeout. Instead of removing the interception it downgrades this fetch's
+  -- pending entry to a swallow-only tombstone, so an applyEdit that arrives
+  -- after we have given up is discarded rather than written to the real file.
+  -- The identity check keeps a superseded fetch from clobbering a newer one.
   local finished = false
-  local prev_handler
+  local token
   local function finish(lines)
     if finished then
       return
     end
     finished = true
-    if prev_handler ~= nil or client.handlers["workspace/applyEdit"] ~= nil then
-      client.handlers["workspace/applyEdit"] = prev_handler
+    if token and pending[client.id] == token then
+      pending[client.id] = { uri = uri, pos = pos, on_edit = nil, expires = vim.uv.now() + GRACE_MS }
     end
     cb(lines)
   end
@@ -219,7 +335,7 @@ local function fetch_via_tweak(st, row, col, cb)
     range = { start = pos, ["end"] = pos },
     context = { diagnostics = {} },
   }
-  client_request(client, "textDocument/codeAction", ca_params, function(err, actions)
+  local ca_ok = client_request(client, "textDocument/codeAction", ca_params, function(err, actions)
     if finished then
       return
     end
@@ -231,17 +347,16 @@ local function fetch_via_tweak(st, row, col, cb)
       return finish(nil)
     end
 
-    -- Intercept the applyEdit this tweak will send back. Per-client handlers
-    -- take precedence over the global vim.lsp.handlers, so only this client's
-    -- applyEdit is diverted, and finish() restores the previous handler.
-    prev_handler = client.handlers["workspace/applyEdit"]
-    client.handlers["workspace/applyEdit"] = function(_, apply_params)
-      finish(M._edit_lines(apply_params and apply_params.edit, uri))
-      -- Tell the server the edit was applied -- it was, to our reading view.
-      return { applied = true }
-    end
+    -- Claim the applyEdit this tweak will send back. The interceptor is already
+    -- installed; this only tells it which edit is ours. A concurrent fetch on
+    -- the same client is simply superseded -- its own finish() sees a different
+    -- token and leaves ours alone.
+    token = { uri = uri, pos = pos, on_edit = function(edit)
+      finish(M._edit_lines(edit, uri))
+    end }
+    pending[client.id] = token
 
-    client_request(client, "workspace/executeCommand", {
+    local ok = client_request(client, "workspace/executeCommand", {
       command = cmd.command,
       arguments = cmd.arguments,
     }, function(cerr)
@@ -251,7 +366,13 @@ local function fetch_via_tweak(st, row, col, cb)
       -- On success the reply carries no edit; the applyEdit interception (or
       -- the timeout) is what finishes the fetch.
     end, st.source_bufnr)
+    if not ok then
+      finish(nil) -- request never went out; don't sit out the timeout
+    end
   end, st.source_bufnr)
+  if not ca_ok then
+    finish(nil)
+  end
 end
 
 -- Fetch a macro's expansion from clangd hover at (row, col). cb(lines|nil).

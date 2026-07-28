@@ -110,5 +110,92 @@ do
   check("edit: nil input tolerated", macro._edit_lines(nil, uri) == nil)
 end
 
+-- _edit_matches: does a WorkspaceEdit belong to OUR tweak (exactly one document,
+-- a range covering the fetch position) or is it a foreign edit to delegate?
+do
+  local uri = "file:///src/x.c"
+  local pos = { line = 3, character = 10 }
+  local inr = { start = { line = 3, character = 8 }, ["end"] = { line = 3, character = 12 } }
+  local outr = { start = { line = 9, character = 0 }, ["end"] = { line = 9, character = 4 } }
+
+  check("matches: single-doc changes, range covers pos", macro._edit_matches({ changes = { [uri] = { { range = inr, newText = "X" } } } }, uri, pos) == true)
+  check("matches: range does not cover pos -> false", macro._edit_matches({ changes = { [uri] = { { range = outr, newText = "X" } } } }, uri, pos) == false)
+  check("matches: two documents in changes -> false", macro._edit_matches({
+    changes = { [uri] = { { range = inr, newText = "X" } }, ["file:///other.c"] = { { range = inr, newText = "Y" } } },
+  }, uri, pos) == false)
+  check("matches: documentChanges all same uri, covers pos", macro._edit_matches({
+    documentChanges = { { textDocument = { uri = uri, version = 1 }, edits = { { range = inr, newText = "X" } } } },
+  }, uri, pos) == true)
+  check("matches: documentChanges with a foreign uri -> false", macro._edit_matches({
+    documentChanges = {
+      { textDocument = { uri = uri, version = 1 }, edits = { { range = inr, newText = "X" } } },
+      { textDocument = { uri = "file:///other.c", version = 1 }, edits = { { range = inr, newText = "Y" } } },
+    },
+  }, uri, pos) == false)
+  check("matches: nil edit -> false", macro._edit_matches(nil, uri, pos) == false)
+end
+
+-- The persistent applyEdit interceptor: consume for the active fetch, swallow
+-- during the post-fetch grace window, delegate everything else.
+do
+  local uri = "file:///src/x.c"
+  local pos = { line = 3, character = 10 }
+  local inr = { start = { line = 3, character = 8 }, ["end"] = { line = 3, character = 12 } }
+  local mine = { changes = { [uri] = { { range = inr, newText = "(0x3U << 0)" } } } }
+  local foreign = { changes = { ["file:///other.c"] = { { range = inr, newText = "nope" } } } }
+
+  local client = { id = 1, handlers = {} }
+  macro._install_interceptor(client)
+  local h = client.handlers["workspace/applyEdit"]
+  check("interceptor: installed on the client", type(h) == "function")
+  macro._install_interceptor(client)
+  check("interceptor: install is idempotent", client.handlers["workspace/applyEdit"] == h)
+
+  -- Stub the global fallback so delegation is observable. Restored below.
+  local orig_global = vim.lsp.handlers["workspace/applyEdit"]
+  local delegated = 0
+  vim.lsp.handlers["workspace/applyEdit"] = function()
+    delegated = delegated + 1
+    return { applied = false }
+  end
+  local ok, err = pcall(function()
+    -- (a) active fetch consumes the matching edit exactly once.
+    local got, calls = nil, 0
+    macro._pending[1] = { uri = uri, pos = pos, on_edit = function(e)
+      calls = calls + 1
+      got = e
+    end }
+    local r = h(nil, { edit = mine })
+    check("interceptor: active fetch consumes matching edit", calls == 1 and got == mine)
+    check("interceptor: consumed edit answers applied=true", type(r) == "table" and r.applied == true)
+    check("interceptor: pending cleared after consume", macro._pending[1] == nil)
+    check("interceptor: consume did not delegate", delegated == 0)
+
+    -- (b) tombstone swallows a late edit -- it must NOT reach the real handler.
+    macro._pending[1] = { uri = uri, pos = pos, on_edit = nil, expires = vim.uv.now() + 10000 }
+    local r2 = h(nil, { edit = mine })
+    check("interceptor: late edit swallowed by tombstone", type(r2) == "table" and r2.applied == true)
+    check("interceptor: swallowed edit never hits the real file", delegated == 0)
+
+    -- (c) nothing pending -> straight delegation.
+    macro._pending[1] = nil
+    h(nil, { edit = mine })
+    check("interceptor: no pending -> delegates", delegated == 1)
+
+    -- (d) a foreign edit mid-fetch still reaches the original handler, and the
+    -- in-flight fetch keeps its claim.
+    local p = { uri = uri, pos = pos, on_edit = function()
+      check("interceptor: foreign edit must not be consumed", false)
+    end }
+    macro._pending[1] = p
+    h(nil, { edit = foreign })
+    check("interceptor: foreign edit delegated mid-fetch", delegated == 2)
+    check("interceptor: foreign edit leaves pending intact", macro._pending[1] == p)
+    macro._pending[1] = nil
+  end)
+  vim.lsp.handlers["workspace/applyEdit"] = orig_global
+  check("interceptor: test body ran without error", ok, tostring(err))
+end
+
 print("")
 print(fails == 0 and "ALL MACRO TESTS PASSED" or (fails .. " FAILURE(S)"))
