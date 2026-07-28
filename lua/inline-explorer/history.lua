@@ -1,6 +1,6 @@
 -- Snapshot-based undo/redo for the reading view. The view is nomodifiable, so
 -- native undo does not apply; instead every mutation (block expand, inline
--- substitute) snapshots the whole buffer first, and `u`/`r` restore snapshots.
+-- substitute) snapshots the whole buffer first, and `u`/`<C-r>` restore snapshots.
 local view = require("inline-explorer.view")
 
 local M = {}

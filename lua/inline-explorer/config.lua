@@ -8,7 +8,7 @@ M.defaults = {
     open = "<leader>eo", -- open a reading view for the current file
     close = "<leader>eq", -- close the reading view
     undo = "u", -- undo the last expansion (buffer-local to the view)
-    redo = "r", -- redo (buffer-local to the view)
+    redo = "<C-r>", -- redo (buffer-local to the view)
   },
   indent = "  ", -- indent prepended to each expansion level
   header = true, -- wrap each expansion in `/* v name */ ... /* ^ name */`

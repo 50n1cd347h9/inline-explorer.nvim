@@ -41,7 +41,7 @@ function M.open()
   vim.wo.foldenable = true
   pcall(vim.api.nvim_win_set_cursor, 0, cursor)
 
-  -- Buffer-local undo/redo, so `u`/`r` only rebind inside the view.
+  -- Buffer-local undo/redo, so `u`/`<C-r>` only rebind inside the view.
   local hist = require("inline-explorer.history")
   local km = require("inline-explorer.config").options.keymaps or {}
   if km.undo then

@@ -124,11 +124,11 @@ Open a file (with a language server attached), then:
 | `<leader>ee`  | `:InlineExplorerExpand`     | Block-expand the symbol under the cursor (any lang) |
 | `<leader>ei`  | `:InlineExplorerInline`     | Inline in place: functions inlined, macros expanded (C) |
 | `<leader>ec`  | (`za`)                      | Fold / unfold the expansion under the cursor        |
-| `u` / `r`     | —                           | Undo / redo the last expansion (inside the view)    |
+| `u` / `<C-r>` | —                           | Undo / redo the last expansion (inside the view)    |
 | `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
 
 Expansions nest: move the cursor onto any function/macro inside an expanded body
-(block) or inlined fragment (substitution) and expand again. `u`/`r` are
+(block) or inlined fragment (substitution) and expand again. `u`/`<C-r>` are
 buffer-local snapshots of the view, so they undo/redo whole expansions without
 touching your real files (native undo does not apply — the view is read-only).
 
@@ -234,7 +234,7 @@ require("inline-explorer").setup({
     open = "<leader>eo",
     close = "<leader>eq",
     undo = "u",                -- buffer-local to the view
-    redo = "r",                -- buffer-local to the view
+    redo = "<C-r>",            -- buffer-local to the view
   },
   indent = "  ", -- indent added per expansion level
   header = true, -- wrap each expansion in /* v name */ ... /* ^ name */
