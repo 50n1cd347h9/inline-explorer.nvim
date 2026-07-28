@@ -119,47 +119,22 @@ end
 -- shared name would be a duplicate declaration in one scope -- a SEMANTIC
 -- error tree-sitter cannot see -- so when gcc is available the double-inlined
 -- program is syntax-checked for real; without gcc only the parse check runs.
+-- Parse-only here; the gcc syntax check of the double-inlined program (a
+-- shared injected name is a SEMANTIC duplicate declaration tree-sitter cannot
+-- see) lives in the gcc layer, tests/pbt_spec.lua.
 do
   local bad, bad_seed
   local n_unique = math.min(N_CASES, 100)
-  local have_gcc = vim.fn.executable("gcc") == 1
-  local tmpdir
-  if have_gcc then
-    tmpdir = vim.fn.tempname()
-    vim.fn.mkdir(tmpdir, "p")
-  end
   for i = 1, n_unique do
     local seed = BASE_SEED + 7000 + i
     local case = gen.case(gen.rng(seed))
     local rc = gen.render(case)
-    local two = "static int caller(int a, int b)\n{\n    int t = 3;\n    int s = 4;\n"
-    for j, p in ipairs(case.params) do
-      if p.type == "ptr" then
-        two = two .. "    int pv" .. j .. " = 1;\n"
-      end
-    end
-    local call = "f(" .. table.concat(case.args, ", ") .. ")"
-    two = two .. "    return " .. call .. " + " .. call .. ";\n}"
+    local two = gen.render_double(case)
     local once = S.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
     if once then
       local twice = S.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
-      if twice then
-        if has_error(twice) then
-          bad, bad_seed = "second inlining produced ERROR nodes", seed
-        elseif have_gcc and i <= 30 then
-          local tail = rc.main_src
-          local path = tmpdir .. "/uniq" .. i .. ".c"
-          local fh = assert(io.open(path, "w"))
-          fh:write(rc.callee_src .. "\n" .. twice .. "\n" .. tail)
-          fh:close()
-          local out = vim.fn.system({
-            "gcc", "-std=gnu11", "-fsyntax-only", "-Werror=implicit-function-declaration",
-            "-Wno-unused-label", "-Wno-unused-variable", path,
-          })
-          if vim.v.shell_error ~= 0 then
-            bad, bad_seed = "double-inlined program rejected by gcc:\n" .. out, seed
-          end
-        end
+      if twice and has_error(twice) then
+        bad, bad_seed = "second inlining produced ERROR nodes", seed
       end
     end
     if bad then

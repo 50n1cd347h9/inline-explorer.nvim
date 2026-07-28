@@ -23,8 +23,30 @@ M.defaults = {
 
 M.options = vim.deepcopy(M.defaults)
 
+-- Version-stable by-hand validation (vim.validate changed shape across 0.10
+-- and 0.11): wrong types error loudly, unknown keys warn instead of being
+-- silently ignored.
+local function check(opts)
+  local types = { keymaps = "table", indent = "string", header = "boolean", mode = "string" }
+  for name, expected in pairs(types) do
+    if opts[name] ~= nil and type(opts[name]) ~= expected then
+      error(("inline-explorer: option '%s' must be a %s"):format(name, expected), 0)
+    end
+  end
+  if opts.mode ~= nil and opts.mode ~= "correct" and opts.mode ~= "readable" then
+    error('inline-explorer: mode must be "correct" or "readable"', 0)
+  end
+  for k in pairs(opts) do
+    if M.defaults[k] == nil then
+      vim.notify(("[inline-explorer] unknown option '%s' (typo?)"):format(k), vim.log.levels.WARN)
+    end
+  end
+end
+
 function M.setup(opts)
-  M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts or {})
+  opts = opts or {}
+  check(opts)
+  M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts)
   return M.options
 end
 

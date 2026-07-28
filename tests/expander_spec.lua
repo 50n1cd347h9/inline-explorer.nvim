@@ -8,6 +8,14 @@ vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
 local resolver = require("inline-explorer.resolver")
 local view = require("inline-explorer.view")
 local expander = require("inline-explorer.expander")
+-- Config validation: bad values error, unknown keys warn, then reset clean.
+do
+  local config = require("inline-explorer.config")
+  local ok = pcall(config.setup, { mode = "bogus" })
+  assert(not ok, "config.setup accepted an invalid mode")
+  local ok2 = pcall(config.setup, { indent = 4 })
+  assert(not ok2, "config.setup accepted a non-string indent")
+end
 require("inline-explorer.config").setup({})
 
 local fails = 0

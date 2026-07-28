@@ -178,6 +178,40 @@ if bad then
 else
   print(("PASS  differential property holds for %d cases (gcc builds: %d)"):format(N_CASES, n_built))
 end
+
+-- P-unique, gcc half (moved from the fast layer to keep it gcc-free): the
+-- double-inlined caller must survive a real syntax check -- a shared injected
+-- name would be a duplicate declaration in one scope, invisible to
+-- tree-sitter.
+do
+  local ubad, ubad_seed
+  for i = 1, 20 do
+    local seed = BASE_SEED + 7000 + i
+    local case = gen.case(gen.rng(seed))
+    local rc = gen.render(case)
+    local two = gen.render_double(case)
+    local once = S.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
+    local twice = once and S.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
+    if twice then
+      local path = tmp .. "/uniq" .. i .. ".c"
+      writef(path, rc.callee_src .. "\n" .. twice .. "\n" .. rc.main_src)
+      local out = vim.fn.system({
+        "gcc", "-std=gnu11", "-fsyntax-only", "-Werror=implicit-function-declaration",
+        "-Wno-unused-label", "-Wno-unused-variable", path,
+      })
+      if vim.v.shell_error ~= 0 then
+        ubad, ubad_seed = out, seed
+        break
+      end
+    end
+  end
+  if ubad then
+    fails = fails + 1
+    print("FAIL  double-inlining uniqueness @seed=" .. ubad_seed .. ":\n" .. ubad)
+  else
+    print("PASS  double-inlined programs survive gcc syntax checks (20 cases)")
+  end
+end
 print(("info  readable mode compiled %d/%d (compile-only, never failing)"):format(readable_compiled, readable_total))
 print(("info  cast-vs-call exemptions taken: %d"):format(exempted))
 print(("info  unbuildable originals skipped: %d"):format(skipped_unbuildable))

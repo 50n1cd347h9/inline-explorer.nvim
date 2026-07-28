@@ -236,6 +236,21 @@ function M.render(case)
   }
 end
 
+-- A caller invoking the SAME call twice (`f(...) + f(...)`), for the
+-- double-inlining uniqueness properties.
+function M.render_double(case)
+  local call = "f(" .. table.concat(case.args, ", ") .. ")"
+  local lines = { "static int caller(int a, int b)", "{", "    int t = 3;", "    int s = 4;" }
+  for i, p in ipairs(case.params) do
+    if p.type == "ptr" then
+      lines[#lines + 1] = "    int pv" .. i .. " = 1;"
+    end
+  end
+  lines[#lines + 1] = "    return " .. call .. " + " .. call .. ";"
+  lines[#lines + 1] = "}"
+  return table.concat(lines, "\n")
+end
+
 -- Greedy shrink: repeatedly try dropping callee statements (from the tail),
 -- then dropping params (with their argument), then simplifying the context to
 -- the plain declaration-init form. A reduction is kept only while
