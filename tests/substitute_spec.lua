@@ -31,7 +31,7 @@ local function compiles(src, name)
   local p = tmp .. "/" .. name .. ".c"
   writef(p, src)
   local out = vim.fn.system({
-    "gcc", "-std=gnu11", "-fsyntax-only",
+    "gcc", "-std=gnu11", "-fsyntax-only", "-Werror=implicit-function-declaration",
     "-Wno-unused-label", "-Wno-unused-function", "-Wno-unused-variable", p,
   })
   return vim.v.shell_error == 0, out
@@ -40,7 +40,10 @@ end
 local function run_ok(src, name)
   local c, exe = tmp .. "/" .. name .. ".c", tmp .. "/" .. name .. ".out"
   writef(c, src)
-  local out = vim.fn.system({ "gcc", "-std=gnu11", "-Wno-unused-label", "-Wno-unused-function", c, "-o", exe })
+  local out = vim.fn.system({
+    "gcc", "-std=gnu11", "-Werror=implicit-function-declaration",
+    "-Wno-unused-label", "-Wno-unused-function", c, "-o", exe,
+  })
   if vim.v.shell_error ~= 0 then
     return false, out
   end
@@ -428,7 +431,7 @@ do
 }]]
   local t2 = transform(caller_arr, callee_arr, "first", { { N = 1 } })
   local main2 = "int main(void){ return (caller()==42)?0:1; }\n"
-  check("case15 array param decays to pointer", t2:find("int %*first_a__?i?e?1? =") ~= nil or t2:find("int %*a = %(arr%);") ~= nil, t2)
+  check("case15 array param decays to pointer", t2:find("int %*a = %(arr%);") ~= nil, t2)
   check("case15 array-param compiles", (compiles(callee_arr .. "\n" .. t2 .. main2, "c15b")))
   check("case15 array-param runs equal", (run_ok(callee_arr .. "\n" .. t2 .. main2, "c15b")))
 
@@ -514,10 +517,11 @@ do
     return pick(ap, bp, c)[0];
 }]]
   local t = transform(caller, callee, "pick", { { N = 1 } })
-  local main = "#include <string.h>\nint main(void){ return (strcmp(caller(1),\"x\")==0 && strcmp(caller(0),\"y\")==0)?0:1; }\n"
+  local main = "int main(void){ return (strcmp(caller(1),\"x\")==0 && strcmp(caller(0),\"y\")==0)?0:1; }\n"
+  local src18 = "#include <string.h>\n" .. callee .. "\n" .. t .. "\n" .. main
   check("case18 result slot keeps pointer depth", t:find("char %*%* ?__ie_ret1;") ~= nil, t)
-  check("case18 compiles (char ** return)", (compiles(callee .. "\n" .. t .. main, "c18")), t)
-  check("case18 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c18")))
+  check("case18 compiles (char ** return)", (compiles(src18, "c18")), t)
+  check("case18 runs equal to original", (run_ok(src18, "c18")))
 end
 
 print("")

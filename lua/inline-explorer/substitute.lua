@@ -45,6 +45,8 @@ local function query_nodes(node, src, q)
 end
 
 -- Descend a declarator to its identifier name (through pointer/array/fn wrappers).
+-- NOTE: parenthesized_declarator has no `declarator` field in tree-sitter-c, so
+-- fall through it via its first named child (e.g. `int (*fp)(int)`).
 local function decl_name(decl, src)
   local n = decl
   while n do
@@ -52,6 +54,9 @@ local function decl_name(decl, src)
       return text(n, src)
     end
     local d = n:field("declarator")[1]
+    if not d and n:type() == "parenthesized_declarator" then
+      d = n:named_child(0)
+    end
     if not d then
       return nil
     end
@@ -63,8 +68,10 @@ end
 local function func_declarator(decl)
   local n = decl
   while n and n:type() ~= "function_declarator" do
-    if n:type() == "pointer_declarator" or n:type() == "parenthesized_declarator" then
+    if n:type() == "pointer_declarator" then
       n = n:field("declarator")[1]
+    elseif n:type() == "parenthesized_declarator" then
+      n = n:field("declarator")[1] or n:named_child(0)
     else
       return nil
     end
