@@ -148,15 +148,16 @@ is C-only and requires the tree-sitter `c` parser.
 Given `return snap != acquire(c);`, inlining `acquire` produces:
 
 ```c
-__typeof__(c) cpu = (c);
+int cpu = (c);
 struct ct *p = per_cpu_ptr(CT, cpu);
 return snap != (p->state & MASK);
 ```
 
 How it works:
 
-- **Parameters** become `__typeof__(arg) param = (arg);` bindings — correct
-  call-by-value semantics with no type reconstruction.
+- **Parameters** are bound to their declared type (`int cpu = (c);`), reconstructed
+  from the definition so arrays decay to pointers and a `0`/NULL argument keeps the
+  right pointer type; `__auto_type` is a fallback for exotic declarators.
 - **Simple functions** (straight-line, single trailing return) are rendered as a
   *pretty hoist*: setup statements lifted above the call, the returned expression
   spliced in place (parenthesised, so precedence is preserved).
