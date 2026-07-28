@@ -37,7 +37,8 @@ depth N. tree-sitter then extracts the exact definition node from the target fil
   nodes (extmarks).
 - **Resolver** (`resolver.lua`) — `name -> definition location` via the attached
   server's `workspace/symbol` (any language), then `location -> body lines` via
-  tree-sitter with a language-agnostic node matcher (brace heuristic fallback).
+  the server's `textDocument/documentSymbol` full range (tree-sitter, then a
+  brace heuristic, as fallbacks when no server range is available).
 - **Expander** (`expander.lua`) — splice the body below the call line, indent,
   wrap in a fold, guard against self-recursion.
 - **Config / init** — options, user commands, keymaps.
