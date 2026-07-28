@@ -79,6 +79,13 @@ function M._insert(st, bufnr, lnum, name, body, label)
   vim.api.nvim_buf_set_lines(bufnr, lnum + 1, lnum + 1, false, out)
   vim.bo[bufnr].modifiable = false
 
+  -- Origin bookkeeping: spliced lines have no position in the source file.
+  if st.origin then
+    for _ = 1, #out do
+      table.insert(st.origin, lnum + 2, false)
+    end
+  end
+
   local first, last = lnum + 1, lnum + #out -- 0-indexed inserted range
   st.nodes[#st.nodes + 1] = {
     name = name,

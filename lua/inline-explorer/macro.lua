@@ -467,9 +467,14 @@ local function fetch_via_hover(st, row, col, cb)
   end)
 end
 
--- Fetch a macro's expansion at (row, col): ExpandMacro tweak first, hover as
--- fallback. cb(lines|nil), called exactly once.
+-- Fetch a macro's expansion at (row, col) IN THE SOURCE FILE: ExpandMacro
+-- tweak first, hover as fallback. cb(lines|nil), called exactly once. A nil
+-- row means the caller could not map its position back to the source (the
+-- macro use sits on inserted text) -- nothing to query.
 function M.fetch_expansion(st, row, col, cb)
+  if row == nil then
+    return cb(nil)
+  end
   fetch_via_tweak(st, row, col, function(lines)
     if lines and #lines > 0 then
       return cb(lines)

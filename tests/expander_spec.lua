@@ -75,6 +75,37 @@ check("recursion guard blocks re-expansion", vim.api.nvim_buf_line_count(vbuf) =
 require("inline-explorer.history").undo()
 check("undo restores the original view", vim.api.nvim_buf_line_count(vbuf) == 4)
 
+-- Line-origin bookkeeping: after undo the map is identity again; a splice
+-- marks the inserted rows as origin-less and shifts the tail; a rewrite keeps
+-- origins for unchanged lines and re-anchors surviving expansion nodes.
+do
+  local st = view.current()
+  check("origin: identity after undo", view.src_line(st, 0) == 0 and view.src_line(st, 3) == 3, vim.inspect(st.origin))
+
+  local col = ("    int r = helper(1);"):find("helper") - 1
+  vim.api.nvim_win_set_cursor(0, { 3, col })
+  expander.expand()
+  vim.wait(1000, function()
+    return vim.api.nvim_buf_line_count(vbuf) > 4
+  end, 10)
+  local inserted = vim.api.nvim_buf_line_count(vbuf) - 4
+  check("origin: spliced rows have no source line", view.src_line(st, 3) == nil and view.src_line(st, 2 + inserted) == nil, vim.inspect(st.origin))
+  check("origin: tail shifted to its old source line", view.src_line(st, 3 + inserted) == 3, vim.inspect(st.origin))
+
+  -- Rewrite that only touches the call line: unchanged lines keep their
+  -- origins and the expansion node survives with its rows intact.
+  local lines_now = vim.api.nvim_buf_get_lines(vbuf, 0, -1, false)
+  lines_now[3] = "    int r = (0);"
+  view.rewrite(st, vbuf, table.concat(lines_now, "\n"), 2)
+  check("rewrite: node survives an unrelated line change", #st.nodes == 1, #st.nodes)
+  check("rewrite: changed line loses its origin", view.src_line(st, 2) == nil, vim.inspect(st.origin))
+  check("rewrite: unchanged lines keep origins", view.src_line(st, 0) == 0 and view.src_line(st, 3 + inserted) == 3, vim.inspect(st.origin))
+
+  -- Restore the original call line so the guard tests below can find `helper`.
+  lines_now[3] = "    int r = helper(1);"
+  view.rewrite(st, vbuf, table.concat(lines_now, "\n"), 2)
+end
+
 -- Re-entrancy guard: while a resolver round trip is in flight, a second
 -- expand is refused; the stamp goes stale after FETCH_GUARD_MS so a leaked
 -- flag self-heals.

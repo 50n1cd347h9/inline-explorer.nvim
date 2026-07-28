@@ -34,7 +34,14 @@ function M.open()
   local lang = vim.treesitter.language.get_lang(ft) or ft
   pcall(vim.treesitter.start, view, lang)
 
-  M.state[view] = { source_bufnr = src, nodes = {}, undo = {}, redo = {} }
+  -- origin[view_row + 1] = source row (0-based) the line came from, or false
+  -- for inserted text. Kept current across splices, rewrites and undo, so a
+  -- view position can be mapped back to the real file at any depth.
+  local origin = {}
+  for i = 1, #lines do
+    origin[i] = i - 1
+  end
+  M.state[view] = { source_bufnr = src, nodes = {}, undo = {}, redo = {}, origin = origin }
 
   vim.api.nvim_set_current_buf(view)
   vim.wo.foldmethod = "manual"
@@ -69,6 +76,43 @@ function M.current()
   return M.state[vim.api.nvim_get_current_buf()]
 end
 
+-- Source line (0-based) a view line originates from, or nil for inserted text.
+function M.src_line(st, row)
+  local o = st.origin and st.origin[row + 1]
+  if o == false or o == nil then
+    return nil
+  end
+  return o
+end
+
+-- Diff old vs new text into map[old_row_0] = new_row_0 for lines that
+-- survived unchanged (changed/inserted lines are absent).
+function M._remap_rows(old_src, new_src)
+  local hunks = vim.diff(old_src, new_src, { result_type = "indices" }) or {}
+  local map = {}
+  local old_n = #vim.split(old_src, "\n", { plain = true })
+  local new_n = #vim.split(new_src, "\n", { plain = true })
+  local oi, ni = 1, 1
+  for _, h in ipairs(hunks) do
+    local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
+    -- count == 0 means "insertion after line start", so the first affected
+    -- line is start + 1 in that buffer.
+    local a_start = ca > 0 and sa or sa + 1
+    local b_start = cb > 0 and sb or sb + 1
+    while oi < a_start and ni < b_start do
+      map[oi - 1] = ni - 1
+      oi, ni = oi + 1, ni + 1
+    end
+    oi = a_start + ca
+    ni = b_start + cb
+  end
+  while oi <= old_n and ni <= new_n do
+    map[oi - 1] = ni - 1
+    oi, ni = oi + 1, ni + 1
+  end
+  return map
+end
+
 -- Re-entrancy guard: one resolver round trip per view at a time, so two quick
 -- keypresses on a slow server cannot interleave their splices. The stamp goes
 -- stale after FETCH_GUARD_MS, so a leaked flag can never wedge the view
@@ -89,16 +133,56 @@ function M.end_fetch(st)
 end
 
 -- Replace the whole view buffer with `new_src` (used by in-place transforms).
--- Snapshots for undo first, and resets block-expansion tracking since the
--- wholesale rewrite invalidates its extmarks/folds.
+-- Snapshots for undo first. Lines that survive the rewrite unchanged (per
+-- vim.diff) keep their origin bookkeeping, and block-expansion nodes whose
+-- endpoints both survive are re-anchored with their folds re-created instead
+-- of being dropped wholesale.
 function M.rewrite(st, bufnr, new_src, row)
   require("inline-explorer.history").snapshot(st, bufnr)
+
+  local old_src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  local rowmap = M._remap_rows(old_src, new_src)
+
+  local surviving = {}
+  for _, node in ipairs(st.nodes) do
+    local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.s_mark, {})
+    local e = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.e_mark, {})
+    if s[1] and e[1] and rowmap[s[1]] and rowmap[e[1]] then
+      surviving[#surviving + 1] = { name = node.name, s = rowmap[s[1]], e = rowmap[e[1]] }
+    end
+  end
   vim.api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
-  st.nodes = {}
+
+  local new_origin = {}
+  if st.origin then
+    for old_row, new_row in pairs(rowmap) do
+      new_origin[new_row + 1] = st.origin[old_row + 1]
+    end
+  end
+
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(new_src, "\n", { plain = true }))
   vim.bo[bufnr].modifiable = false
   local n = vim.api.nvim_buf_line_count(bufnr)
+  for i = 1, n do
+    if new_origin[i] == nil then
+      new_origin[i] = false
+    end
+  end
+  st.origin = new_origin
+
+  pcall(vim.cmd, "silent! normal! zE")
+  st.nodes = {}
+  for _, node in ipairs(surviving) do
+    st.nodes[#st.nodes + 1] = {
+      name = node.name,
+      s_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, node.s, 0, {}),
+      e_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, node.e, 0, {}),
+    }
+    pcall(vim.cmd, string.format("%d,%dfold", node.s + 1, node.e + 1))
+    pcall(vim.cmd, string.format("%d,%dfoldopen", node.s + 1, node.e + 1))
+  end
+
   pcall(vim.api.nvim_win_set_cursor, 0, { math.min((row or 0) + 1, n), 0 })
 end
 

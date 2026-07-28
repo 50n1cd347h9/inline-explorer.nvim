@@ -125,7 +125,10 @@ The smart `ei` action splices that expansion **in place** of the macro use (the
 same fetch→replace path as functions, with the fetch preferring the tweak and
 falling back to hover only if it's unavailable); explicit `ee` block-pastes the
 macro definition instead. There is no separate macro command. The query
-(codeAction or hover) runs against the original source at the cursor, exact at
-depth 0; large line shifts can misalign it. The `ExpandMacro` tweak path
-implements exactly the interception that an earlier revision of this document
-described as a future step.
+(codeAction or hover) runs against the original source: the view keeps a
+per-line origin map (updated across splices, rewrites and undo), so the cursor
+position is translated to the exact file line however far prior expansions
+have shifted things; a macro use on inserted text has no origin and falls back
+to block expansion. The `ExpandMacro` tweak path implements exactly the
+interception that an earlier revision of this document described as a future
+step.

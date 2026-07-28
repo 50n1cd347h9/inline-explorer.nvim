@@ -231,8 +231,10 @@ functions. Two ways to see one, under the same keys as functions:
   tweak (its `workspace/applyEdit` is intercepted and kept out of the real
   file), with `textDocument/hover` scraping as the fallback -- so it respects
   your include paths, `#define`s and `#ifdef` state. The query runs against the
-  original source at the cursor, reliable at depth 0; large line shifts from
-  prior expansions can misalign it.
+  original source: the view line is mapped back to the file line it came from,
+  so it stays exact however far prior expansions have shifted things. A macro
+  use sitting on inserted text (inside an expanded body) has no source
+  position and falls back to block expansion.
 - **`<leader>ee`** (block expand) drops the macro's definition below the use as a
   folded block, like any other symbol.
 

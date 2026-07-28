@@ -72,8 +72,10 @@ function M.smart()
       -- Not a confirmed function (macro, or heuristic-extracted from a header):
       -- try an in-place macro expansion via clangd (tweak, then hover); block-paste
       -- only if that yields nothing (so a plain function-signature hover never gets
-      -- spliced).
-      macro.fetch_expansion(st, row, col, function(exp)
+      -- spliced). The clangd query runs against the ORIGINAL file, so map the
+      -- view row back to its source line; inserted text has no source position
+      -- and skips straight to the fallback.
+      macro.fetch_expansion(st, view.src_line(st, row), col, function(exp)
         if not exp or #exp == 0 then
           return block_fallback()
         end
