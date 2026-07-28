@@ -173,15 +173,26 @@ end
 -- How long after a fetch ends a straggling applyEdit for that same macro is
 -- still swallowed rather than delegated (a slow tweak that lands after the
 -- timeout must never reach the real buffer).
-local GRACE_MS = 10000
+--
+-- Honest residual: within this window, a genuine single-document edit whose
+-- range happens to contain the fetch position -- a rename of that very macro,
+-- say -- is swallowed and falsely answered { applied = true }. That is the
+-- price of keeping a late tweak edit out of the real file: applyEdit carries no
+-- correlation id back to the executeCommand that caused it, so there is no way
+-- to tell the two apart. The window is kept short for that reason.
+local GRACE_MS = 3000
 
--- client.id -> { uri, pos, on_edit = fn|nil, expires = nil|uv-ms }.
+-- client.id -> LIST of claims, each { uri, pos, on_edit = fn|nil, expires = nil|uv-ms }.
 -- on_edit set   : a fetch is in flight and wants the matching edit.
--- on_edit nil   : tombstone -- the fetch is over, swallow a late match until
---                 `expires`, then fall through to the real handler again.
+-- on_edit nil   : tombstone -- that fetch is over (or already consumed its
+--                 edit), swallow a further match until `expires`, then prune.
+-- One claim PER FETCH, never one slot per client: overlapping fetches each keep
+-- their own claim, so a superseded fetch still gets a tombstone and its late
+-- edit can never fall through to the real buffer.
 local pending = {}
--- client.id -> true once the persistent interceptor is installed.
-local intercepting = {}
+-- client.id -> the interceptor closure we installed, so we can detect another
+-- plugin replacing it and chain-reinstall on top.
+local our_handler = {}
 
 -- Is `pos` inside `range` (inclusive on both ends)?
 local function pos_in_range(pos, range)
@@ -239,43 +250,71 @@ function M._edit_matches(workspace_edit, uri, pos)
   return false
 end
 
--- Install the persistent workspace/applyEdit interceptor on `client` (once).
+-- Install the workspace/applyEdit interceptor on `client`.
 --
--- It is deliberately NEVER uninstalled. The previous per-client handler is
--- captured a single time and every applyEdit that is not a match for a pending
--- fetch is delegated to it (or to the global handler), so the interceptor is
--- transparent: renames, other plugins' code actions and edits elsewhere in the
--- file all behave exactly as before, even while a fetch is in flight. Nothing
--- is ever restored, so there is no window in which a late edit escapes to the
--- real buffer, no foreign handler can be nil'd out by a restore, and
--- overlapping fetches cannot leak a stale override.
+-- It is deliberately NEVER uninstalled. The handler present at install time is
+-- captured as `prev`, and every applyEdit that matches no claim is delegated to
+-- it (or to the global handler), so the interceptor is transparent: renames,
+-- other plugins' code actions and edits elsewhere in the file all behave exactly
+-- as before, even while a fetch is in flight. Nothing is ever restored, so there
+-- is no window in which a late edit escapes to the real buffer and no foreign
+-- handler can be nil'd out by a restore.
+--
+-- Calling this again is a no-op while our closure is still the installed
+-- handler. If another plugin has replaced it since, we install a fresh
+-- interceptor that captures THAT handler as `prev` -- chaining onto it rather
+-- than fighting it, and restoring our coverage.
 local function install_interceptor(client)
-  if intercepting[client.id] then
+  local mine = our_handler[client.id]
+  if mine ~= nil and client.handlers["workspace/applyEdit"] == mine then
     return
   end
-  intercepting[client.id] = true
   local prev = client.handlers["workspace/applyEdit"]
-  client.handlers["workspace/applyEdit"] = function(err, params, ctx, config)
-    local p = pending[client.id]
+  local handler = function(err, params, ctx, config)
+    local claims = pending[client.id]
     local edit = params and params.edit
-    if p and M._edit_matches(edit, p.uri, p.pos) then
-      if p.on_edit then
-        -- Active fetch: consume the edit, and never apply it anywhere.
-        local on_edit = p.on_edit
-        pending[client.id] = nil
+    if claims then
+      local now = vim.uv.now()
+      -- Drop tombstones whose grace window has passed: edits matching them are
+      -- no longer plausibly ours and must reach the real handler again.
+      for i = #claims, 1, -1 do
+        local c = claims[i]
+        if c.expires and now >= c.expires then
+          table.remove(claims, i)
+        end
+      end
+      -- Prefer an in-flight fetch (newest first) over a tombstone, so a fresh
+      -- fetch at a position an older one also covered still gets its answer.
+      local hit
+      for i = #claims, 1, -1 do
+        if claims[i].on_edit and M._edit_matches(edit, claims[i].uri, claims[i].pos) then
+          hit = claims[i]
+          break
+        end
+      end
+      if hit then
+        -- Consume, and downgrade IN PLACE rather than removing the claim: a
+        -- duplicate applyEdit for the same tweak then hits the tombstone below
+        -- instead of being delegated and applied for real.
+        local on_edit = hit.on_edit
+        hit.on_edit = nil
+        hit.expires = now + GRACE_MS
         on_edit(edit)
         return { applied = true }
       end
-      if p.expires and vim.uv.now() < p.expires then
-        -- The fetch already gave up, but this is still its edit: swallow it so
-        -- the expansion is not written into the user's real source buffer.
-        return { applied = true }
+      for i = #claims, 1, -1 do
+        if M._edit_matches(edit, claims[i].uri, claims[i].pos) then
+          -- A live tombstone: that fetch is over, but this is still its edit --
+          -- swallow it so the expansion never lands in the real source buffer.
+          return { applied = true }
+        end
       end
-      pending[client.id] = nil -- tombstone expired; fall through
     end
     local fallback = prev or vim.lsp.handlers["workspace/applyEdit"]
     return fallback(err, params, ctx, config)
   end
+  client.handlers["workspace/applyEdit"] = handler
+  our_handler[client.id] = handler
 end
 
 M._install_interceptor = install_interceptor
@@ -310,19 +349,21 @@ local function fetch_via_tweak(st, row, col, cb)
   local pos = { line = row, character = col }
 
   -- Exactly-once guard shared by the success path, every error path, and the
-  -- timeout. Instead of removing the interception it downgrades this fetch's
-  -- pending entry to a swallow-only tombstone, so an applyEdit that arrives
+  -- timeout. Instead of removing the interception it downgrades THIS fetch's own
+  -- claim, in place, to a swallow-only tombstone, so an applyEdit that arrives
   -- after we have given up is discarded rather than written to the real file.
-  -- The identity check keeps a superseded fetch from clobbering a newer one.
+  -- Other fetches' claims in the list are never touched. If the claim is already
+  -- a tombstone the interceptor consumed the edit and dated it -- leave it be.
   local finished = false
-  local token
+  local claim
   local function finish(lines)
     if finished then
       return
     end
     finished = true
-    if token and pending[client.id] == token then
-      pending[client.id] = { uri = uri, pos = pos, on_edit = nil, expires = vim.uv.now() + GRACE_MS }
+    if claim and claim.on_edit then
+      claim.on_edit = nil
+      claim.expires = vim.uv.now() + GRACE_MS
     end
     cb(lines)
   end
@@ -348,13 +389,18 @@ local function fetch_via_tweak(st, row, col, cb)
     end
 
     -- Claim the applyEdit this tweak will send back. The interceptor is already
-    -- installed; this only tells it which edit is ours. A concurrent fetch on
-    -- the same client is simply superseded -- its own finish() sees a different
-    -- token and leaves ours alone.
-    token = { uri = uri, pos = pos, on_edit = function(edit)
+    -- installed; this only tells it which edit is ours. The claim is APPENDED:
+    -- a concurrent fetch on the same client keeps its own claim, so both are
+    -- answered and both leave a tombstone behind.
+    claim = { uri = uri, pos = pos, on_edit = function(edit)
       finish(M._edit_lines(edit, uri))
     end }
-    pending[client.id] = token
+    local claims = pending[client.id]
+    if not claims then
+      claims = {}
+      pending[client.id] = claims
+    end
+    claims[#claims + 1] = claim
 
     local ok = client_request(client, "workspace/executeCommand", {
       command = cmd.command,

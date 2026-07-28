@@ -161,18 +161,19 @@ do
   local ok, err = pcall(function()
     -- (a) active fetch consumes the matching edit exactly once.
     local got, calls = nil, 0
-    macro._pending[1] = { uri = uri, pos = pos, on_edit = function(e)
+    local a = { uri = uri, pos = pos, on_edit = function(e)
       calls = calls + 1
       got = e
     end }
+    macro._pending[1] = { a }
     local r = h(nil, { edit = mine })
     check("interceptor: active fetch consumes matching edit", calls == 1 and got == mine)
     check("interceptor: consumed edit answers applied=true", type(r) == "table" and r.applied == true)
-    check("interceptor: pending cleared after consume", macro._pending[1] == nil)
+    check("interceptor: consumed claim downgraded to a tombstone", a.on_edit == nil and a.expires ~= nil)
     check("interceptor: consume did not delegate", delegated == 0)
 
     -- (b) tombstone swallows a late edit -- it must NOT reach the real handler.
-    macro._pending[1] = { uri = uri, pos = pos, on_edit = nil, expires = vim.uv.now() + 10000 }
+    macro._pending[1] = { { uri = uri, pos = pos, on_edit = nil, expires = vim.uv.now() + 3000 } }
     local r2 = h(nil, { edit = mine })
     check("interceptor: late edit swallowed by tombstone", type(r2) == "table" and r2.applied == true)
     check("interceptor: swallowed edit never hits the real file", delegated == 0)
@@ -187,14 +188,92 @@ do
     local p = { uri = uri, pos = pos, on_edit = function()
       check("interceptor: foreign edit must not be consumed", false)
     end }
-    macro._pending[1] = p
+    macro._pending[1] = { p }
     h(nil, { edit = foreign })
     check("interceptor: foreign edit delegated mid-fetch", delegated == 2)
-    check("interceptor: foreign edit leaves pending intact", macro._pending[1] == p)
+    check("interceptor: foreign edit leaves the claim intact", macro._pending[1][1] == p and p.on_edit ~= nil)
     macro._pending[1] = nil
   end)
   vim.lsp.handlers["workspace/applyEdit"] = orig_global
   check("interceptor: test body ran without error", ok, tostring(err))
+end
+
+-- Claims are per fetch, not per client: overlapping fetches must each keep
+-- their own claim (and their own tombstone), or a superseded fetch's late edit
+-- ends up delegated into the real buffer.
+do
+  local uri = "file:///src/x.c"
+  local posA, posB = { line = 3, character = 10 }, { line = 7, character = 4 }
+  local function edit_at(line, c0, c1)
+    return { changes = { [uri] = { { range = { start = { line = line, character = c0 }, ["end"] = { line = line, character = c1 } }, newText = "X" } } } }
+  end
+  local editA, editB = edit_at(3, 8, 12), edit_at(7, 2, 6)
+
+  local client = { id = 2, handlers = {} }
+  macro._install_interceptor(client)
+  local h = client.handlers["workspace/applyEdit"]
+
+  local orig_global = vim.lsp.handlers["workspace/applyEdit"]
+  local delegated = 0
+  vim.lsp.handlers["workspace/applyEdit"] = function()
+    delegated = delegated + 1
+    return { applied = false }
+  end
+  local ok, err = pcall(function()
+    local callsA, callsB = 0, 0
+    local A = { uri = uri, pos = posA, on_edit = function() callsA = callsA + 1 end }
+    local B = { uri = uri, pos = posB, on_edit = function() callsB = callsB + 1 end }
+    macro._pending[2] = { A, B } -- A is the older fetch, B supersedes it
+
+    -- (1) the older fetch is still answered, and the newer one is untouched.
+    h(nil, { edit = editA })
+    check("claims: superseded fetch still consumes its own edit", callsA == 1 and callsB == 0)
+    check("claims: newer claim untouched and still active", B.on_edit ~= nil)
+    check("claims: older claim consumed without delegating", delegated == 0)
+
+    -- (2) consuming leaves a tombstone: a duplicate edit is swallowed, not
+    -- delegated, and the callback does not fire twice.
+    local r = h(nil, { edit = editA })
+    check("claims: duplicate edit swallowed by the consume tombstone", type(r) == "table" and r.applied == true)
+    check("claims: duplicate edit did not delegate", delegated == 0)
+    check("claims: on_edit not called twice", callsA == 1)
+
+    -- the newer fetch is answered afterwards, as normal.
+    h(nil, { edit = editB })
+    check("claims: newer fetch consumed after the older one", callsB == 1 and delegated == 0)
+
+    -- (3) an expired tombstone is pruned and its edit delegates again.
+    macro._pending[2] = { { uri = uri, pos = posA, on_edit = nil, expires = vim.uv.now() - 1 } }
+    h(nil, { edit = editA })
+    check("claims: expired tombstone delegates", delegated == 1)
+    check("claims: expired tombstone pruned from the list", #macro._pending[2] == 0)
+    macro._pending[2] = nil
+  end)
+  vim.lsp.handlers["workspace/applyEdit"] = orig_global
+  check("claims: test body ran without error", ok, tostring(err))
+end
+
+-- (4) If another plugin replaces our handler, the next fetch chain-reinstalls
+-- on top of it instead of silently losing coverage.
+do
+  local client = { id = 3, handlers = {} }
+  macro._install_interceptor(client)
+  local first = client.handlers["workspace/applyEdit"]
+
+  local foreign_calls = 0
+  client.handlers["workspace/applyEdit"] = function()
+    foreign_calls = foreign_calls + 1
+    return { applied = true }
+  end
+  macro._install_interceptor(client) -- next fetch's install step
+  local h = client.handlers["workspace/applyEdit"]
+  check("reinstall: a replaced handler is re-wrapped", h ~= first and type(h) == "function")
+
+  h(nil, { edit = { changes = { ["file:///other.c"] = { { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } }, newText = "y" } } } } })
+  check("reinstall: the foreign handler is chained as prev", foreign_calls == 1)
+
+  macro._install_interceptor(client)
+  check("reinstall: no-op while our handler is still installed", client.handlers["workspace/applyEdit"] == h)
 end
 
 print("")
