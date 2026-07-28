@@ -114,8 +114,10 @@ position, errors, timeout) the fallback scrapes `textDocument/hover` markdown
 "Expands to" marker; we take the part after it).
 
 The smart `ei` action splices that expansion **in place** of the macro use (the
-same read→hover→replace path as functions); explicit `ee` block-pastes the macro
-definition instead. There is no separate macro command. The hover query uses the
-original source at the cursor, exact at depth 0; large line shifts can misalign
-it. The `ExpandMacro` tweak path implements exactly the interception that an
-earlier revision of this document described as a future step.
+same fetch→replace path as functions, with the fetch preferring the tweak and
+falling back to hover only if it's unavailable); explicit `ee` block-pastes the
+macro definition instead. There is no separate macro command. The query
+(codeAction or hover) runs against the original source at the cursor, exact at
+depth 0; large line shifts can misalign it. The `ExpandMacro` tweak path
+implements exactly the interception that an earlier revision of this document
+described as a future step.

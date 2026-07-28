@@ -1,10 +1,11 @@
 -- Macro expansion: a macro has no type or structured body to transform, so we
 -- ask the live clangd. Preferred path: the ExpandMacro tweak (codeAction ->
--- executeCommand), whose workspace/applyEdit we intercept -- the edit is never
--- applied to the real file, we only take its newText as the expansion. clangd
--- runs the real preprocessor, so the result respects include paths / #define /
--- #ifdef. Fallback: scrape the expansion from textDocument/hover markdown
--- (older clangd, tweak failure, timeout).
+-- executeCommand), whose workspace/applyEdit we intercept (for the fetch and
+-- a 3s grace window after -- a reply straggling past ~5s would fall through
+-- to the default handler instead) -- we only take its newText as the
+-- expansion. clangd runs the real preprocessor, so the result respects
+-- include paths / #define / #ifdef. Fallback: scrape the expansion from
+-- textDocument/hover markdown (older clangd, tweak failure, timeout).
 local M = {}
 
 local function parse(src)
@@ -256,9 +257,10 @@ end
 -- captured as `prev`, and every applyEdit that matches no claim is delegated to
 -- it (or to the global handler), so the interceptor is transparent: renames,
 -- other plugins' code actions and edits elsewhere in the file all behave exactly
--- as before, even while a fetch is in flight. Nothing is ever restored, so there
--- is no window in which a late edit escapes to the real buffer and no foreign
--- handler can be nil'd out by a restore.
+-- as before, even while a fetch is in flight. Nothing is ever restored-to-nil,
+-- so no foreign handler can be wiped out by a restore; a late edit is swallowed
+-- as long as its claim's grace window lasts, and only past that (~5s) would it
+-- fall through to the delegate instead.
 --
 -- Calling this again is a no-op while our closure is still the installed
 -- handler. If another plugin has replaced it since, we install a fresh
