@@ -9,6 +9,9 @@ M.defaults = {
     close = "<leader>eq", -- close the reading view
     undo = "u", -- undo the last expansion (buffer-local to the view)
     redo = "<C-r>", -- redo (buffer-local to the view)
+    next_block = "]e", -- jump to the next expansion block (buffer-local)
+    prev_block = "[e", -- jump to the previous expansion block (buffer-local)
+    list_blocks = "<leader>el", -- expansion blocks in the location list
   },
   indent = "  ", -- indent prepended to each expansion level
   header = true, -- wrap each expansion in `/* v name */ ... /* ^ name */`

@@ -106,6 +106,33 @@ do
   view.rewrite(st, vbuf, table.concat(lines_now, "\n"), 2)
 end
 
+-- Navigation: jump to the surviving block, breadcrumb inside it, loclist.
+do
+  local nav = require("inline-explorer.nav")
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  nav.next()
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  check("nav.next lands on the block start", row == 3, row)
+  check("breadcrumb names the containing expansion", nav.breadcrumb() == "helper", nav.breadcrumb())
+
+  vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(vbuf), 0 })
+  nav.prev()
+  check("nav.prev lands on the block start", vim.api.nvim_win_get_cursor(0)[1] - 1 == 3)
+
+  nav.list()
+  local ll = vim.fn.getloclist(0)
+  check("loclist lists the expansion", #ll == 1 and ll[1].text:find("helper", 1, true) ~= nil, vim.inspect(ll))
+  vim.cmd.lclose()
+  -- lopen switched windows; return to the view for the guard tests below.
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(win) == vbuf then
+      vim.api.nvim_set_current_win(win)
+      break
+    end
+  end
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+end
+
 -- Re-entrancy guard: while a resolver round trip is in flight, a second
 -- expand is refused; the stamp goes stale after FETCH_GUARD_MS so a leaked
 -- flag self-heals.

@@ -125,6 +125,8 @@ Open a file (with a language server attached), then:
 | `<leader>ei`  | `:InlineExplorerInline`     | Inline in place: functions inlined, macros expanded (C) |
 | `<leader>ec`  | (`za`)                      | Fold / unfold the expansion under the cursor        |
 | `u` / `<C-r>` | —                           | Undo / redo the last expansion (inside the view)    |
+| `]e` / `[e`   | `:InlineExplorerNext`/`Prev`| Jump to the next / previous expansion block         |
+| `<leader>el`  | `:InlineExplorerList`       | Expansion blocks in the location list               |
 | `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
 
 Expansions nest: move the cursor onto any function/macro inside an expanded body
@@ -136,6 +138,10 @@ Put the cursor on a function call or macro and expand it. Its body is spliced in
 below, indented and folded-open. Move into that body and expand again to go
 deeper. Folding a block collapses its subtree; unfolding reopens it — nothing is
 re-fetched.
+
+For deep sessions, `require("inline-explorer").breadcrumb()` returns the chain
+of expansions the cursor is inside (`do_work > helper`), empty outside a view —
+drop it into your statusline.
 
 > Tip: until your keymaps are sorted, drive it entirely by command
 > (`:InlineExplorerOpen`, then `:InlineExplorerExpand` on a symbol). The commands

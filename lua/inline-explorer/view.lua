@@ -57,6 +57,16 @@ function M.open()
   if km.redo then
     vim.keymap.set("n", km.redo, hist.redo, { buffer = view, desc = "Inline Explorer: redo expansion" })
   end
+  local nav = require("inline-explorer.nav")
+  if km.next_block then
+    vim.keymap.set("n", km.next_block, nav.next, { buffer = view, desc = "Inline Explorer: next expansion block" })
+  end
+  if km.prev_block then
+    vim.keymap.set("n", km.prev_block, nav.prev, { buffer = view, desc = "Inline Explorer: previous expansion block" })
+  end
+  if km.list_blocks then
+    vim.keymap.set("n", km.list_blocks, nav.list, { buffer = view, desc = "Inline Explorer: list expansion blocks" })
+  end
   return view
 end
 

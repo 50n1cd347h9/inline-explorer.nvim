@@ -16,6 +16,10 @@ function M.setup(opts)
     config.options.mode = (config.options.mode == "correct") and "readable" or "correct"
     vim.notify("[inline-explorer] substitution mode = " .. config.options.mode)
   end, { desc = "Toggle inline-substitution output between correct and readable" })
+  local nav = require("inline-explorer.nav")
+  vim.api.nvim_create_user_command("InlineExplorerNext", nav.next, { desc = "Jump to the next expansion block" })
+  vim.api.nvim_create_user_command("InlineExplorerPrev", nav.prev, { desc = "Jump to the previous expansion block" })
+  vim.api.nvim_create_user_command("InlineExplorerList", nav.list, { desc = "List expansion blocks in the location list" })
 
   local map = vim.keymap.set
   local km = o.keymaps
@@ -34,6 +38,13 @@ function M.setup(opts)
   if km.toggle_fold then
     map("n", km.toggle_fold, "za", { desc = "Inline Explorer: toggle fold" })
   end
+end
+
+-- Statusline helper: names of the expansions the cursor is inside,
+-- outermost first ("" outside a view). E.g.:
+--   require("inline-explorer").breadcrumb()
+function M.breadcrumb()
+  return require("inline-explorer.nav").breadcrumb()
 end
 
 return M
