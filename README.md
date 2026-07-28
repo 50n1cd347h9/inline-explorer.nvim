@@ -5,8 +5,9 @@ inline**, right where they are called — and expanding again inside what you ju
 expanded. No window-hopping, no floating peek windows.
 
 Built for reading the Linux kernel, but **language-agnostic**: it works for any
-language whose server implements `workspace/symbol` and that has a tree-sitter
-parser installed (C/C++, TypeScript/JavaScript, Python, Rust, Go, Lua, …).
+language whose server implements `workspace/symbol`, and reads best with a
+tree-sitter parser installed too (C/C++, TypeScript/JavaScript, Python, Rust,
+Go, Lua, …).
 
 Expansions happen in a dedicated **read-only copy** of the file, so your real
 source is never touched. Each expansion is a real block of text you can move the
@@ -35,9 +36,10 @@ ret = do_work(x);
   (clangd, ts_ls / vtsls, pyright, rust-analyzer, gopls, lua_ls, …). Resolution is
   powered by its index.
 - **The tree-sitter parser for your language** (`:TSInstall <lang>`, or via
-  `nvim-treesitter`). It is used for two things: extracting exact definition
-  bodies, and **highlighting the reading view**
-  (see [Syntax highlighting](#syntax-highlighting-in-the-view)).
+  `nvim-treesitter`). It powers **highlighting the reading view**
+  (see [Syntax highlighting](#syntax-highlighting-in-the-view)), C inline
+  substitution (`:InlineExplorerInline`), and serves as the extraction fallback
+  when the server yields no usable range.
 - For C specifically, a `compile_commands.json` clangd can find — essential for
   the kernel:
   ```sh

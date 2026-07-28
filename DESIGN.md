@@ -29,7 +29,9 @@ real, cursor-navigable buffer text. The copy buffer makes that safe.
 No server is attached to the copy buffer, and nested expansions sit on inserted
 text that has no position in any real file. So the symbol under the cursor is
 resolved by **name** (`workspace/symbol`), which works identically at depth 0 and
-depth N. tree-sitter then extracts the exact definition node from the target file.
+depth N. Once resolved, the server's `textDocument/documentSymbol` supplies the
+definition's full range; tree-sitter extraction only takes over as a fallback
+when the server doesn't provide a usable range.
 
 ## Components
 
