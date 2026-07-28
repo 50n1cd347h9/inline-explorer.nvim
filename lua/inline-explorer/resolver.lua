@@ -8,8 +8,9 @@
 --
 -- Extraction asks the same server for textDocument/documentSymbol on the
 -- definition's file and takes the symbol's full range -- no per-language node
--- tables. tree-sitter (a generic same-line-ancestor heuristic) and a brace
--- counter remain as fallbacks when no server range is available.
+-- tables. tree-sitter (a generic two-pass ancestor walk that skips a small
+-- set of transparent container nodes) and a brace counter remain as
+-- fallbacks when no server range is available.
 local M = {}
 
 -- Ask whichever server is attached to the source buffer where `name` is defined.
@@ -76,25 +77,40 @@ end
 
 -- Pick the definition's full range out of a documentSymbol response. Handles
 -- both shapes: hierarchical DocumentSymbol[] (range + children) and flat
--- SymbolInformation[] (location.range, name-matched). The deepest symbol whose
--- range contains -- and is wider than -- `ref_range` wins; a range identical
--- to ref_range is a name-only range and is rejected so extraction falls back
--- to tree-sitter instead of splicing a bare name. Returns (range, label).
-function M._symbol_range(symbols, ref_range, name)
+-- SymbolInformation[] (location.range, name-matched, optionally uri-matched).
+-- The deepest symbol whose range contains `ref_range` wins. DocumentSymbol
+-- .range is full-range by spec, so a hierarchical symbol whose range equals
+-- ref_range is a normal, valid match. SymbolInformation.location.range has
+-- no such guarantee -- some servers report just the name -- so for the flat
+-- shape only, a range identical to ref_range is rejected as name-only and
+-- extraction falls back to tree-sitter instead of splicing a bare name.
+-- `uri`, when given, additionally restricts flat entries to the requested
+-- document (workspace/symbol-shaped responses can span files). Returns
+-- (range, label).
+function M._symbol_range(symbols, ref_range, name, uri)
   local best, best_label
   local function consider(range, kind)
-    if contains(range, ref_range) and not same_range(range, ref_range) then
+    if contains(range, ref_range) then
       if not best or contains(best, range) then
         best, best_label = range, kind_label(kind)
       end
     end
   end
   local function walk(list)
-    for _, s in ipairs(list or {}) do
+    if type(list) ~= "table" then -- vim.NIL / absent children
+      return
+    end
+    for _, s in ipairs(list) do
       if s.range then -- hierarchical DocumentSymbol
         consider(s.range, s.kind)
         walk(s.children)
-      elseif s.location and s.location.range and (name == nil or s.name == name) then
+      elseif
+        s.location
+        and s.location.range
+        and (name == nil or s.name == name)
+        and (uri == nil or s.location.uri == nil or s.location.uri == uri)
+        and not same_range(s.location.range, ref_range)
+      then
         consider(s.location.range, s.kind) -- flat SymbolInformation
       end
     end
@@ -114,12 +130,36 @@ local function buffer_lang(bufnr)
   return vim.treesitter.language.get_lang(ft) or ft
 end
 
+-- Small set of transparent container nodes the ancestor walk below must
+-- never select, and must stop ascending past. This is NOT a revival of the
+-- old per-language definition table: it does not say what a definition
+-- looks like, only lists a handful of wrapper nodes (include guards,
+-- linkage blocks, and the declaration list they hold) whose *own* range is
+-- never the right answer, no matter the language.
+local CONTAINER_NODES = {
+  preproc_ifdef = true,
+  preproc_if = true,
+  preproc_else = true,
+  preproc_elif = true,
+  linkage_specification = true,
+  declaration_list = true,
+}
+
 -- Synchronous fallback extraction, used when no server range is available.
--- Table-free: the definition node is taken to be the outermost named ancestor
--- of the location that starts on the located line (or up to 3 lines above, for
--- return types / attributes on their own line). For C functions this naturally
--- yields the node type "function_definition" as the label. Without a parser,
--- the brace heuristic is the last resort.
+-- Table-free: starting at the located node and walking up through its
+-- ancestors, two candidates are tracked in a single pass, stopping (without
+-- recording it) at the first CONTAINER_NODES ancestor -- e.g. an #ifndef
+-- guard or an `extern "C"` block -- so a definition near the top of a
+-- guarded header never comes back as the whole guarded region:
+--   1. first_spanning: the FIRST (innermost) ancestor that starts within
+--      [srow-3, srow] (return types / attributes on their own line) and
+--      either spans multiple lines or ends after srow. This is the usual
+--      case and wins when present.
+--   2. outermost_in_window: the OUTERMOST ancestor starting within that
+--      same window, below the container reached (if any). This is the
+--      fallback for single-line definitions, where nothing satisfies (1).
+-- For C functions this naturally yields the node type "function_definition"
+-- as the label. Without a parser, the brace heuristic is the last resort.
 function M.extract_sync(loc)
   local bufnr = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(bufnr)
@@ -136,14 +176,21 @@ function M.extract_sync(loc)
       if ok and parser then
         local root = parser:parse()[1]:root()
         local node = root:named_descendant_for_range(srow, scol, srow, scol)
-        local best
+        local first_spanning, outermost_in_window
         while node and node:parent() do -- stop before the whole-file root
-          local a = node:range()
+          if CONTAINER_NODES[node:type()] then
+            break -- a bigger container reached; keep what was found below it
+          end
+          local a, _, b = node:range()
           if a >= srow - 3 and a <= srow then
-            best = node
+            outermost_in_window = node
+            if not first_spanning and (b > a or b > srow) then
+              first_spanning = node
+            end
           end
           node = node:parent()
         end
+        local best = first_spanning or outermost_in_window
         if best then
           local a, _, b, _ = best:range()
           return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), best:type()
@@ -156,10 +203,22 @@ function M.extract_sync(loc)
   return M.extract_heuristic(bufnr, srow), "heuristic"
 end
 
+-- Whether `c` advertises textDocument/documentSymbol support for `bufnr`.
+-- Guarded with pcall: the exact shape of Client:supports_method has moved
+-- around across 0.10/0.11, and an unknown shape must not be treated as
+-- support -- an unsupported client would otherwise leave buf_request_all's
+-- handler uncalled (an LSP error response, or never invoked at all).
+local function supports_document_symbol(c, bufnr)
+  local ok, does = pcall(c.supports_method, c, "textDocument/documentSymbol", bufnr)
+  return ok and does == true
+end
+
 -- Extract the definition at `loc`. Asks the server attached to `source_bufnr`
 -- for the target document's symbols and uses the returned full range; falls
--- back to extract_sync when there is no server, no response, or no usable
--- range. Calls cb(lines, label) -- possibly synchronously (fallback path).
+-- back to extract_sync when there is no server, no client actually supports
+-- documentSymbol, the target buffer never attaches to a client, the request
+-- errors, or there is no usable range. cb(lines, label) is called exactly
+-- once on every path -- possibly synchronously (fallback path).
 function M.extract(loc, source_bufnr, cb)
   local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
   local clients = vim.lsp.get_clients({ bufnr = bufnr })
@@ -169,30 +228,57 @@ function M.extract(loc, source_bufnr, cb)
 
   -- The definition file may not be open anywhere; load it and attach the
   -- source buffer's clients so the server learns about the document.
+  -- buf_attach_client can return false (e.g. the target ends up with no
+  -- real clients), and a client that never attaches or does not support
+  -- documentSymbol would otherwise mean buf_request_all's handler is either
+  -- never called or called with an error -- either way cb would never fire.
+  -- Only proceed with the async round trip once at least one client is
+  -- confirmed both attached and capable; otherwise fall back immediately.
   local target = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(target)
+  local usable = false
   for _, c in ipairs(clients) do
-    vim.lsp.buf_attach_client(target, c.id)
+    if vim.lsp.buf_attach_client(target, c.id) and supports_document_symbol(c, target) then
+      usable = true
+    end
+  end
+  if not usable then
+    return cb(M.extract_sync(loc))
   end
 
   local params = { textDocument = { uri = loc.uri } }
   vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
-    local range, label
-    for _, r in pairs(results or {}) do
-      if r.result then
-        range, label = M._symbol_range(r.result, loc.range, loc.name)
-        if range then
-          break
+    -- pcall so a malformed/unexpected response shape can't leave cb unfired.
+    local ok, lines, label = pcall(function()
+      local range, lbl
+      for _, r in pairs(results or {}) do
+        if r.result then
+          range, lbl = M._symbol_range(r.result, loc.range, loc.name, loc.uri)
+          if range then
+            break
+          end
         end
       end
-    end
-    if range then
-      local lines = vim.api.nvim_buf_get_lines(target, range.start.line, range["end"].line + 1, false)
-      if #lines > 0 then
-        return cb(lines, label)
+      if not range then
+        return nil, nil
       end
+      -- LSP ranges are end-exclusive; end.character == 0 on a line after
+      -- start means that line's content is not actually part of the range.
+      local erow = range["end"].line
+      if range["end"].character == 0 and erow > range.start.line then
+        erow = erow - 1
+      end
+      local ls = vim.api.nvim_buf_get_lines(target, range.start.line, erow + 1, false)
+      if #ls == 0 then
+        return nil, nil
+      end
+      return ls, lbl
+    end)
+    if ok and lines then
+      cb(lines, label)
+    else
+      cb(M.extract_sync(loc))
     end
-    cb(M.extract_sync(loc))
   end)
 end
 

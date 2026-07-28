@@ -109,5 +109,69 @@ do
   check("extract: fallback returned the body", got_lines ~= nil and table.concat(got_lines, "\n"):find("return 1", 1, true) ~= nil)
 end
 
+-- extract_sync: include-guarded header must not swallow the whole guard.
+-- Pass 1 of the two-pass ancestor walk must find the function_definition
+-- before the preproc_ifdef container is ever reached; the container must
+-- not be selected and the walk must not ascend past it.
+do
+  local hpath = vim.fn.tempname() .. ".h"
+  local f = assert(io.open(hpath, "w"))
+  f:write("#ifndef FOO_H\n#define FOO_H\nstatic int acc(int cpu)\n{\n    return cpu + 1;\n}\n#endif\n")
+  f:close()
+  local col = ("static int acc(int cpu)"):find("acc") - 1
+  local lines, label = resolver.extract_sync({ uri = vim.uri_from_fname(hpath), range = range(2, col, 2, col) })
+  check("extract_sync: include guard -> function_definition, not the guard", label == "function_definition", tostring(label))
+  local body = lines and table.concat(lines, "\n") or ""
+  check(
+    "extract_sync: include guard body is exactly the 4 function lines",
+    lines ~= nil and #lines == 4 and body:find("acc", 1, true) ~= nil,
+    lines
+  )
+  check("extract_sync: include guard body excludes #ifndef", not body:find("#ifndef", 1, true))
+  check("extract_sync: include guard body excludes #endif", not body:find("#endif", 1, true))
+end
+
+-- _symbol_range: hierarchical DocumentSymbol whose range equals ref_range
+-- must still be accepted -- DocumentSymbol.range is full-range by spec, so
+-- the name-only rejection must not apply here (only to flat
+-- SymbolInformation, where location.range really can be name-only).
+do
+  local symbols = {
+    { name = "f", kind = 12, range = range(2, 0, 5, 1), selectionRange = range(2, 11, 2, 12) },
+  }
+  local ref = range(2, 0, 5, 1)
+  local r, label = resolver._symbol_range(symbols, ref, "f")
+  check(
+    "hierarchical: range equal to ref_range is accepted (full-range by spec)",
+    r ~= nil and r.start.line == 2 and r["end"].line == 5,
+    r
+  )
+  check("hierarchical: equal-range symbol still labeled function_definition", label == "function_definition", label)
+end
+
+-- _symbol_range: flat SymbolInformation whose location.uri differs from the
+-- requested document must be ignored.
+do
+  local flat = {
+    { name = "f", kind = 12, location = { uri = "file:///elsewhere.c", range = range(6, 0, 9, 1) } },
+  }
+  local r = resolver._symbol_range(flat, range(6, 11, 6, 12), "f", "file:///x.c")
+  check("flat: cross-file uri is rejected", r == nil, r)
+end
+
+-- _symbol_range: vim.NIL (JSON null) children must not throw.
+do
+  local symbols = {
+    { name = "f", kind = 12, range = range(0, 0, 2, 1), selectionRange = range(0, 4, 0, 5), children = vim.NIL },
+  }
+  local ok, r = pcall(resolver._symbol_range, symbols, range(1, 0, 1, 1), "f")
+  check("_symbol_range: vim.NIL children do not error", ok, r)
+  check(
+    "_symbol_range: vim.NIL children -> range still returned",
+    ok and r ~= nil and r.start.line == 0 and r["end"].line == 2,
+    r
+  )
+end
+
 print("")
 print(fails == 0 and "ALL RESOLVER TESTS PASSED" or (fails .. " FAILURE(S)"))
