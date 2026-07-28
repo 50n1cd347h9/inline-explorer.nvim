@@ -38,47 +38,31 @@ local function markup(contents)
   return table.concat(parts, "\n")
 end
 
--- Extract the expansion from clangd's macro hover markdown: prefer the fenced
--- code block after an "Expands to" marker, else the last code block, else text.
+-- Extract the expansion from clangd's macro hover markdown. clangd puts the
+-- `#define` and the expansion in fenced code, separated by an "Expands to"
+-- marker that may be plain markdown OR a `// Expands to` comment inside the same
+-- block. Take the code that follows the marker (falling back to all code).
 local function expansion_lines(md)
-  local lines = vim.split(md, "\n", { plain = true })
-  local expands_at
-  for i, l in ipairs(lines) do
-    if l:lower():find("expands to", 1, true) then
-      expands_at = i
-      break
-    end
-  end
-
-  local blocks, cur, startln = {}, nil, nil
-  for i, l in ipairs(lines) do
+  local incode, seen = false, false
+  local after, all = {}, {}
+  for _, l in ipairs(vim.split(md, "\n", { plain = true })) do
     if l:match("^%s*```") then
-      if cur then
-        blocks[#blocks + 1] = { startln, cur }
-        cur = nil
-      else
-        cur, startln = {}, i
-      end
-    elseif cur then
-      cur[#cur + 1] = l
-    end
-  end
-
-  if expands_at then
-    for _, b in ipairs(blocks) do
-      if b[1] > expands_at then
-        return b[2]
+      incode = not incode
+    elseif l:lower():find("expands to", 1, true) then
+      seen = true -- marker line itself is dropped
+    elseif incode then
+      all[#all + 1] = l
+      if seen then
+        after[#after + 1] = l
       end
     end
   end
-  if #blocks > 0 then
-    return blocks[#blocks][2]
+  local out = (seen and #after > 0) and after or all
+  while out[1] and out[1]:match("^%s*$") do
+    table.remove(out, 1)
   end
-  local out = {}
-  for _, l in ipairs(lines) do
-    if l:match("%S") then
-      out[#out + 1] = l
-    end
+  while out[#out] and out[#out]:match("^%s*$") do
+    table.remove(out)
   end
   return out
 end
@@ -115,9 +99,10 @@ function M.replace_in_src(src, row, col, exp_lines)
     parts[i] = l
   end
   if #parts > 1 then
-    -- Indent continuation lines under the use's own line.
+    -- Indent continuation lines to the leading whitespace of the use's line
+    -- (NOT everything before the macro, which would repeat `foo = ` on each line).
     local bol = sb(inv) - scol(inv)
-    local indent = src:sub(bol + 1, sb(inv))
+    local indent = src:sub(bol + 1):match("^[ \t]*")
     for i = 2, #parts do
       parts[i] = indent .. parts[i]
     end
