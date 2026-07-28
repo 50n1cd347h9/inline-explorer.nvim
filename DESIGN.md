@@ -51,6 +51,13 @@ compiler-style inlining — so the surrounding statement reads on its own.
 Decisions (from brainstorming): C-only, `goto` allowed, no fallback to
 block-paste, rigour level X (compile-correct).
 
+Since the 2026-07 restructuring the engine is a pipeline: `analyze_callee`
+resolves the callee into a small IR, `analyze_context` resolves the call
+site, and a single `decide()` picks one of three layout-only printers
+(pretty hoist / canonical statement expression / readable-multi). The
+canonical form is the semantic baseline — legal in any expression context —
+and prettier output is only chosen when the analysis proves it safe.
+
 Mechanism:
 
 - Parameters bind via `__typeof__(arg) param = (arg);` — dodges declarator
