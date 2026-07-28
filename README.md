@@ -196,6 +196,15 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
   Every transform the engine accepts must compile and pass.
 - `tests/substitute_spec.lua` compiles+runs a focused set of shaped cases
   (pointers, early returns, labels, collisions, void, a kernel-style accessor).
+- `tests/properties_spec.lua` and `tests/pbt_spec.lua` add **property-based
+  testing** on top: a deterministic generator (`tests/lib/gen.lua`) builds
+  UB-free random callees and splices them into nine caller contexts. The fast
+  layer checks tree-sitter invariants over ~300 cases per run; the gcc layer
+  builds and runs each program before and after substitution and requires
+  byte-identical stdout — and whenever the engine chooses the pretty form, the
+  canonical form of the same call must agree too. Failures shrink to a minimal
+  counterexample and print their seed (`IE_PBT_SEED` / `IE_PBT_CASES` /
+  `IE_PROP_CASES` control reproduction and budget). A zero-argument call wrapped as `(f()) & k` parses as a cast in tree-sitter-c (no semantic type info), so the engine's rejection of that shape is expected and exempted by the property layers.
 
 ```sh
 nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!"

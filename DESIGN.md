@@ -99,6 +99,14 @@ expression referencing body locals, `__typeof__`/`__auto_type` mistyping NULL
 pointer arguments, missed collisions on array/pointer declarations, and hoisting
 across a `switch` `case` label.
 
+On top of the shaped and real-source suites, `tests/properties_spec.lua` and
+`tests/pbt_spec.lua` run property-based tests over a deterministic random
+generator (`tests/lib/gen.lua`): tree-sitter invariants (clean re-parse, call
+count, unique injected names, safe rejection) on ~300 cases per run, and a gcc
+differential that requires byte-identical stdout before and after substitution,
+including canonical-vs-pretty agreement whenever the analysis picked the pretty
+form. Counterexamples shrink greedily and reproduce from a printed seed.
+
 ## Macro expansion (C-only)
 
 Macros have no type and no guaranteed statement/expression structure, so the
