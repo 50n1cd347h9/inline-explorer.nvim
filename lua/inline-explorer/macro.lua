@@ -332,11 +332,29 @@ local function client_request(client, method, params, handler, bufnr)
   return client.request(method, params, handler, bufnr)
 end
 
+-- Drop claim lists and interceptor bookkeeping for clients that no longer
+-- exist (ids are monotonic, so no reuse hazard -- this is pure housekeeping,
+-- run on each fetch so a restarted clangd doesn't leave dead entries behind).
+function M._prune_dead_clients()
+  for id in pairs(pending) do
+    if not vim.lsp.get_client_by_id(id) then
+      pending[id] = nil
+      our_handler[id] = nil
+    end
+  end
+  for id in pairs(our_handler) do
+    if not vim.lsp.get_client_by_id(id) then
+      our_handler[id] = nil
+    end
+  end
+end
+
 -- Fetch the expansion via the ExpandMacro tweak. Calls cb(lines|nil) exactly
 -- once: on success with the applyEdit's newText lines, on any failure -- no
 -- clangd, no tweak support, no action at this position, request error, or
 -- timeout -- with nil so the caller can fall back.
 local function fetch_via_tweak(st, row, col, cb)
+  M._prune_dead_clients()
   local client = vim.lsp.get_clients({ bufnr = st.source_bufnr, name = "clangd" })[1]
   if not client then
     return cb(nil)

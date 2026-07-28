@@ -253,16 +253,38 @@ function M.extract(loc, source_bufnr, cb)
   -- never to fire and we must fall back immediately instead of waiting.
   local target = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(target)
+  -- Track which clients WE attach, so they can be detached again once the
+  -- request settles: every expansion used to leave a permanent didOpen on the
+  -- definition file, and a long session accumulated server-side documents
+  -- (clangd retains an AST per open file). A buffer the user actually has in
+  -- a window keeps its attachment.
+  local newly_attached = {}
   for _, c in ipairs(clients) do
+    local pre = c.attached_buffers and c.attached_buffers[target]
     vim.lsp.buf_attach_client(target, c.id)
+    if not pre then
+      newly_attached[#newly_attached + 1] = c.id
+    end
+  end
+  local function release_target()
+    if #vim.fn.win_findbuf(target) > 0 then
+      return -- visible to the user; leave the attachment alone
+    end
+    for _, id in ipairs(newly_attached) do
+      pcall(vim.lsp.buf_detach_client, target, id)
+    end
   end
   if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
+    release_target()
     return cb(M.extract_sync(loc))
   end
 
   -- A wedged server must not hang the keypress: after the timeout, extract
   -- locally and say so (the late response, if any, is dropped by the guard).
-  local finish = once_with_timeout(cb, function()
+  local finish = once_with_timeout(function(...)
+    release_target()
+    cb(...)
+  end, function()
     vim.notify("[inline-explorer] documentSymbol timed out; extracted locally", vim.log.levels.WARN)
     return M.extract_sync(loc)
   end)

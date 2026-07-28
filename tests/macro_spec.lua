@@ -292,5 +292,14 @@ do
   check("kernel-shaped expansion loses the redundant nest", new:find("!= ({ int v = 1; v; });", 1, true) ~= nil, new)
 end
 
+-- Housekeeping: claims and interceptor bookkeeping for dead client ids are
+-- pruned on the next fetch.
+do
+  macro._pending[99991] = { { uri = "file:///x.c", pos = { line = 0, character = 0 } } }
+  macro._pending[99992] = {}
+  macro._prune_dead_clients()
+  check("dead-client claims pruned", macro._pending[99991] == nil and macro._pending[99992] == nil)
+end
+
 print("")
 print(fails == 0 and "ALL MACRO TESTS PASSED" or (fails .. " FAILURE(S)"))

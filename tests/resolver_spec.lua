@@ -281,6 +281,28 @@ do
     check("extract: wedged server falls back to extract_sync", got_label == "function_definition", tostring(got_label))
     check("extract: fallback body intact", got_lines ~= nil and table.concat(got_lines, "\n"):find("return 9", 1, true) ~= nil)
 
+    -- Attachment hygiene: extract attached the wedge client to a definition
+    -- file the user never opened in a window; once the request settles the
+    -- attachment must be released (no permanent didOpen accumulation).
+    local h2 = vim.fn.tempname() .. ".h"
+    local f2 = assert(io.open(h2, "w"))
+    f2:write("static int other_fn(void)\n{\n    return 5;\n}\n")
+    f2:close()
+    local got2
+    resolver.extract(
+      { uri = vim.uri_from_fname(h2), range = range(0, 11, 0, 13), name = "other_fn" },
+      src_buf,
+      function(lines)
+        got2 = lines
+      end
+    )
+    vim.wait(2000, function()
+      return got2 ~= nil
+    end, 20)
+    local target2 = vim.uri_to_bufnr(vim.uri_from_fname(h2))
+    local still = #vim.lsp.get_clients({ bufnr = target2, name = "wedge" })
+    check("extract: temporary attachment released after settling", still == 0, "clients still attached: " .. still)
+
     resolver._timeout_ms = saved
     if client_id then
       vim.lsp.stop_client(client_id, true)
