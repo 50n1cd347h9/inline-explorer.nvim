@@ -98,7 +98,7 @@ for i, call in ipairs(calls) do
   if ok and new and new ~= src0 then
     accepted = accepted + 1
     write(cfile, new)
-    local build = vim.fn.system({ "gcc", "-std=c99", "-Wno-unused-label", cfile, dir .. "/test.c", "-o", work .. "/v", "-lm" })
+    local build = vim.fn.system({ "gcc", "-std=c99", "-Werror=implicit-function-declaration", "-Wno-unused-label", cfile, dir .. "/test.c", "-o", work .. "/v", "-lm" })
     if vim.v.shell_error ~= 0 then
       failures[#failures + 1] = { call.name, "compile:\n" .. build:sub(1, 300) }
     else

@@ -103,6 +103,7 @@ yourself — these are independent of `mapleader`:
 ```lua
 vim.keymap.set("n", "<space>eo", "<cmd>InlineExplorerOpen<cr>")
 vim.keymap.set("n", "<space>ee", "<cmd>InlineExplorerExpand<cr>")
+vim.keymap.set("n", "<space>ei", "<cmd>InlineExplorerInline<cr>")
 vim.keymap.set("n", "<space>ec", "za")
 vim.keymap.set("n", "<space>eq", "<cmd>InlineExplorerClose<cr>")
 ```
@@ -119,7 +120,7 @@ Open a file (with a language server attached), then:
 | ------------- | --------------------------- | --------------------------------------------------- |
 | `<leader>eo`  | `:InlineExplorerOpen`       | Open a reading view for the current file            |
 | `<leader>ee`  | `:InlineExplorerExpand`     | Block-expand the symbol under the cursor (any lang) |
-| `<leader>ei`  | `:InlineExplorerSubstitute` | Inline in place: functions inlined, macros expanded (C) |
+| `<leader>ei`  | `:InlineExplorerInline`     | Inline in place: functions inlined, macros expanded (C) |
 | `<leader>ec`  | (`za`)                      | Fold / unfold the expansion under the cursor        |
 | `u` / `r`     | —                           | Undo / redo the last expansion (inside the view)    |
 | `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
@@ -140,7 +141,7 @@ re-fetched.
 
 ## Inline substitution (C)
 
-`:InlineExplorerSubstitute` (`<leader>ei`) does more than paste the definition
+`:InlineExplorerInline` (`<leader>ei`) does more than paste the definition
 below the call — it **rewrites the call into the effect of the function body**,
 the way a compiler inlines it, so the surrounding statement reads on its own. This
 is C-only and requires the tree-sitter `c` parser.
@@ -225,10 +226,13 @@ Defaults:
 ```lua
 require("inline-explorer").setup({
   keymaps = {
-    expand = "<leader>ee",
+    substitute = "<leader>ei", -- smart inline (in place); the primary action
+    expand = "<leader>ee",     -- explicit block-paste (also the fallback)
     toggle_fold = "<leader>ec",
     open = "<leader>eo",
     close = "<leader>eq",
+    undo = "u",                -- buffer-local to the view
+    redo = "r",                -- buffer-local to the view
   },
   indent = "  ", -- indent added per expansion level
   header = true, -- wrap each expansion in /* v name */ ... /* ^ name */

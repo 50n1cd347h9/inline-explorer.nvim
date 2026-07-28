@@ -31,7 +31,7 @@ local function compiles(src, name)
   local p = tmp .. "/" .. name .. ".c"
   writef(p, src)
   local out = vim.fn.system({
-    "gcc", "-std=gnu11", "-fsyntax-only",
+    "gcc", "-std=gnu11", "-fsyntax-only", "-Werror=implicit-function-declaration",
     "-Wno-unused-label", "-Wno-unused-function", "-Wno-unused-variable", p,
   })
   return vim.v.shell_error == 0, out
@@ -40,7 +40,10 @@ end
 local function run_ok(src, name)
   local c, exe = tmp .. "/" .. name .. ".c", tmp .. "/" .. name .. ".out"
   writef(c, src)
-  local out = vim.fn.system({ "gcc", "-std=gnu11", "-Wno-unused-label", "-Wno-unused-function", c, "-o", exe })
+  local out = vim.fn.system({
+    "gcc", "-std=gnu11", "-Werror=implicit-function-declaration",
+    "-Wno-unused-label", "-Wno-unused-function", c, "-o", exe,
+  })
   if vim.v.shell_error ~= 0 then
     return false, out
   end
@@ -51,7 +54,7 @@ end
 local function transform(caller, callee, fname, seq)
   local src = caller
   for _, step in ipairs(seq) do
-    local new, err = S.inline_call(src, callee, fname, step.N, step.occ or 1)
+    local new, err = S.inline_call(src, callee, fname, step.N, step.occ or 1, step.mode)
     assert(new, ("inline_call failed (N=%d): %s"):format(step.N, tostring(err)))
     src = new
   end
@@ -244,6 +247,281 @@ do
   local main = "int main(void){ return (caller(20)==1 && caller(5)==99 && caller(-1)==99)?0:1; }\n"
   check("case9 compiles (unbraced if, multi-return)", (compiles(callee .. "\n" .. t .. main, "c9")), t)
   check("case9 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c9")))
+end
+
+-- Case 10: readable mode, multi-statement single-return callee -> pretty hoist,
+-- and never a statement expression / goto.
+do
+  local callee = [[static int calc(int x)
+{
+    int a = x + 1;
+    int b = a * 2;
+    return a + b;
+}]]
+  local caller = [[static int caller(int n)
+{
+    return calc(n) - 1;
+}]]
+  local t = transform(caller, callee, "calc", { { N = 1, mode = "readable" } })
+  local main = "int main(void){ return (caller(3)==11)?0:1; }\n"
+  check("case10 readable never emits ({...}) or goto", not t:find("({", 1, true) and not t:find("goto", 1, true), t)
+  check("case10 compiles (readable, pretty hoist)", (compiles(callee .. "\n" .. t .. main, "c10")))
+  check("case10 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c10")))
+end
+
+-- Case 11: readable mode, if/else returns (no fallthrough conflict) -> hoisted
+-- with return -> assignment; still compiles and preserves semantics here.
+do
+  local callee = [[static int sign(int x)
+{
+    if (x >= 0)
+        return 1;
+    else
+        return -1;
+}]]
+  local caller = [[static int caller(int n)
+{
+    int s = sign(n);
+    return s * 10;
+}]]
+  local t = transform(caller, callee, "sign", { { N = 1, mode = "readable" } })
+  local main = "int main(void){ return (caller(5)==10 && caller(-5)==-10)?0:1; }\n"
+  check("case11 readable multi-return has no ({...})/goto", not t:find("({", 1, true) and not t:find("goto", 1, true), t)
+  check("case11 rewrote returns to assignments", t:find("__ie_ret1 =") ~= nil, t)
+  check("case11 compiles (readable, multi-return)", (compiles(callee .. "\n" .. t .. main, "c11")))
+  check("case11 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c11")))
+end
+
+-- Case 12: hoist is unsafe under short-circuit / ternary / if-header, even for a
+-- simple callee -> correct mode must fall back to a statement expression, and
+-- short-circuit behaviour (skipping the side effect) must be preserved.
+do
+  local prelude = [[
+static int cnt = 0;
+static int bump(void)
+{
+    int one = 1;
+    return cnt += one;
+}
+]]
+  local callee = [[static int bump(void)
+{
+    int one = 1;
+    return cnt += one;
+}]]
+
+  local caller_and = [[static int caller(int a)
+{
+    return a && bump();
+}]]
+  local t = transform(caller_and, callee, "bump", { { N = 1 } })
+  local main = "int main(void){ cnt = 0; if (caller(0) != 0) return 1; if (cnt != 0) return 2;"
+    .. " if (caller(1) != 1) return 3; if (cnt != 1) return 4; return 0; }\n"
+  check("case12 && operand uses a statement expr (no unsafe hoist)", t:find("({", 1, true) ~= nil, t)
+  check("case12 compiles (short-circuit)", (compiles(prelude .. t .. main, "c12a")))
+  check("case12 short-circuit still skips the side effect", (run_ok(prelude .. t .. main, "c12a")))
+
+  local caller_tern = [[static int caller(int c)
+{
+    return c ? bump() : 7;
+}]]
+  local t2 = transform(caller_tern, callee, "bump", { { N = 1 } })
+  check("case12 ternary arm uses a statement expr", t2:find("({", 1, true) ~= nil, t2)
+  local main2 = "int main(void){ cnt = 0; if (caller(0) != 7) return 1; if (cnt != 0) return 2; return 0; }\n"
+  check("case12 ternary compiles and skips untaken arm", (run_ok(prelude .. t2 .. main2, "c12b")))
+
+  local caller_if = [[static int caller(int a)
+{
+    if (bump() == a)
+        return 1;
+    return 0;
+}]]
+  local t3 = transform(caller_if, callee, "bump", { { N = 1 } })
+  check("case12 if-header call uses a statement expr", t3:find("({", 1, true) ~= nil, t3)
+  local main3 = "int main(void){ cnt = 0; return (caller(1)==1 && caller(5)==0 && cnt==2)?0:1; }\n"
+  check("case12 if-header compiles and runs", (run_ok(prelude .. t3 .. main3, "c12c")))
+end
+
+-- Case 13: statement after a case/goto label is not directly inside braces ->
+-- the hoist must be wrapped in a block (a declaration cannot follow a bare label).
+do
+  local callee = [[static int dbl(int x)
+{
+    int t = x * 2;
+    return t;
+}]]
+
+  local caller_case = [[static int caller(int n)
+{
+    switch (n) {
+    case 1:
+        return dbl(n);
+    default:
+        return 0;
+    }
+}]]
+  local t = transform(caller_case, callee, "dbl", { { N = 1 } })
+  local main = "int main(void){ return (caller(1)==2 && caller(9)==0)?0:1; }\n"
+  check("case13 compiles (hoist after case label wrapped)", (compiles(callee .. "\n" .. t .. main, "c13a")), t)
+  check("case13 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c13a")))
+
+  local caller_goto = [[static int caller(int n)
+{
+    if (n < 0)
+        goto out;
+    return 0;
+out:
+    return dbl(n);
+}]]
+  local t2 = transform(caller_goto, callee, "dbl", { { N = 1 } })
+  local main2 = "int main(void){ return (caller(-3)==-6 && caller(3)==0)?0:1; }\n"
+  check("case13 compiles (hoist after goto label wrapped)", (compiles(callee .. "\n" .. t2 .. main2, "c13b")), t2)
+  check("case13 goto-label variant runs equal", (run_ok(callee .. "\n" .. t2 .. main2, "c13b")))
+end
+
+-- Case 14: non-inlinable / invalid inputs report errors instead of producing code.
+do
+  local caller = "static int caller(int n)\n{\n    return f(n);\n}"
+
+  local variadic = "static int f(int x, ...)\n{\n    return x;\n}"
+  local new, err = S.inline_call(caller, variadic, "f", 1, 1)
+  check("case14 variadic -> error", new == nil and tostring(err):find("variadic") ~= nil, tostring(err))
+
+  local two_params = "static int f(int a, int b)\n{\n    return a + b;\n}"
+  new, err = S.inline_call(caller, two_params, "f", 1, 1)
+  check("case14 arity mismatch -> error", new == nil and tostring(err):find("arity") ~= nil, tostring(err))
+
+  local empty = "static int f(int x)\n{\n}"
+  new, err = S.inline_call(caller, empty, "f", 1, 1)
+  check("case14 empty body -> error", new == nil and tostring(err):find("empty") ~= nil, tostring(err))
+
+  local ok_callee = "static int g(int x)\n{\n    return x;\n}"
+  new, err = S.inline_call(caller, ok_callee, "g", 1, 1)
+  check("case14 no call in caller -> error", new == nil and tostring(err):find("not found") ~= nil, tostring(err))
+end
+
+-- Case 15: parameter bindings reconstruct the declared type: a NULL/0 argument
+-- keeps its pointer type, arrays decay to pointers, and exotic declarators
+-- (function pointers) fall back to __auto_type.
+do
+  local callee_null = [[static int isnull(char *p)
+{
+    if (p)
+        return 0;
+    return 1;
+}]]
+  local caller_null = [[static int caller(void)
+{
+    return isnull(0);
+}]]
+  local t = transform(caller_null, callee_null, "isnull", { { N = 1 } })
+  local main = "int main(void){ return (caller()==1)?0:1; }\n"
+  check("case15 NULL arg bound with declared pointer type", t:find("char %*p = %(0%);") ~= nil, t)
+  check("case15 NULL-arg compiles", (compiles(callee_null .. "\n" .. t .. main, "c15a")))
+  check("case15 NULL-arg runs equal", (run_ok(callee_null .. "\n" .. t .. main, "c15a")))
+
+  local callee_arr = [[static int first(int a[])
+{
+    return a[0];
+}]]
+  local caller_arr = [[static int caller(void)
+{
+    int arr[3] = { 42, 1, 2 };
+    return first(arr);
+}]]
+  local t2 = transform(caller_arr, callee_arr, "first", { { N = 1 } })
+  local main2 = "int main(void){ return (caller()==42)?0:1; }\n"
+  check("case15 array param decays to pointer", t2:find("int %*a = %(arr%);") ~= nil, t2)
+  check("case15 array-param compiles", (compiles(callee_arr .. "\n" .. t2 .. main2, "c15b")))
+  check("case15 array-param runs equal", (run_ok(callee_arr .. "\n" .. t2 .. main2, "c15b")))
+
+  local callee_fp = [[static int apply(int (*fp)(int), int x)
+{
+    int r = fp(x);
+    return r + 1;
+}]]
+  local caller_fp = [[static int add2(int v) { return v + 2; }
+static int caller(int n)
+{
+    return apply(add2, n);
+}]]
+  local t3 = transform(caller_fp, callee_fp, "apply", { { N = 1 } })
+  local main3 = "int main(void){ return (caller(4)==7)?0:1; }\n"
+  check("case15 function-pointer param falls back to __auto_type, name kept", t3:find("__auto_type fp =") ~= nil, t3)
+  check("case15 fn-pointer compiles", (compiles(callee_fp .. "\n" .. t3 .. main3, "c15c")))
+  check("case15 fn-pointer runs equal", (run_ok(callee_fp .. "\n" .. t3 .. main3, "c15c")))
+end
+
+-- Case 16: nested inlining -- inline f, then inline the call to g that f's body
+-- brought with it (the cursor-position path a user would take in the view).
+do
+  local callee_g = [[static int g(int x)
+{
+    int t = x + 10;
+    return t;
+}]]
+  local callee_f = [[static int f(int x)
+{
+    int y = g(x) * 2;
+    return y + 1;
+}]]
+  local caller = [[static int caller(int n)
+{
+    int r = f(n);
+    return r;
+}]]
+  local t = transform(caller, callee_f, "f", { { N = 1 } })
+  check("case16 first inline exposed the inner call", t:find("g(", 1, true) ~= nil, t)
+
+  -- Locate the spliced g(...) call and inline it from that cursor position.
+  local grow, gcol
+  for i, l in ipairs(vim.split(t, "\n", { plain = true })) do
+    local c = l:find("g%(")
+    if c then
+      grow, gcol = i - 1, c - 1
+      break
+    end
+  end
+  local t2 = assert(S.inline_in_buffer(t, grow, gcol, callee_g, 2))
+  local main = "int main(void){ return (caller(5)==31)?0:1; }\n"
+  check("case16 nested inline removed the inner call", not t2:find("g(", 1, true), t2)
+  check("case16 compiles (nested inline)", (compiles(callee_g .. "\n" .. callee_f .. "\n" .. t2 .. main, "c16")), t2)
+  check("case16 runs equal to original", (run_ok(callee_g .. "\n" .. callee_f .. "\n" .. t2 .. main, "c16")))
+end
+
+-- Case 17: tab-indented caller -> hoisted lines and wrapping use tabs.
+do
+  local callee = "static int dbl(int x)\n{\n\tint t = x * 2;\n\treturn t;\n}"
+  local caller = "static int caller(int n)\n{\n\treturn dbl(n) + 1;\n}"
+  local t = transform(caller, callee, "dbl", { { N = 1 } })
+  local main = "int main(void){ return (caller(3)==7)?0:1; }\n"
+  check("case17 hoisted lines keep the caller's tab indent", t:find("\n\tint t = ") ~= nil, t)
+  check("case17 compiles (tab indent)", (compiles(callee .. "\n" .. t .. main, "c17")))
+  check("case17 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c17")))
+end
+
+-- Case 18: pointer-returning callee with early returns -> the statement-expr
+-- result slot reconstructs the full pointer depth (char **).
+do
+  local callee = [[static char **pick(char **a, char **b, int c)
+{
+    if (c)
+        return a;
+    return b;
+}]]
+  local caller = [[static char *caller(int c)
+{
+    static char *x = "x", *y = "y";
+    static char *ap[1], *bp[1];
+    ap[0] = x; bp[0] = y;
+    return pick(ap, bp, c)[0];
+}]]
+  local t = transform(caller, callee, "pick", { { N = 1 } })
+  local main = "int main(void){ return (strcmp(caller(1),\"x\")==0 && strcmp(caller(0),\"y\")==0)?0:1; }\n"
+  local src18 = "#include <string.h>\n" .. callee .. "\n" .. t .. "\n" .. main
+  check("case18 result slot keeps pointer depth", t:find("char %*%* ?__ie_ret1;") ~= nil, t)
+  check("case18 compiles (char ** return)", (compiles(src18, "c18")), t)
+  check("case18 runs equal to original", (run_ok(src18, "c18")))
 end
 
 print("")
