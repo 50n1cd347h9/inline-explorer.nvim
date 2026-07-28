@@ -312,7 +312,7 @@ cross build.
 - **Recursion guard is ancestor-only**: a symbol will not expand inside its own
   body, but mutual recursion across siblings is not detected.
 
-# TODO
+## TODO
 - test with Linux Kernel
 
 ## License
