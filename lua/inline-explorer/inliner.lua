@@ -40,7 +40,13 @@ function M.smart()
     return vim.notify("[inline-explorer] nothing under the cursor", vim.log.levels.WARN)
   end
 
+  if not view.begin_fetch(st) then
+    return vim.notify("[inline-explorer] a lookup is already in flight", vim.log.levels.INFO)
+  end
+
+  -- The guard is released before delegating: expander.expand acquires its own.
   local function block_fallback()
+    view.end_fetch(st)
     vim.schedule(expander.expand)
   end
 
@@ -54,6 +60,7 @@ function M.smart()
         local ok, new = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
         if ok and new then
           return vim.schedule(function()
+            view.end_fetch(st)
             st.subst_n = N
             view.rewrite(st, bufnr, new, row)
           end)
@@ -72,8 +79,10 @@ function M.smart()
         vim.schedule(function()
           local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
           if ok and new then
+            view.end_fetch(st)
             view.rewrite(st, bufnr, new, row)
           else
+            view.end_fetch(st)
             expander.expand()
           end
         end)

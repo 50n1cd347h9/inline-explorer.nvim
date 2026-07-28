@@ -69,6 +69,25 @@ function M.current()
   return M.state[vim.api.nvim_get_current_buf()]
 end
 
+-- Re-entrancy guard: one resolver round trip per view at a time, so two quick
+-- keypresses on a slow server cannot interleave their splices. The stamp goes
+-- stale after FETCH_GUARD_MS, so a leaked flag can never wedge the view
+-- permanently (the resolver's own timeout fires well before that).
+M.FETCH_GUARD_MS = 5000
+
+function M.begin_fetch(st)
+  local now = vim.uv.now()
+  if st.fetch_started and (now - st.fetch_started) < M.FETCH_GUARD_MS then
+    return false
+  end
+  st.fetch_started = now
+  return true
+end
+
+function M.end_fetch(st)
+  st.fetch_started = nil
+end
+
 -- Replace the whole view buffer with `new_src` (used by in-place transforms).
 -- Snapshots for undo first, and resets block-expansion tracking since the
 -- wholesale rewrite invalidates its extmarks/folds.

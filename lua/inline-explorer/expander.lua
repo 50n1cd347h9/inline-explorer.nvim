@@ -41,14 +41,20 @@ function M.expand()
     return notify("'" .. name .. "' is already expanded above (recursion guard)", vim.log.levels.INFO)
   end
 
+  if not view.begin_fetch(st) then
+    return notify("a lookup is already in flight", vim.log.levels.INFO)
+  end
+
   resolver.locate(name, st.source_bufnr, function(loc, err)
     if not loc then
+      view.end_fetch(st)
       return vim.schedule(function()
         notify(err or "not found")
       end)
     end
     resolver.extract(loc, st.source_bufnr, function(body, label)
       vim.schedule(function()
+        view.end_fetch(st)
         if not body or #body == 0 then
           return notify("could not extract a body for '" .. name .. "'")
         end
