@@ -110,25 +110,53 @@ do
 end
 
 -- extract_sync: include-guarded header must not swallow the whole guard.
--- Pass 1 of the two-pass ancestor walk must find the function_definition
--- before the preproc_ifdef container is ever reached; the container must
--- not be selected and the walk must not ascend past it.
+-- The definition here is a ONE-LINE function specifically so this test pins
+-- the CONTAINER_NODES denylist itself: with the outermost-in-window walk
+-- and an empty denylist, a multi-line body would still happen to stop at
+-- the function_definition (its parent, translation_unit, is the loop-exit
+-- root) even without the guard against ascending into the preproc_ifdef --
+-- but a one-line function's function_definition node is a plausible
+-- "outermost in window" candidate all the way up through the #ifndef itself
+-- (which also starts within the window), so only the denylist stops the
+-- ascent there and keeps the whole header out of the result.
 do
   local hpath = vim.fn.tempname() .. ".h"
   local f = assert(io.open(hpath, "w"))
-  f:write("#ifndef FOO_H\n#define FOO_H\nstatic int acc(int cpu)\n{\n    return cpu + 1;\n}\n#endif\n")
+  f:write("#ifndef FOO_H\n#define FOO_H\nstatic int acc(int cpu) { return cpu + 1; }\n#endif\n")
   f:close()
   local col = ("static int acc(int cpu)"):find("acc") - 1
   local lines, label = resolver.extract_sync({ uri = vim.uri_from_fname(hpath), range = range(2, col, 2, col) })
   check("extract_sync: include guard -> function_definition, not the guard", label == "function_definition", tostring(label))
   local body = lines and table.concat(lines, "\n") or ""
   check(
-    "extract_sync: include guard body is exactly the 4 function lines",
-    lines ~= nil and #lines == 4 and body:find("acc", 1, true) ~= nil,
+    "extract_sync: include guard body is exactly the 1 function line",
+    lines ~= nil and #lines == 1 and body:find("acc", 1, true) ~= nil,
     lines
   )
   check("extract_sync: include guard body excludes #ifndef", not body:find("#ifndef", 1, true))
   check("extract_sync: include guard body excludes #endif", not body:find("#endif", 1, true))
+end
+
+-- extract_sync: a multi-line parameter list must not truncate the
+-- definition to its signature. Regression test for a bug in the first
+-- version of this fix: an "innermost ancestor that spans multiple lines"
+-- pass picked the function_declarator (identifier + multi-line parameter
+-- list) instead of the function_definition, dropping the body and mislabeling
+-- the result. The walk now only ever takes the OUTERMOST ancestor in the
+-- window, so it climbs past the declarator to the full definition.
+do
+  local cpath = vim.fn.tempname() .. ".c"
+  local f = assert(io.open(cpath, "w"))
+  f:write("int add(\n    int a,\n    int b)\n{ return a + b; }\n")
+  f:close()
+  local lines, label = resolver.extract_sync({ uri = vim.uri_from_fname(cpath), range = range(0, 4, 0, 4) })
+  check("extract_sync: multi-line parameter list -> function_definition", label == "function_definition", tostring(label))
+  check("extract_sync: multi-line parameter list keeps all 4 lines", lines ~= nil and #lines == 4, lines)
+  check(
+    "extract_sync: multi-line parameter list body includes the return",
+    lines ~= nil and table.concat(lines, "\n"):find("return a + b", 1, true) ~= nil,
+    lines
+  )
 end
 
 -- _symbol_range: hierarchical DocumentSymbol whose range equals ref_range

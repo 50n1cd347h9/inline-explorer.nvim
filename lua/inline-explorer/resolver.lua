@@ -147,19 +147,18 @@ local CONTAINER_NODES = {
 
 -- Synchronous fallback extraction, used when no server range is available.
 -- Table-free: starting at the located node and walking up through its
--- ancestors, two candidates are tracked in a single pass, stopping (without
--- recording it) at the first CONTAINER_NODES ancestor -- e.g. an #ifndef
--- guard or an `extern "C"` block -- so a definition near the top of a
--- guarded header never comes back as the whole guarded region:
---   1. first_spanning: the FIRST (innermost) ancestor that starts within
---      [srow-3, srow] (return types / attributes on their own line) and
---      either spans multiple lines or ends after srow. This is the usual
---      case and wins when present.
---   2. outermost_in_window: the OUTERMOST ancestor starting within that
---      same window, below the container reached (if any). This is the
---      fallback for single-line definitions, where nothing satisfies (1).
--- For C functions this naturally yields the node type "function_definition"
--- as the label. Without a parser, the brace heuristic is the last resort.
+-- ancestors, the OUTERMOST ancestor starting within [srow-3, srow] (return
+-- types / attributes on their own line) wins, stopping the ascent (without
+-- ever recording it) at the first CONTAINER_NODES ancestor -- e.g. an
+-- #ifndef guard or an `extern "C"` block -- so a definition near the top of
+-- a guarded header never comes back as the whole guarded region. There is
+-- deliberately no "innermost ancestor that spans multiple lines" shortcut:
+-- when a parameter list spans lines, the innermost multi-line ancestor is
+-- just the declarator (signature only, body dropped), so outermost-in-window
+-- is the only rule -- the container denylist alone is what keeps it from
+-- also swallowing the guard. For C functions this naturally yields the node
+-- type "function_definition" as the label. Without a parser, the brace
+-- heuristic is the last resort.
 function M.extract_sync(loc)
   local bufnr = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(bufnr)
@@ -176,24 +175,20 @@ function M.extract_sync(loc)
       if ok and parser then
         local root = parser:parse()[1]:root()
         local node = root:named_descendant_for_range(srow, scol, srow, scol)
-        local first_spanning, outermost_in_window
+        local outermost_in_window
         while node and node:parent() do -- stop before the whole-file root
           if CONTAINER_NODES[node:type()] then
             break -- a bigger container reached; keep what was found below it
           end
-          local a, _, b = node:range()
+          local a = node:range()
           if a >= srow - 3 and a <= srow then
             outermost_in_window = node
-            if not first_spanning and (b > a or b > srow) then
-              first_spanning = node
-            end
           end
           node = node:parent()
         end
-        local best = first_spanning or outermost_in_window
-        if best then
-          local a, _, b, _ = best:range()
-          return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), best:type()
+        if outermost_in_window then
+          local a, _, b, _ = outermost_in_window:range()
+          return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), outermost_in_window:type()
         end
         break -- parsed fine but nothing plausible here
       end
@@ -201,16 +196,6 @@ function M.extract_sync(loc)
   end
 
   return M.extract_heuristic(bufnr, srow), "heuristic"
-end
-
--- Whether `c` advertises textDocument/documentSymbol support for `bufnr`.
--- Guarded with pcall: the exact shape of Client:supports_method has moved
--- around across 0.10/0.11, and an unknown shape must not be treated as
--- support -- an unsupported client would otherwise leave buf_request_all's
--- handler uncalled (an LSP error response, or never invoked at all).
-local function supports_document_symbol(c, bufnr)
-  local ok, does = pcall(c.supports_method, c, "textDocument/documentSymbol", bufnr)
-  return ok and does == true
 end
 
 -- Extract the definition at `loc`. Asks the server attached to `source_bufnr`
@@ -232,17 +217,18 @@ function M.extract(loc, source_bufnr, cb)
   -- real clients), and a client that never attaches or does not support
   -- documentSymbol would otherwise mean buf_request_all's handler is either
   -- never called or called with an error -- either way cb would never fire.
-  -- Only proceed with the async round trip once at least one client is
-  -- confirmed both attached and capable; otherwise fall back immediately.
+  -- The capability check below is the exact same predicate buf_request_all
+  -- uses to compute its `remaining` response count (get_clients filtered by
+  -- bufnr + method, which itself filters by attached_buffers and
+  -- client:supports_method), so it cannot drift out of sync with nvim's own
+  -- bookkeeping: if it reports zero, buf_request_all's handler is guaranteed
+  -- never to fire and we must fall back immediately instead of waiting.
   local target = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(target)
-  local usable = false
   for _, c in ipairs(clients) do
-    if vim.lsp.buf_attach_client(target, c.id) and supports_document_symbol(c, target) then
-      usable = true
-    end
+    vim.lsp.buf_attach_client(target, c.id)
   end
-  if not usable then
+  if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
     return cb(M.extract_sync(loc))
   end
 
