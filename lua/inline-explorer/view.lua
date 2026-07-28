@@ -28,6 +28,12 @@ function M.open()
   vim.bo[view].modifiable = false
   pcall(vim.api.nvim_buf_set_name, view, "inline-explorer://" .. vim.fn.fnamemodify(name, ":t"))
 
+  -- The view is a detached copy, so clangd never attaches and its semantic-token
+  -- highlighting is absent. Start tree-sitter explicitly so the buffer keeps rich
+  -- highlighting instead of falling back to bare regex syntax.
+  local lang = vim.treesitter.language.get_lang(ft) or ft
+  pcall(vim.treesitter.start, view, lang)
+
   M.state[view] = { source_bufnr = src, nodes = {} }
 
   vim.api.nvim_set_current_buf(view)
