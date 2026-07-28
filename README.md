@@ -167,17 +167,41 @@ How it works:
 - **Callee labels** and **locals that would collide** with the caller scope are
   suffixed `name__ieN` so repeated/nested inlining stays correct.
 
-The transform is compile-correctness tested: `tests/substitute_spec.lua` inlines a
-range of functions and has gcc **compile and run** each result against the
-original's semantics. Run it with:
+### correct vs. readable
+
+The `mode` option chooses the output style (toggle live with
+`:InlineExplorerToggleMode`):
+
+- **`correct`** (default) — the result is guaranteed to compile. Complex functions
+  become GNU statement expressions with `return`→`goto`, and hoists are wrapped in
+  a block after labels. Faithful to the original's semantics.
+- **`readable`** — favours clean output: never emits `({...})` or `goto`, hoists
+  the body top-to-bottom. Prettier, but **not guaranteed to compile or preserve
+  semantics** for functions with early returns / labels / short-circuits.
+
+```lua
+require("inline-explorer").setup({ mode = "correct" }) -- or "readable"
+```
+
+### Tested against real source
+
+Correctness is verified on **real OSS**, not just hand-written snippets:
+
+- `tests/real_cjson_spec.lua` clones [cJSON](https://github.com/DaveGamble/cJSON)
+  and, for **every** in-file call to a same-file static function, applies
+  correct-mode substitution then has gcc **rebuild and run cJSON's test suite**.
+  Every transform the engine accepts must compile and pass.
+- `tests/substitute_spec.lua` compiles+runs a focused set of shaped cases
+  (pointers, early returns, labels, collisions, void, a kernel-style accessor).
 
 ```sh
+nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!"
 nvim --headless --clean -u NONE -c "luafile tests/substitute_spec.lua" -c "qa!"
 ```
 
 Limitations: macros and variadic functions are not inlinable this way; the current
 action rewrites the whole view buffer, so it resets any block-expansion folds in
-the view (undo/redo for the view is planned).
+the view.
 
 ## Macro expansion (C)
 
@@ -205,6 +229,7 @@ require("inline-explorer").setup({
   },
   indent = "  ", -- indent added per expansion level
   header = true, -- wrap each expansion in /* v name */ ... /* ^ name */
+  mode = "correct", -- inline-substitution output: "correct" | "readable"
 })
 ```
 

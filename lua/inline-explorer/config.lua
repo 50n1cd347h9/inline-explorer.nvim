@@ -2,9 +2,9 @@ local M = {}
 
 M.defaults = {
   keymaps = {
-    expand = "<leader>ee", -- expand the symbol under the cursor (block, any language)
-    substitute = "<leader>ei", -- inline-substitute the call under the cursor (C only)
-    expand_macro = "<leader>em", -- expand the macro under the cursor via clangd (C)
+    substitute = "<leader>ei", -- primary: smart inline (substitute in place, else block)
+    expand = "<leader>ee", -- explicit block-paste (any language; also the fallback)
+    expand_macro = "<leader>em", -- explicit in-place macro expansion via clangd (C)
     toggle_fold = "<leader>ec", -- fold / unfold the expansion under the cursor
     open = "<leader>eo", -- open a reading view for the current file
     close = "<leader>eq", -- close the reading view
@@ -13,6 +13,10 @@ M.defaults = {
   },
   indent = "  ", -- indent prepended to each expansion level
   header = true, -- wrap each expansion in `/* v name */ ... /* ^ name */`
+  -- Inline-substitution output: "correct" always compiles (uses ({...})/goto and
+  -- block wrapping where needed); "readable" favours clean output (no ({...})/goto)
+  -- and may not compile in edge cases (early returns, labels, short-circuits).
+  mode = "correct",
 }
 
 M.options = vim.deepcopy(M.defaults)

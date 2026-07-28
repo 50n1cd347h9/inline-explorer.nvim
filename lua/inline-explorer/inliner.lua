@@ -1,26 +1,29 @@
--- Inliner action: C-only "true inline substitution" of the call under the
--- cursor, inside the reading view. Resolves the callee with the LSP, extracts
--- its definition, and rewrites the view buffer via the substitute engine.
+-- Smart inline: the primary expansion action. In a C buffer it prefers
+-- in-place substitution (functions -> compiler-style inline, macros -> clangd
+-- expansion) and only falls back to block-paste (`expander.expand`) when
+-- in-place is not possible. Non-C buffers always use block-paste.
 local resolver = require("inline-explorer.resolver")
 local substitute = require("inline-explorer.substitute")
+local macro = require("inline-explorer.macro")
+local expander = require("inline-explorer.expander")
 local view = require("inline-explorer.view")
+local config = require("inline-explorer.config")
 
 local M = {}
 
-local function notify(msg, level)
-  vim.notify("[inline-explorer] " .. msg, level or vim.log.levels.WARN)
+local function has_c_parser()
+  return pcall(vim.treesitter.get_string_parser, "int __ie;", "c")
 end
 
-function M.substitute()
+-- Try in-place substitution first; fall back to block-paste.
+function M.smart()
   local st = view.current()
   if not st then
-    return notify("open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
+    vim.notify("[inline-explorer] open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
+    return
   end
-  if vim.bo.filetype ~= "c" then
-    return notify("inline substitution is C-only")
-  end
-  if not pcall(vim.treesitter.get_string_parser, "int __ie;", "c") then
-    return notify("inline substitution needs the C tree-sitter parser (:TSInstall c)")
+  if vim.bo.filetype ~= "c" or not has_c_parser() then
+    return expander.expand() -- non-C / no parser: block only
   end
 
   local bufnr = vim.api.nvim_get_current_buf()
@@ -28,42 +31,54 @@ function M.substitute()
   local row, col = cur[1] - 1, cur[2]
   local src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
 
-  local ok, fname = pcall(substitute.call_name_at, src, row, col)
-  if not ok then
-    return notify("failed to parse the buffer: " .. tostring(fname))
+  local fname = substitute.call_name_at(src, row, col) -- non-nil only on a call
+  local ident = fname
+  if not ident or ident == "" then
+    ident = vim.fn.expand("<cword>")
   end
-  if not fname then
-    return notify("no function call under the cursor")
+  if not ident or ident == "" then
+    return vim.notify("[inline-explorer] nothing under the cursor", vim.log.levels.WARN)
   end
 
-  resolver.locate(fname, st.source_bufnr, function(loc, err)
+  local function block_fallback()
+    vim.schedule(expander.expand)
+  end
+
+  resolver.locate(ident, st.source_bufnr, function(loc)
     if not loc then
-      return vim.schedule(function()
-        notify(err or "could not resolve '" .. fname .. "'")
+      return block_fallback() -- expander.expand re-resolves and reports if unknown
+    end
+    local lines, label = resolver.extract(loc)
+
+    if fname and label == "function_definition" then
+      local N = (st.subst_n or 0) + 1
+      local ok, new = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
+      if ok and new then
+        return vim.schedule(function()
+          st.subst_n = N
+          view.rewrite(st, bufnr, new, row)
+        end)
+      end
+      return block_fallback() -- e.g. variadic function
+    end
+
+    if type(label) == "string" and label:match("^preproc") then
+      return macro.fetch_expansion(st, row, col, function(exp)
+        if not exp or #exp == 0 then
+          return block_fallback()
+        end
+        vim.schedule(function()
+          local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
+          if ok and new then
+            view.rewrite(st, bufnr, new, row)
+          else
+            expander.expand()
+          end
+        end)
       end)
     end
-    local lines = resolver.extract(loc)
-    local callee_src = table.concat(lines or {}, "\n")
-    local N = (st.subst_n or 0) + 1
-    local pok, new, e2 = pcall(substitute.inline_in_buffer, src, row, col, callee_src, N)
-    if not pok then
-      new, e2 = nil, tostring(new)
-    end
 
-    vim.schedule(function()
-      if not new then
-        return notify((e2 or ("could not inline '" .. fname .. "'")) .. " (macros/variadic are not supported)")
-      end
-      st.subst_n = N
-      require("inline-explorer.history").snapshot(st, bufnr)
-      -- Whole-buffer rewrite: existing block-expansion extmarks no longer map.
-      vim.api.nvim_buf_clear_namespace(bufnr, view.ns, 0, -1)
-      st.nodes = {}
-      vim.bo[bufnr].modifiable = true
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(new, "\n", { plain = true }))
-      vim.bo[bufnr].modifiable = false
-      pcall(vim.api.nvim_win_set_cursor, 0, { math.min(row + 1, vim.api.nvim_buf_line_count(bufnr)), 0 })
-    end)
+    block_fallback() -- declarations, types, etc.
   end)
 end
 

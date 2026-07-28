@@ -67,8 +67,25 @@ Mechanism:
 - Truly non-inlinable cases (variadic, macros) report an error rather than
   producing wrong code.
 
-Guarantee: `tests/substitute_spec.lua` has gcc compile and run each transform
-against the original function's semantics.
+Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
+
+- **correct** (default) — guaranteed to compile. Hoisting only when the call is
+  reached unconditionally in a plain statement; block-wrap after case/goto labels
+  (a declaration cannot follow a bare label); GNU statement expression + `goto`
+  for everything else. Parameter bindings reconstruct the declared parameter type
+  (arrays decay to pointers) so NULL/`0` arguments keep the right pointer type;
+  the result slot uses the reconstructed return type.
+- **readable** — never emits `({...})`/`goto`; hoists the body with `return`→
+  assignment. Cleaner, but not guaranteed to compile or preserve semantics for
+  early-return / labelled / short-circuit code.
+
+Guarantee: `tests/substitute_spec.lua` (shaped cases) and
+`tests/real_cjson_spec.lua` (every in-file static call in real cJSON) have gcc
+compile and run each correct-mode transform against the originals' semantics.
+These real-source tests drove out several bugs: `__typeof__` of the return
+expression referencing body locals, `__typeof__`/`__auto_type` mistyping NULL
+pointer arguments, missed collisions on array/pointer declarations, and hoisting
+across a `switch` `case` label.
 
 ## Macro expansion (C-only)
 

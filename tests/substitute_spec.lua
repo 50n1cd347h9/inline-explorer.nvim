@@ -190,5 +190,40 @@ do
   check("case6 runs equal to original", (run_ok(callee .. "\n" .. new .. main, "c6")))
 end
 
+-- Case 7: kernel-shaped accessor (mirrors ct_rcu_watching_cpu_acquire): a
+-- __always_inline function with a macro-based per-cpu access, used inside a
+-- larger expression via a struct member argument.
+do
+  local prelude = [[
+#define __always_inline inline __attribute__((always_inline))
+#define per_cpu_ptr(p, cpu) (&(p)[cpu])
+#define CT_RCU_WATCHING_MASK 0x3
+struct context_tracking { int state; };
+static struct context_tracking ctx[4];
+static int atomic_read_acquire(int *p) { return *p; }
+struct rcu_data { int cpu; };
+static __always_inline int ct_rcu_watching_cpu_acquire(int cpu)
+{
+    struct context_tracking *ct = per_cpu_ptr(ctx, cpu);
+    return atomic_read_acquire(&ct->state) & CT_RCU_WATCHING_MASK;
+}
+]]
+  local callee = [[static __always_inline int ct_rcu_watching_cpu_acquire(int cpu)
+{
+    struct context_tracking *ct = per_cpu_ptr(ctx, cpu);
+    return atomic_read_acquire(&ct->state) & CT_RCU_WATCHING_MASK;
+}]]
+  local caller = [[static int caller(int snap, struct rcu_data *rdp)
+{
+    return snap != ct_rcu_watching_cpu_acquire(rdp->cpu);
+}]]
+  local t = transform(caller, callee, "ct_rcu_watching_cpu_acquire", { { N = 1 } })
+  local main = "int main(void){ ctx[2].state = 5; struct rcu_data d = { .cpu = 2 };"
+    .. " return (caller(5,&d)==1 && caller(1,&d)==0)?0:1; }\n"
+  check("case7 compiles (kernel-shaped __always_inline accessor)", (compiles(prelude .. t .. main, "c7")))
+  check("case7 runs equal to original", (run_ok(prelude .. t .. main, "c7")))
+  check("case7 pretty-hoisted (no statement expr)", not t:find("({", 1, true), t)
+end
+
 print("")
 print(fails == 0 and "ALL SUBSTITUTE TESTS PASSED" or (fails .. " FAILURE(S)"))

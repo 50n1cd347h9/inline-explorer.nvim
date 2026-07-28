@@ -72,6 +72,30 @@ local function func_declarator(decl)
   return n
 end
 
+-- Reconstruct a function's declared return type text (base type + pointer depth),
+-- so the statement-expression result slot does not depend on body-local names the
+-- way `__typeof__(return expr)` would.
+local function return_type(fdef, src)
+  local ty = fdef:field("type")[1]
+  local base = ty and text(ty, src) or "int"
+  local depth, d = 0, fdef:field("declarator")[1]
+  while d do
+    local t = d:type()
+    if t == "pointer_declarator" then
+      depth = depth + 1
+      d = d:field("declarator")[1]
+    elseif t == "parenthesized_declarator" then
+      d = d:field("declarator")[1]
+    else
+      break -- function_declarator or anything unexpected
+    end
+  end
+  if depth > 0 then
+    return base .. " " .. string.rep("*", depth)
+  end
+  return base
+end
+
 local function find_function_def(root, src, name)
   for i = 0, root:named_child_count() - 1 do
     local c = root:named_child(i)
@@ -94,8 +118,9 @@ local function find_calls(root, src, name)
   return calls
 end
 
-local function param_names(fd, src)
-  local names, variadic = {}, false
+-- Parameters as { name = <string|false>, node = <parameter_declaration> }.
+local function get_params(fd, src)
+  local out, variadic = {}, false
   local pl = fd:field("parameters")[1]
   for i = 0, pl:named_child_count() - 1 do
     local pc = pl:named_child(i)
@@ -105,13 +130,43 @@ local function param_names(fd, src)
       local decl = pc:field("declarator")[1]
       local ty = pc:field("type")[1]
       if decl then
-        names[#names + 1] = decl_name(decl, src)
+        out[#out + 1] = { name = decl_name(decl, src), node = pc }
       elseif not (ty and text(ty, src) == "void") then
-        names[#names + 1] = false -- unnamed, non-void parameter
+        out[#out + 1] = { name = false, node = pc } -- unnamed, non-void parameter
       end
     end
   end
-  return names, variadic
+  return out, variadic
+end
+
+-- Build a `<param type> <name> = (arg);` binding. Reconstructs the parameter's
+-- declared type (arrays decay to pointers) so a NULL/0 argument keeps the right
+-- pointer type; __typeof__/__auto_type of the argument would deduce `int` there.
+-- Falls back to __auto_type for exotic declarators (function pointers) or
+-- unnamed parameters.
+local function build_bind(param, arg, rename, N, idx, src)
+  local decl = param.node:field("declarator")[1]
+  if decl then
+    local stars, d = "", decl
+    while d do
+      local t = d:type()
+      if t == "pointer_declarator" or t == "array_declarator" then
+        stars = stars .. "*"
+        d = d:field("declarator")[1]
+      elseif t == "identifier" then
+        break
+      else
+        d = nil
+      end
+    end
+    if d and d:type() == "identifier" then
+      local spec = src:sub(sb(param.node) + 1, sb(decl)):gsub("%s+$", "")
+      local name = rename[text(d, src)] or text(d, src)
+      return string.format("%s %s%s = (%s);", spec, stars, name, arg)
+    end
+  end
+  local name = (param.name and (rename[param.name] or param.name)) or ("__ie_arg" .. idx .. "_" .. N)
+  return string.format("__auto_type %s = (%s);", name, arg)
 end
 
 -- Apply {start_byte, end_byte, replacement} edits (absolute bytes) restricted to
@@ -179,7 +234,7 @@ local function enclosing_scope(call, src)
   local qs = {
     "(parameter_declaration declarator: (_) @d)",
     "(init_declarator declarator: (_) @d)",
-    "(declaration declarator: (identifier) @d)",
+    "(declaration declarator: (_) @d)", -- covers array/pointer declarators, not just plain identifiers
   }
   for _, q in ipairs(qs) do
     for _, d in ipairs(query_nodes(fn, src, q)) do
@@ -192,19 +247,26 @@ local function enclosing_scope(call, src)
   return set
 end
 
--- Statement child of a compound_statement that (transitively) contains `call`.
+-- Innermost enclosing statement (or declaration) that contains the call.
 local function enclosing_statement(call)
   local n = call
-  while n and not (n:parent() and n:parent():type() == "compound_statement") do
+  while n do
+    local t = n:type()
+    if t:match("_statement$") or t == "declaration" then
+      return n
+    end
     n = n:parent()
   end
-  return n
+  return call
 end
 
 -- Build the transform. Returns (new_caller_src, err).
-function M.inline_call(caller_src, callee_src, fname, N, occ)
+-- mode: "correct" (default, guaranteed to compile) or "readable" (cleaner output
+-- that skips ({...})/goto and safety wrapping, and may not compile in edge cases).
+function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
   N = N or 1
   occ = occ or 1
+  mode = mode or "correct"
 
   local call = find_calls(parse(caller_src), caller_src, fname)[occ]
   if not call then
@@ -217,7 +279,7 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
     return nil, "definition of '" .. fname .. "' not found"
   end
 
-  local params, variadic = param_names(fd, callee_src)
+  local params, variadic = get_params(fd, callee_src)
   if variadic then
     return nil, "cannot inline variadic function '" .. fname .. "'"
   end
@@ -250,7 +312,7 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
     end
   end
   for _, p in ipairs(params) do
-    maybe_rename(p)
+    maybe_rename(p.name)
   end
   for _, s in ipairs(stmts) do
     if s:type() == "declaration" then
@@ -288,8 +350,7 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
 
   local binds = {}
   for i, p in ipairs(params) do
-    local name = rename[p] or p
-    binds[#binds + 1] = string.format("__typeof__(%s) %s = (%s);", args[i], name, args[i])
+    binds[#binds + 1] = build_bind(p, args[i], rename, N, i, callee_src)
   end
 
   local ret_var = "__ie_ret" .. N
@@ -297,13 +358,17 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
 
   -- Rewrite `return E;` -> `{ ret = E; goto end; }` by editing only the `return`
   -- keyword and the `;` (leaving E for the label/rename edits above).
-  local function return_edits()
+  -- style "goto": `return E;` -> `{ ret = E; goto end; }` (correct, self-contained)
+  -- style "assign": `return E;` -> `ret = E;`            (readable, no control flow)
+  local function return_edits(style)
     local eds = {}
     for _, r in ipairs(returns) do
       local kw = r:child(0)
       local semi = r:child(r:child_count() - 1)
       local has_expr = r:named_child_count() > 0
-      if has_expr then
+      if style == "assign" then
+        eds[#eds + 1] = { sb(kw), eb(kw), has_expr and (ret_var .. " =") or "(void)0" }
+      elseif has_expr then
         eds[#eds + 1] = { sb(kw), eb(kw), "{ " .. ret_var .. " =" }
         eds[#eds + 1] = { sb(semi), eb(semi), "; goto " .. end_label .. "; }" }
       else
@@ -318,67 +383,141 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
     return apply_edits(caller_src, 0, #caller_src, edits)
   end
 
-  -- Indentation of the statement the call lives in, taken from the caller so
-  -- tabs/spaces match the surrounding source.
-  local stmt = enclosing_statement(call)
-  local stmt_bol = sb(stmt) - scol(stmt)
-  local stmt_indent = caller_src:sub(stmt_bol + 1, sb(stmt))
+  -- The statement the call lives in, and its indentation (tabs/spaces preserved).
+  local target = enclosing_statement(call)
+  local target_type = target:type()
+  local stmt_bol = sb(target) - scol(target)
+  local stmt_indent = caller_src:sub(stmt_bol + 1, sb(target))
+  local unit = stmt_indent:find("\t") and "\t" or "    "
+
+  -- Hoisting is only valid (in correct mode) when the call is reached
+  -- unconditionally within a plain statement; short-circuit / ternary contexts
+  -- and loop/if headers are not.
+  local function hoist_safe()
+    if not (target_type == "return_statement" or target_type == "expression_statement" or target_type == "declaration") then
+      return false
+    end
+    local n = call
+    while n and n ~= target do
+      local t = n:type()
+      if t == "conditional_expression" then
+        return false
+      end
+      if t == "binary_expression" then
+        for i = 0, n:child_count() - 1 do
+          local ch = n:child(i)
+          if not ch:named() and (text(ch, caller_src) == "&&" or text(ch, caller_src) == "||") then
+            return false
+          end
+        end
+      end
+      n = n:parent()
+    end
+    return true
+  end
 
   local last = stmts[#stmts]
-  local simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0
+  local callee_simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0
 
-  if simple then
-    -- Pretty hoist. Setup = every statement except the trailing return.
+  -- Pretty hoist: setup lifted above the statement, return expression spliced in.
+  local function emit_pretty(wrap)
     local hoist = {}
     for _, b in ipairs(binds) do
-      hoist[#hoist + 1] = stmt_indent .. b
+      hoist[#hoist + 1] = b
     end
     if #stmts >= 2 then
-      local rstart = sb(stmts[1]) - scol(stmts[1]) -- keep line-1 indentation
-      local setup = apply_edits(callee_src, rstart, eb(stmts[#stmts - 1]), body_edits)
-      vim.list_extend(hoist, rebase(setup, stmt_indent))
+      local rstart = sb(stmts[1]) - scol(stmts[1])
+      vim.list_extend(hoist, rebase(apply_edits(callee_src, rstart, eb(stmts[#stmts - 1]), body_edits), ""))
     end
     local expr = last:named_child(0)
     local expr_text = apply_edits(callee_src, sb(expr), eb(expr), body_edits)
 
+    if wrap then
+      -- After a case/goto label a declaration needs a block to be a statement.
+      local ttext = text(target, caller_src)
+      local off = sb(call) - sb(target)
+      local modified = ttext:sub(1, off) .. "(" .. expr_text .. ")" .. ttext:sub(eb(call) - sb(target) + 1)
+      local inner = stmt_indent .. unit
+      local out = { "{" }
+      for _, l in ipairs(hoist) do
+        out[#out + 1] = inner .. l
+      end
+      for _, l in ipairs(vim.split(modified, "\n", { plain = true })) do
+        out[#out + 1] = inner .. l
+      end
+      out[#out + 1] = stmt_indent .. "}"
+      return splice({ { sb(target), eb(target), table.concat(out, "\n") } })
+    end
+
+    local block = {}
+    for _, l in ipairs(hoist) do
+      block[#block + 1] = stmt_indent .. l
+    end
     return splice({
-      { stmt_bol, stmt_bol, table.concat(hoist, "\n") .. "\n" },
+      { stmt_bol, stmt_bol, table.concat(block, "\n") .. "\n" },
       { sb(call), eb(call), "(" .. expr_text .. ")" },
     })
   end
 
-  -- General form: GNU statement expression.
-  local edits = {}
-  vim.list_extend(edits, body_edits)
-  vim.list_extend(edits, return_edits())
-  local rstart = sb(stmts[1]) - scol(stmts[1])
-  local body_text = apply_edits(callee_src, rstart, eb(stmts[#stmts]), edits)
-
-  local first_ret = returns[1]
-  local slot = ""
-  if first_ret and first_ret:named_child_count() > 0 then
-    slot = string.format("__typeof__(%s) %s;", text(first_ret:named_child(0), callee_src), ret_var)
+  -- Correct general form: GNU statement expression (self-contained, compiles).
+  local function emit_stmt_expr()
+    local edits = {}
+    vim.list_extend(edits, body_edits)
+    vim.list_extend(edits, return_edits("goto"))
+    local rstart = sb(stmts[1]) - scol(stmts[1])
+    local body_text = apply_edits(callee_src, rstart, eb(stmts[#stmts]), edits)
+    local slot = ""
+    if returns[1] and returns[1]:named_child_count() > 0 then
+      slot = return_type(fdef, callee_src) .. " " .. ret_var .. ";"
+    end
+    local inner = stmt_indent .. unit
+    local parts = { "({" }
+    for _, b in ipairs(binds) do
+      parts[#parts + 1] = inner .. b
+    end
+    if slot ~= "" then
+      parts[#parts + 1] = inner .. slot
+    end
+    vim.list_extend(parts, rebase(body_text, inner))
+    parts[#parts + 1] = inner .. end_label .. ":;"
+    if slot ~= "" then
+      parts[#parts + 1] = inner .. ret_var .. ";"
+    end
+    parts[#parts + 1] = stmt_indent .. "})"
+    return splice({ { sb(call), eb(call), table.concat(parts, "\n") } })
   end
 
-  local unit = stmt_indent:find("\t") and "\t" or "    "
-  local inner = stmt_indent .. unit
-  local parts = { "({" }
-  for _, b in ipairs(binds) do
-    parts[#parts + 1] = inner .. b
+  -- Readable general form: body hoisted with return -> assignment, no ({})/goto.
+  -- Reads top-to-bottom; not faithful for functions with early returns.
+  local function emit_readable_multi()
+    local edits = {}
+    vim.list_extend(edits, body_edits)
+    vim.list_extend(edits, return_edits("assign"))
+    local rstart = sb(stmts[1]) - scol(stmts[1])
+    local body_text = apply_edits(callee_src, rstart, eb(stmts[#stmts]), edits)
+    local hoist = {}
+    for _, b in ipairs(binds) do
+      hoist[#hoist + 1] = stmt_indent .. b
+    end
+    if returns[1] and returns[1]:named_child_count() > 0 then
+      hoist[#hoist + 1] = stmt_indent .. return_type(fdef, callee_src) .. " " .. ret_var .. ";"
+    end
+    vim.list_extend(hoist, rebase(body_text, stmt_indent))
+    return splice({
+      { stmt_bol, stmt_bol, table.concat(hoist, "\n") .. "\n" },
+      { sb(call), eb(call), ret_var },
+    })
   end
-  if slot ~= "" then
-    parts[#parts + 1] = inner .. slot
-  end
-  vim.list_extend(parts, rebase(body_text, inner))
-  parts[#parts + 1] = inner .. end_label .. ":;"
-  if slot ~= "" then
-    parts[#parts + 1] = inner .. ret_var .. ";"
-  end
-  parts[#parts + 1] = stmt_indent .. "})"
 
-  return splice({
-    { sb(call), eb(call), table.concat(parts, "\n") },
-  })
+  if callee_simple and (mode == "readable" or hoist_safe()) then
+    local parent_t = target:parent() and target:parent():type()
+    local wrap = (mode == "correct") and (parent_t == "case_statement" or parent_t == "labeled_statement")
+    return emit_pretty(wrap)
+  end
+  if mode == "readable" then
+    return emit_readable_multi()
+  end
+  return emit_stmt_expr()
 end
 
 -- Climb from (row, col) to the innermost enclosing call_expression node.
@@ -402,7 +541,7 @@ end
 
 -- Inline the call under the cursor (row, col are 0-indexed). Resolves the call to
 -- an occurrence index and delegates to inline_call.
-function M.inline_in_buffer(caller_src, row, col, callee_src, N)
+function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode)
   local root = parse(caller_src)
   local call = call_at(root, row, col)
   if not call then
@@ -422,7 +561,7 @@ function M.inline_in_buffer(caller_src, row, col, callee_src, N)
       break
     end
   end
-  return M.inline_call(caller_src, callee_src, fname, N, occ or 1)
+  return M.inline_call(caller_src, callee_src, fname, N, occ or 1, mode)
 end
 
 return M

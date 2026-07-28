@@ -69,4 +69,18 @@ function M.current()
   return M.state[vim.api.nvim_get_current_buf()]
 end
 
+-- Replace the whole view buffer with `new_src` (used by in-place transforms).
+-- Snapshots for undo first, and resets block-expansion tracking since the
+-- wholesale rewrite invalidates its extmarks/folds.
+function M.rewrite(st, bufnr, new_src, row)
+  require("inline-explorer.history").snapshot(st, bufnr)
+  vim.api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
+  st.nodes = {}
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(new_src, "\n", { plain = true }))
+  vim.bo[bufnr].modifiable = false
+  local n = vim.api.nvim_buf_line_count(bufnr)
+  pcall(vim.api.nvim_win_set_cursor, 0, { math.min((row or 0) + 1, n), 0 })
+end
+
 return M
