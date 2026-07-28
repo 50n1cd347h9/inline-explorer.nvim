@@ -50,11 +50,12 @@ function M.smart()
     vim.schedule(expander.expand)
   end
 
-  resolver.locate(ident, st.source_bufnr, function(loc)
-    if not loc then
-      return block_fallback() -- expander.expand re-resolves and reports if unknown
+  resolver.fetch(ident, st.source_bufnr, function(lines, label, err)
+    if not lines then
+      local _ = err -- expander.expand re-resolves and reports if unknown
+      return block_fallback()
     end
-    resolver.extract(loc, st.source_bufnr, function(lines, label)
+    do
       if fname and label == "function_definition" then
         local N = (st.subst_n or 0) + 1
         local ok, new = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
@@ -87,7 +88,7 @@ function M.smart()
           end
         end)
       end)
-    end)
+    end
   end)
 end
 

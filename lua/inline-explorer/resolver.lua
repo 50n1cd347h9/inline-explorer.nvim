@@ -19,23 +19,8 @@ local M = {}
 -- forever. Exposed as a module field so tests can shorten it.
 M._timeout_ms = 4000
 
--- Wrap `cb` so it fires exactly once: either with the real response or, after
--- M._timeout_ms, with whatever `on_timeout` produces.
 local function once_with_timeout(cb, on_timeout)
-  local finished = false
-  local function finish(...)
-    if finished then
-      return
-    end
-    finished = true
-    cb(...)
-  end
-  vim.defer_fn(function()
-    if not finished then
-      finish(on_timeout())
-    end
-  end, M._timeout_ms)
-  return finish
+  return require("inline-explorer.async").once_with_timeout(cb, on_timeout, M._timeout_ms)
 end
 
 -- Ask whichever server is attached to the source buffer where `name` is defined.
@@ -362,6 +347,21 @@ function M.extract_heuristic(bufnr, srow)
     end
   end
   return out
+end
+
+-- Composed lookup: name -> definition body. locate then extract, one
+-- callback: cb(lines, label, err). On failure lines is nil and err carries
+-- the reason (extract itself always yields something via its fallbacks, so a
+-- nil here means location failed).
+function M.fetch(name, source_bufnr, cb)
+  M.locate(name, source_bufnr, function(loc, err)
+    if not loc then
+      return cb(nil, nil, err or "not found")
+    end
+    M.extract(loc, source_bufnr, function(lines, label)
+      cb(lines, label, nil)
+    end)
+  end)
 end
 
 return M
