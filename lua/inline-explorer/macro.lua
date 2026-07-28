@@ -110,7 +110,9 @@ function M.replace_in_src(src, row, col, exp_lines)
       parts[i] = indent .. parts[i]
     end
   end
-  local exp = table.concat(parts, "\n")
+  -- Collapse the redundant paren nests kernel macros wrap their bodies in
+  -- (`(({ ... }))` and friends) before deciding on our own parenthesisation.
+  local exp = require("inline-explorer.simplify").parens(table.concat(parts, "\n"))
   -- Parenthesise in expression context to preserve precedence, unless the
   -- expansion is already a single balanced (...) or ({...}) group.
   local already_grouped = exp:match("^%b()$") ~= nil

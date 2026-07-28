@@ -581,5 +581,24 @@ do
   check("case20 readable runs equal", (run_ok(callee .. "\n" .. tr .. main, "c20b")))
 end
 
+-- Case 21: a callee whose return expression is already parenthesised must not
+-- get a second precedence pair from the pretty printer (`((x + 1))`).
+do
+  local callee = [[static int wrapped(int x)
+{
+    int t = x * 2;
+    return (t + 1);
+}]]
+  local caller = [[static int caller(int n)
+{
+    return wrapped(n) - 1;
+}]]
+  local t = transform(caller, callee, "wrapped", { { N = 1 } })
+  local main = "int main(void){ return (caller(3)==6)?0:1; }\n"
+  check("case21 no doubled precedence parens", not t:find("((t + 1))", 1, true) and t:find("(t + 1)", 1, true) ~= nil, t)
+  check("case21 compiles", (compiles(callee .. "\n" .. t .. main, "c21")))
+  check("case21 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c21")))
+end
+
 print("")
 print(fails == 0 and "ALL SUBSTITUTE TESTS PASSED" or (fails .. " FAILURE(S)"))

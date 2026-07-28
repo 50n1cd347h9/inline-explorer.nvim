@@ -524,7 +524,10 @@ local function print_pretty(caller_src, ir, ctx)
   end
   local expr = ir.stmts[#ir.stmts]:named_child(0)
   local expr_text = apply_edits(ir.src, sb(expr), eb(expr), ir.body_edits)
-  return print_hoisted(caller_src, ir, ctx, hoist, "(" .. expr_text .. ")")
+  -- The precedence parens double up when the return expression was already
+  -- parenthesised; collapse the redundant nest (semantics-preserving).
+  local replacement = require("inline-explorer.simplify").parens("(" .. expr_text .. ")")
+  return print_hoisted(caller_src, ir, ctx, hoist, replacement)
 end
 
 -- Canonical form: GNU statement expression + return->goto. Legal in any

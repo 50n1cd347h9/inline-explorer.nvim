@@ -276,5 +276,21 @@ do
   check("reinstall: no-op while our handler is still installed", client.handlers["workspace/applyEdit"] == h)
 end
 
+-- Redundant paren collapse: kernel-style expansions arrive as `(({ ... }))`
+-- (the macro definition's own defensive parens around an rcu-style statement
+-- expression); the splice must not keep the noise, and must not add a third
+-- pair on top.
+do
+  local simplify = require("inline-explorer.simplify")
+  check("simplify: ((X)) collapses", simplify.parens("((x + 1))") == "(x + 1)")
+  check("simplify: cast parens preserved", simplify.parens("((int)(x))") == "((int)(x))")
+  check("simplify: unparsable text untouched", simplify.parens("((") == "((")
+
+  local src = "int f(void) { return ekp != DEREF(key); }"
+  local col = src:find("DEREF") - 1
+  local new = macro.replace_in_src(src, 0, col, { "(({ int v = 1; v; }))" })
+  check("kernel-shaped expansion loses the redundant nest", new:find("!= ({ int v = 1; v; });", 1, true) ~= nil, new)
+end
+
 print("")
 print(fails == 0 and "ALL MACRO TESTS PASSED" or (fails .. " FAILURE(S)"))
