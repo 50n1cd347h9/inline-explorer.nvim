@@ -552,5 +552,34 @@ do
   check("case19 readable has no ({...})/goto", not tr:find("({", 1, true) and not tr:find("goto", 1, true), tr)
 end
 
+-- Case 20: call in an UNBRACED for body whose argument depends on the loop
+-- variable. The body child of a for_statement is a legitimate statement
+-- target (the climb must stop there, not at the for), so hoisting wraps the
+-- body in a block and stays INSIDE the loop -- hoisting above the loop would
+-- lift a loop-variant expression out (and reference `i` before it exists).
+-- Pins the `parent:field("body")[1] ~= n` guard in enclosing_statement.
+do
+  local callee = [[static int lim(int x)
+{
+    int t = x + 1;
+    return t & 7;
+}]]
+  local caller = [[static int caller(int a)
+{
+    int acc = 0;
+    for (int i = 0; i < 3; i++)
+        acc = acc + lim(a + i);
+    return acc;
+}]]
+  local t = transform(caller, callee, "lim", { { N = 1 } })
+  local main = "int main(void){ return (caller(1)==(2&7)+(3&7)+(4&7))?0:1; }\n"
+  check("case20 compiles (unbraced for body, correct)", (compiles(callee .. "\n" .. t .. main, "c20a")), t)
+  check("case20 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c20a")))
+
+  local tr = transform(caller, callee, "lim", { { N = 1, mode = "readable" } })
+  check("case20 readable compiles (hoist stays inside the loop)", (compiles(callee .. "\n" .. tr .. main, "c20b")), tr)
+  check("case20 readable runs equal", (run_ok(callee .. "\n" .. tr .. main, "c20b")))
+end
+
 print("")
 print(fails == 0 and "ALL SUBSTITUTE TESTS PASSED" or (fails .. " FAILURE(S)"))

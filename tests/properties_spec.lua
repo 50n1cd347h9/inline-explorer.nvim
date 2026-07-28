@@ -59,6 +59,10 @@ local function has_real_call(src, fname)
   return false
 end
 
+-- Exemptions taken by violation() for the cast-vs-call ambiguity; printed at
+-- the end so an erosion in the exemption rate stays visible.
+local exempted = 0
+
 -- One case, one mode. Returns nil if healthy, else a short violation tag.
 local function violation(case, mode)
   local rc = gen.render(case)
@@ -69,6 +73,7 @@ local function violation(case, mode)
     -- ambiguity artifact documented on has_real_call above, which is a
     -- generator/parser interaction, not an engine bug.
     if not has_real_call(rc.caller_src, "f") then
+      exempted = exempted + 1
       return nil
     end
     return "rejected: " .. tostring(err)
@@ -212,5 +217,6 @@ do
   check("rebase x common_ws_prefix roundtrip holds for 100 fragments", bad == nil, bad)
 end
 
+print(("info  cast-vs-call exemptions taken: %d"):format(exempted))
 print("")
 print(fails == 0 and "ALL PROPERTY TESTS PASSED" or (fails .. " FAILURE(S)"))
