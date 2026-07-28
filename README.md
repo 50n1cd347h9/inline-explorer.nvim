@@ -212,10 +212,12 @@ Macros have no type or structured body, so they cannot be transformed like
 functions. Two ways to see one, under the same keys as functions:
 
 - **`<leader>ei`** (smart inline) replaces the macro use **in place** with its
-  expansion, fetched from the **live clangd** (`textDocument/hover`), so it
-  respects your include paths, `#define`s and `#ifdef` state. The query runs
-  against the original source at the cursor, reliable at depth 0; large line
-  shifts from prior expansions can misalign it.
+  expansion, fetched from the **live clangd** -- preferring the `ExpandMacro`
+  tweak (its `workspace/applyEdit` is intercepted, never applied to the real
+  file), with `textDocument/hover` scraping as the fallback -- so it respects
+  your include paths, `#define`s and `#ifdef` state. The query runs against the
+  original source at the cursor, reliable at depth 0; large line shifts from
+  prior expansions can misalign it.
 - **`<leader>ee`** (block expand) drops the macro's definition below the use as a
   folded block, like any other symbol.
 

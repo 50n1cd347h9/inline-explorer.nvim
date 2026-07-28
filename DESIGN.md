@@ -103,15 +103,18 @@ across a `switch` `case` label.
 
 Macros have no type and no guaranteed statement/expression structure, so the
 substitution engine cannot handle them — a faithful expansion means running the
-preprocessor. `macro.lua` therefore delegates to the live clangd:
-`textDocument/hover` at the macro (read-only, no buffer edits), and the expansion
-is pulled from the hover markdown (clangd puts `#define` and the expansion in one
-code block separated by an "Expands to" marker; we take the part after it).
+preprocessor. `macro.lua` therefore delegates to the live clangd, preferring its
+`ExpandMacro` tweak: the tweak is discovered via `textDocument/codeAction`,
+executed via `workspace/executeCommand`, and the `workspace/applyEdit` it sends
+back is intercepted — never applied to the real file — with its `newText` taken
+as the expansion. When the tweak is unavailable (older clangd, no action at the
+position, errors, timeout) the fallback scrapes `textDocument/hover` markdown
+(clangd puts `#define` and the expansion in one code block separated by an
+"Expands to" marker; we take the part after it).
 
 The smart `ei` action splices that expansion **in place** of the macro use (the
 same read→hover→replace path as functions); explicit `ee` block-pastes the macro
 definition instead. There is no separate macro command. The hover query uses the
 original source at the cursor, exact at depth 0; large line shifts can misalign
-it. A future step could use clangd's `ExpandMacro` tweak for precise in-place
-edits, at the cost of intercepting the `workspace/applyEdit` it would apply to the
-real file.
+it. The `ExpandMacro` tweak path implements exactly the interception that an
+earlier revision of this document described as a future step.
