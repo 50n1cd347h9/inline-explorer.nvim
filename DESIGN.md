@@ -69,3 +69,18 @@ Mechanism:
 
 Guarantee: `tests/substitute_spec.lua` has gcc compile and run each transform
 against the original function's semantics.
+
+## Macro expansion (C-only)
+
+Macros have no type and no guaranteed statement/expression structure, so the
+substitution engine cannot handle them — a faithful expansion means running the
+preprocessor. `macro.lua` therefore delegates: it asks the live clangd for
+`textDocument/hover` at the macro (read-only, no buffer edits), extracts the
+expansion from the hover markdown, and inserts it as a folded block via the
+block-expander (so folds/undo come for free).
+
+The hover query uses the original source buffer at the cursor coordinates, which
+is exact at depth 0; large line shifts from prior expansions can misalign it. A
+future step could use clangd's `ExpandMacro` tweak for precise in-place edits, at
+the cost of intercepting the `workspace/applyEdit` it would otherwise apply to the
+real file.

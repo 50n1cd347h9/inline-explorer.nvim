@@ -4,6 +4,7 @@ M.defaults = {
   keymaps = {
     expand = "<leader>ee", -- expand the symbol under the cursor (block, any language)
     substitute = "<leader>ei", -- inline-substitute the call under the cursor (C only)
+    expand_macro = "<leader>em", -- expand the macro under the cursor via clangd (C)
     toggle_fold = "<leader>ec", -- fold / unfold the expansion under the cursor
     open = "<leader>eo", -- open a reading view for the current file
     close = "<leader>eq", -- close the reading view

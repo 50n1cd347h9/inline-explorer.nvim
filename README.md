@@ -120,6 +120,7 @@ Open a file (with a language server attached), then:
 | `<leader>eo`  | `:InlineExplorerOpen`       | Open a reading view for the current file            |
 | `<leader>ee`  | `:InlineExplorerExpand`     | Block-expand the symbol under the cursor (any lang) |
 | `<leader>ei`  | `:InlineExplorerSubstitute` | Inline-substitute the call under the cursor (C only) |
+| `<leader>em`  | `:InlineExplorerExpandMacro` | Expand the macro under the cursor via clangd (C)   |
 | `<leader>ec`  | (`za`)                      | Fold / unfold the expansion under the cursor        |
 | `u` / `r`     | —                           | Undo / redo the last expansion (inside the view)    |
 | `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
@@ -177,6 +178,18 @@ nvim --headless --clean -u NONE -c "luafile tests/substitute_spec.lua" -c "qa!"
 Limitations: macros and variadic functions are not inlinable this way; the current
 action rewrites the whole view buffer, so it resets any block-expansion folds in
 the view (undo/redo for the view is planned).
+
+## Macro expansion (C)
+
+Macros have no type or structured body, so they cannot be inline-substituted the
+way functions are. Instead `:InlineExplorerExpandMacro` (`<leader>em`) asks the
+**live clangd** for the expansion — clangd runs the real preprocessor, so the
+result respects your include paths, `#define`s and `#ifdef` state — and drops it
+into the view as a folded block (read-only; your real file is never edited).
+
+The query runs against the original source at the cursor's position, so it is
+reliable at depth 0. Large line shifts from prior expansions above the macro can
+misalign it; expand macros before shifting the lines around them.
 
 ## Configuration
 
