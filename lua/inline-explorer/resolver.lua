@@ -8,8 +8,8 @@
 --
 -- Extraction asks the same server for textDocument/documentSymbol on the
 -- definition's file and takes the symbol's full range -- no per-language node
--- tables. tree-sitter (a generic two-pass ancestor walk that skips a small
--- set of transparent container nodes) and a brace counter remain as
+-- tables. tree-sitter (a generic outermost-in-window ancestor walk that skips
+-- a small set of transparent container nodes) and a brace counter remain as
 -- fallbacks when no server range is available.
 local M = {}
 
