@@ -73,6 +73,39 @@ do
   check("fully shrunk case still renders parseable C", not root:has_error(), rc.program_src)
 end
 
+-- Function-scope name uniqueness: params and top-level locals share the
+-- callee's function scope, so their names must never repeat. Regression for a
+-- rename bug where a "_<i>" suffix could itself collide with a later
+-- independent rename (invalid C that tree-sitter accepts; hit ~1/600 seeds,
+-- e.g. seed 460 pre-fix).
+do
+  local bad
+  for seed = 1, 500 do
+    local case = gen.case(gen.rng(seed))
+    local names, dup = {}, nil
+    for _, p in ipairs(case.params) do
+      if names[p.name] then
+        dup = p.name
+      end
+      names[p.name] = true
+    end
+    for _, s in ipairs(case.stmts) do
+      local n = s:match("^int ([%w_]+) = ")
+      if n then
+        if names[n] then
+          dup = n
+        end
+        names[n] = true
+      end
+    end
+    if dup then
+      bad = "seed " .. seed .. " duplicates '" .. dup .. "'"
+      break
+    end
+  end
+  check("function-scope names unique across 500 seeds", bad == nil, bad)
+end
+
 -- With gcc: original programs must compile AND run (exit 0) for 20 seeds.
 if vim.fn.executable("gcc") == 1 then
   local tmp = vim.fn.tempname()

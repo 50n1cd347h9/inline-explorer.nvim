@@ -70,14 +70,22 @@ function M.case(r)
       operands[#operands + 1] = case.params[i].name
     end
   end
-  -- De-duplicate colliding param names (two params both named "t" is invalid C).
+  -- De-duplicate colliding names (two declarations sharing a name in function
+  -- scope is invalid C). Loop until the candidate is genuinely free: a single
+  -- "_<i>" suffix can itself collide with a later independent "_<n>" rename.
   local seen = {}
-  for i, p in ipairs(case.params) do
-    if seen[p.name] then
-      p.name = p.name .. "_" .. i
-      operands[i] = p.type == "ptr" and ("*" .. p.name) or p.name
+  local function unique(base)
+    local name, k = base, 0
+    while seen[name] do
+      k = k + 1
+      name = base .. "_" .. k
     end
-    seen[p.name] = true
+    seen[name] = true
+    return name
+  end
+  for i, p in ipairs(case.params) do
+    p.name = unique(p.name)
+    operands[i] = p.type == "ptr" and ("*" .. p.name) or p.name
   end
 
   local nstmts = r.int(0, 5)
@@ -87,11 +95,7 @@ function M.case(r)
     if kind == 1 or (kind >= 5 and #operands == 0 and nlocal == 0) then
       -- declaration; t/s again collide with the caller on purpose
       nlocal = nlocal + 1
-      local name = r.pick({ "l" .. nlocal, "t", "s" })
-      if seen[name] then
-        name = name .. "_" .. nlocal
-      end
-      seen[name] = true
+      local name = unique(r.pick({ "l" .. nlocal, "t", "s" }))
       case.stmts[#case.stmts + 1] = "int " .. name .. " = " .. iexpr(r, operands, 2) .. ";"
       operands[#operands + 1] = name
     elseif kind == 2 then
