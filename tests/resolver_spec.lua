@@ -201,5 +201,92 @@ do
   )
 end
 
+-- Timeout: a wedged server (accepts requests, never replies) must not starve
+-- the callbacks -- locate reports a timeout error, extract falls back to
+-- extract_sync. Uses an in-process LSP server that swallows everything after
+-- the initialize handshake.
+do
+  local hpath = vim.fn.tempname() .. ".h"
+  local f = assert(io.open(hpath, "w"))
+  f:write("static int wedge_fn(void)\n{\n    return 9;\n}\n")
+  f:close()
+
+  vim.cmd.edit(hpath)
+  local src_buf = vim.api.nvim_get_current_buf()
+  local client_id = vim.lsp.start({
+    name = "wedge",
+    cmd = function(dispatchers)
+      local closing = false
+      local next_id = 0
+      return {
+        request = function(method, _, callback)
+          next_id = next_id + 1
+          if method == "initialize" then
+            callback(nil, {
+              capabilities = {
+                documentSymbolProvider = true,
+                workspaceSymbolProvider = true,
+              },
+            })
+          end
+          -- every other request: accepted, never answered (the wedge)
+          return true, next_id
+        end,
+        notify = function()
+          return true
+        end,
+        is_closing = function()
+          return closing
+        end,
+        terminate = function()
+          closing = true
+          dispatchers.on_exit(0, 0)
+        end,
+      }
+    end,
+    root_dir = vim.fn.fnamemodify(hpath, ":h"),
+  })
+  vim.wait(2000, function()
+    return client_id ~= nil and #vim.lsp.get_clients({ bufnr = src_buf, name = "wedge" }) > 0
+  end, 20)
+
+  if #vim.lsp.get_clients({ bufnr = src_buf, name = "wedge" }) == 0 then
+    print("SKIP  timeout checks (in-process LSP server unavailable)")
+  else
+    local saved = resolver._timeout_ms
+    resolver._timeout_ms = 300
+
+    local loc_result, loc_err, loc_done
+    resolver.locate("wedge_fn", src_buf, function(l, e)
+      loc_result, loc_err, loc_done = l, e, true
+    end)
+    vim.wait(2000, function()
+      return loc_done
+    end, 20)
+    check("locate: wedged server times out with an error", loc_done == true and loc_result == nil, loc_err)
+    check("locate: timeout error names the cause", tostring(loc_err):find("timed out") ~= nil, tostring(loc_err))
+
+    local col = ("static int wedge_fn(void)"):find("wedge_fn") - 1
+    local got_lines, got_label
+    resolver.extract(
+      { uri = vim.uri_from_fname(hpath), range = range(0, col, 0, col), name = "wedge_fn" },
+      src_buf,
+      function(lines, label)
+        got_lines, got_label = lines, label
+      end
+    )
+    vim.wait(2000, function()
+      return got_lines ~= nil
+    end, 20)
+    check("extract: wedged server falls back to extract_sync", got_label == "function_definition", tostring(got_label))
+    check("extract: fallback body intact", got_lines ~= nil and table.concat(got_lines, "\n"):find("return 9", 1, true) ~= nil)
+
+    resolver._timeout_ms = saved
+    if client_id then
+      vim.lsp.stop_client(client_id, true)
+    end
+  end
+end
+
 print("")
 print(fails == 0 and "ALL RESOLVER TESTS PASSED" or (fails .. " FAILURE(S)"))

@@ -13,6 +13,31 @@
 -- fallbacks when no server range is available.
 local M = {}
 
+-- How long an LSP round trip may take before we stop waiting: extraction
+-- falls back to the local path and location lookup reports failure. A wedged
+-- server (cold index, huge TU) must degrade visibly, not hang the keypress
+-- forever. Exposed as a module field so tests can shorten it.
+M._timeout_ms = 4000
+
+-- Wrap `cb` so it fires exactly once: either with the real response or, after
+-- M._timeout_ms, with whatever `on_timeout` produces.
+local function once_with_timeout(cb, on_timeout)
+  local finished = false
+  local function finish(...)
+    if finished then
+      return
+    end
+    finished = true
+    cb(...)
+  end
+  vim.defer_fn(function()
+    if not finished then
+      finish(on_timeout())
+    end
+  end, M._timeout_ms)
+  return finish
+end
+
 -- Ask whichever server is attached to the source buffer where `name` is defined.
 -- Calls cb(location, err) where location = { uri, range, kind, name }.
 function M.locate(name, source_bufnr, cb)
@@ -21,6 +46,9 @@ function M.locate(name, source_bufnr, cb)
     return cb(nil, "no language server attached to the source buffer")
   end
 
+  local finish = once_with_timeout(cb, function()
+    return nil, "workspace/symbol timed out (server busy or stuck?)"
+  end)
   vim.lsp.buf_request_all(bufnr, "workspace/symbol", { query = name }, function(results)
     local all = {}
     for _, r in pairs(results or {}) do
@@ -29,7 +57,7 @@ function M.locate(name, source_bufnr, cb)
       end
     end
     if #all == 0 then
-      return cb(nil, "no symbol named '" .. name .. "'")
+      return finish(nil, "no symbol named '" .. name .. "'")
     end
 
     -- Prefer an exact-name match; servers fuzzy-match otherwise.
@@ -43,7 +71,7 @@ function M.locate(name, source_bufnr, cb)
     pick = pick or all[1]
 
     local loc = pick.location
-    cb({ uri = loc.uri, range = loc.range, kind = pick.kind, name = pick.name }, nil)
+    finish({ uri = loc.uri, range = loc.range, kind = pick.kind, name = pick.name }, nil)
   end)
 end
 
@@ -232,6 +260,13 @@ function M.extract(loc, source_bufnr, cb)
     return cb(M.extract_sync(loc))
   end
 
+  -- A wedged server must not hang the keypress: after the timeout, extract
+  -- locally and say so (the late response, if any, is dropped by the guard).
+  local finish = once_with_timeout(cb, function()
+    vim.notify("[inline-explorer] documentSymbol timed out; extracted locally", vim.log.levels.WARN)
+    return M.extract_sync(loc)
+  end)
+
   local params = { textDocument = { uri = loc.uri } }
   vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
     -- pcall so a malformed/unexpected response shape can't leave cb unfired.
@@ -261,9 +296,9 @@ function M.extract(loc, source_bufnr, cb)
       return ls, lbl
     end)
     if ok and lines then
-      cb(lines, label)
+      finish(lines, label)
     else
-      cb(M.extract_sync(loc))
+      finish(M.extract_sync(loc))
     end
   end)
 end
