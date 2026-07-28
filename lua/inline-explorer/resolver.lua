@@ -120,11 +120,13 @@ local function is_definition(node_type)
   return false
 end
 
--- Resolve the tree-sitter language for a buffer, falling back to filetype.
+-- Resolve the tree-sitter language for a buffer. A buffer that was only
+-- `bufload`ed (e.g. a header the definition lives in) often has no filetype yet,
+-- so fall back to matching on its file name.
 local function buffer_lang(bufnr)
   local ft = vim.bo[bufnr].filetype
   if ft == "" then
-    ft = vim.filetype.match({ buf = bufnr }) or ""
+    ft = vim.filetype.match({ buf = bufnr, filename = vim.api.nvim_buf_get_name(bufnr) }) or ""
   end
   return vim.treesitter.language.get_lang(ft) or ft
 end
@@ -136,17 +138,25 @@ function M.extract(loc)
   local srow = loc.range.start.line
   local scol = loc.range.start.character
 
-  local lang = buffer_lang(bufnr)
-  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
-  if ok and parser then
-    local root = parser:parse()[1]:root()
-    local node = root:named_descendant_for_range(srow, scol, srow, scol)
-    while node do
-      if is_definition(node:type()) then
-        local a, _, b, _ = node:range()
-        return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), node:type()
+  -- `.h` headers are often detected as C++ while only the C parser is installed,
+  -- so try the detected language, then fall back to C / C++.
+  local seen = {}
+  for _, lang in ipairs({ buffer_lang(bufnr), "c", "cpp" }) do
+    if lang and lang ~= "" and not seen[lang] then
+      seen[lang] = true
+      local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
+      if ok and parser then
+        local root = parser:parse()[1]:root()
+        local node = root:named_descendant_for_range(srow, scol, srow, scol)
+        while node do
+          if is_definition(node:type()) then
+            local a, _, b, _ = node:range()
+            return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), node:type()
+          end
+          node = node:parent()
+        end
+        break -- parsed fine but no definition node here
       end
-      node = node:parent()
     end
   end
 
