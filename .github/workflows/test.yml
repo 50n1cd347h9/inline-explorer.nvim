@@ -1,0 +1,42 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fast-suites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Neovim
+        run: |
+          curl -sL https://github.com/neovim/neovim/releases/download/v0.11.3/nvim-linux-x86_64.tar.gz | tar xz
+          echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Run fast suites
+        run: |
+          set -e
+          for s in gen_spec properties_spec pbt_spec ir_spec substitute_spec macro_spec resolver_spec expander_spec; do
+            echo "==== tests/$s.lua"
+            out=$(nvim --headless --clean -u NONE -c "luafile tests/$s.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+            echo "$out"
+            echo "$out" | grep -q "TESTS PASSED" || { echo "FAILED: $s (no pass banner)"; exit 1; }
+            if echo "$out" | grep -q "FAILURE"; then echo "FAILED: $s"; exit 1; fi
+          done
+
+  real-cjson:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Neovim
+        run: |
+          curl -sL https://github.com/neovim/neovim/releases/download/v0.11.3/nvim-linux-x86_64.tar.gz | tar xz
+          echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Real-source regression (cJSON)
+        run: |
+          out=$(nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+          echo "$out"
+          echo "$out" | grep -Eq "ALL ACCEPTED TRANSFORMS COMPILE \+ PASS|SKIP:" || { echo "FAILED: real_cjson_spec"; exit 1; }
+          if echo "$out" | grep -q "FAILURE"; then echo "FAILED"; exit 1; fi
