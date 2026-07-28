@@ -106,7 +106,8 @@ substitution engine cannot handle them — a faithful expansion means running th
 preprocessor. `macro.lua` therefore delegates to the live clangd, preferring its
 `ExpandMacro` tweak: the tweak is discovered via `textDocument/codeAction`,
 executed via `workspace/executeCommand`, and the `workspace/applyEdit` it sends
-back is intercepted — never applied to the real file — with its `newText` taken
+back is intercepted — kept out of the real file (a reply straggling past the
+timeout + grace window, ~5 s, is the one exception) — with its `newText` taken
 as the expansion. When the tweak is unavailable (older clangd, no action at the
 position, errors, timeout) the fallback scrapes `textDocument/hover` markdown
 (clangd puts `#define` and the expansion in one code block separated by an

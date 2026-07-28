@@ -213,7 +213,7 @@ functions. Two ways to see one, under the same keys as functions:
 
 - **`<leader>ei`** (smart inline) replaces the macro use **in place** with its
   expansion, fetched from the **live clangd** -- preferring the `ExpandMacro`
-  tweak (its `workspace/applyEdit` is intercepted, never applied to the real
+  tweak (its `workspace/applyEdit` is intercepted and kept out of the real
   file), with `textDocument/hover` scraping as the fallback -- so it respects
   your include paths, `#define`s and `#ifdef` state. The query runs against the
   original source at the cursor, reliable at depth 0; large line shifts from
@@ -221,7 +221,9 @@ functions. Two ways to see one, under the same keys as functions:
 - **`<leader>ee`** (block expand) drops the macro's definition below the use as a
   folded block, like any other symbol.
 
-Both are read-only — your real file is never edited.
+Both are read-only — your real file is not edited. (One theoretical exception:
+a tweak reply straggling in seconds late, past the ~5 s interception window,
+would reach Neovim's default `applyEdit` handler.)
 
 ## Configuration
 
