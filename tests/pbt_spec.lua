@@ -117,15 +117,17 @@ local function violation(case)
   -- of the very same call must agree as well.
   local probe = S._probe(rc.caller_src, rc.callee_src, "f", 1, "correct")
   if probe and probe.decision == "pretty" then
-    local canon = S._render(rc.caller_src, rc.callee_src, "f", 1, 1, "canonical")
-    if canon then
-      local c_out, c_code = build_run(program_with(rc, canon), "canon")
-      if c_out == nil then
-        return "canonical rendering does not compile:\n" .. tostring(c_code)
-      end
-      if c_out ~= base_out or c_code ~= base_code then
-        return "canonical rendering disagrees with the original"
-      end
+    local canon, cerr = S._render(rc.caller_src, rc.callee_src, "f", 1, 1, "canonical")
+    if not canon then
+      -- A nil here must not silently disable the structure property.
+      return "canonical rendering unavailable: " .. tostring(cerr)
+    end
+    local c_out, c_code = build_run(program_with(rc, canon), "canon")
+    if c_out == nil then
+      return "canonical rendering does not compile:\n" .. tostring(c_code)
+    end
+    if c_out ~= base_out or c_code ~= base_code then
+      return "canonical rendering disagrees with the original"
     end
   end
   return nil

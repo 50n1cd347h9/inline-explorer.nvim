@@ -115,10 +115,20 @@ do
     bad and (bad .. " @seed=" .. bad_seed .. " mode=" .. bad_mode))
 end
 
--- P-unique: two inlinings with different N never share injected names.
+-- P-unique: two inlinings with different N never share injected names. A
+-- shared name would be a duplicate declaration in one scope -- a SEMANTIC
+-- error tree-sitter cannot see -- so when gcc is available the double-inlined
+-- program is syntax-checked for real; without gcc only the parse check runs.
 do
   local bad, bad_seed
-  for i = 1, math.min(N_CASES, 100) do
+  local n_unique = math.min(N_CASES, 100)
+  local have_gcc = vim.fn.executable("gcc") == 1
+  local tmpdir
+  if have_gcc then
+    tmpdir = vim.fn.tempname()
+    vim.fn.mkdir(tmpdir, "p")
+  end
+  for i = 1, n_unique do
     local seed = BASE_SEED + 7000 + i
     local case = gen.case(gen.rng(seed))
     local rc = gen.render(case)
@@ -136,20 +146,18 @@ do
       if twice then
         if has_error(twice) then
           bad, bad_seed = "second inlining produced ERROR nodes", seed
-        else
-          for name in twice:gmatch("[%w_]+__ie1") do
-            local stem = name:gsub("__ie1$", "")
-            -- every __ie1 name must not ALSO appear only as a bare collision
-            -- (i.e. the __ie2 twin must be distinct); direct check: no name
-            -- carries both suffixes at once (structurally impossible) --
-            -- the real property: __ie1 and __ie2 sets are disjoint.
-            if twice:find(stem .. "__ie2__ie1", 1, true) then
-              bad, bad_seed = "nested suffixing detected: " .. name, seed
-            end
-          end
-          -- injected result/label names must be distinct between the two
-          if twice:find("__ie_ret1", 1, true) and twice:find("__ie_ret2", 1, true) then
-            -- fine: both present and distinct by construction
+        elseif have_gcc and i <= 30 then
+          local tail = rc.program_src:match("#include.*$")
+          local path = tmpdir .. "/uniq" .. i .. ".c"
+          local fh = assert(io.open(path, "w"))
+          fh:write(rc.callee_src .. "\n" .. twice .. "\n" .. tail)
+          fh:close()
+          local out = vim.fn.system({
+            "gcc", "-std=gnu11", "-fsyntax-only", "-Werror=implicit-function-declaration",
+            "-Wno-unused-label", "-Wno-unused-variable", path,
+          })
+          if vim.v.shell_error ~= 0 then
+            bad, bad_seed = "double-inlined program rejected by gcc:\n" .. out, seed
           end
         end
       end
@@ -158,7 +166,7 @@ do
       break
     end
   end
-  check("P-unique holds for 100 double-inlining cases", bad == nil, bad and (bad .. " @seed=" .. bad_seed))
+  check(("P-unique holds for %d double-inlining cases"):format(n_unique), bad == nil, bad and (bad .. " @seed=" .. bad_seed))
 end
 
 -- P-reject-safe: bogus inputs return nil + err and never throw.
