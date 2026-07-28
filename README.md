@@ -5,8 +5,9 @@ inline**, right where they are called — and expanding again inside what you ju
 expanded. No window-hopping, no floating peek windows.
 
 Built for reading the Linux kernel, but **language-agnostic**: it works for any
-language whose server implements `workspace/symbol` and that has a tree-sitter
-parser installed (C/C++, TypeScript/JavaScript, Python, Rust, Go, Lua, …).
+language whose server implements `workspace/symbol`, and reads best with a
+tree-sitter parser installed too (C/C++, TypeScript/JavaScript, Python, Rust,
+Go, Lua, …).
 
 Expansions happen in a dedicated **read-only copy** of the file, so your real
 source is never touched. Each expansion is a real block of text you can move the
@@ -35,9 +36,10 @@ ret = do_work(x);
   (clangd, ts_ls / vtsls, pyright, rust-analyzer, gopls, lua_ls, …). Resolution is
   powered by its index.
 - **The tree-sitter parser for your language** (`:TSInstall <lang>`, or via
-  `nvim-treesitter`). It is used for two things: extracting exact definition
-  bodies, and **highlighting the reading view**
-  (see [Syntax highlighting](#syntax-highlighting-in-the-view)).
+  `nvim-treesitter`). It powers **highlighting the reading view**
+  (see [Syntax highlighting](#syntax-highlighting-in-the-view)), C inline
+  substitution (`:InlineExplorerInline`), and serves as the extraction fallback
+  when the server yields no usable range.
 - For C specifically, a `compile_commands.json` clangd can find — essential for
   the kernel:
   ```sh
@@ -294,9 +296,10 @@ cross build.
 - **View** — a scratch copy of the source buffer, `nomodifiable`,
   `foldmethod=manual`, with tree-sitter highlighting started explicitly.
 - **Resolver** — looks the symbol up by name via the server's `workspace/symbol`,
-  then extracts the exact definition with tree-sitter (a language-agnostic node
-  matcher, with a brace heuristic as last resort). Name-based lookup is what makes
-  nesting possible: inserted text has no real file position to query by.
+  then asks the server for the definition's full range via
+  `textDocument/documentSymbol` (tree-sitter extraction and a brace heuristic
+  remain as fallbacks when no server range is available). Name-based lookup is
+  what makes nesting possible: inserted text has no real file position to query by.
 - **Expander** — splices the body below the call line, tracks it with extmarks,
   and wraps it in a fold.
 
@@ -307,10 +310,10 @@ cross build.
 - **Name-based resolution.** Symbols that share a name (C `static` functions in
   different files, TS overloads / re-exports, …) may resolve to the wrong one. The
   exact-name match picks the server's first hit.
-- **Coverage depends on the server and parser.** A definition is only found if the
-  server's `workspace/symbol` returns it and a tree-sitter parser is installed for
-  the language; without a parser the brace-based fallback only handles C-family
-  syntax.
+- **Coverage depends on the server.** A definition is only found if the server's
+  `workspace/symbol` returns it, and its exact extent comes from the server's
+  `textDocument/documentSymbol`. Without a usable server range, a tree-sitter
+  parser (if installed) or a C-family brace heuristic takes over.
 - **C macros show their `#define` body**, not a fully flattened expansion — which
   is usually what you want when exploring, since you can keep expanding identifiers
   inside it.

@@ -29,7 +29,9 @@ real, cursor-navigable buffer text. The copy buffer makes that safe.
 No server is attached to the copy buffer, and nested expansions sit on inserted
 text that has no position in any real file. So the symbol under the cursor is
 resolved by **name** (`workspace/symbol`), which works identically at depth 0 and
-depth N. tree-sitter then extracts the exact definition node from the target file.
+depth N. Once resolved, the server's `textDocument/documentSymbol` supplies the
+definition's full range; tree-sitter extraction only takes over as a fallback
+when the server doesn't provide a usable range.
 
 ## Components
 
@@ -37,7 +39,8 @@ depth N. tree-sitter then extracts the exact definition node from the target fil
   nodes (extmarks).
 - **Resolver** (`resolver.lua`) — `name -> definition location` via the attached
   server's `workspace/symbol` (any language), then `location -> body lines` via
-  tree-sitter with a language-agnostic node matcher (brace heuristic fallback).
+  the server's `textDocument/documentSymbol` full range (tree-sitter, then a
+  brace heuristic, as fallbacks when no server range is available).
 - **Expander** (`expander.lua`) — splice the body below the call line, indent,
   wrap in a fold, guard against self-recursion.
 - **Config / init** — options, user commands, keymaps.

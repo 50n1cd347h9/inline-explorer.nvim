@@ -1,12 +1,16 @@
 -- Resolver: given an identifier name, ask the language server where it is
--- defined, then extract the full definition text with tree-sitter (heuristic
--- fallback).
+-- defined, then ask it for the definition's full range.
 --
 -- Resolution is name-based (workspace/symbol) on purpose: the reading view is a
 -- copy buffer no server is attached to, and nested expansions live on inserted
--- text with no real file position. A name lookup works at any depth, and
--- workspace/symbol + tree-sitter are both language-agnostic, so nothing here is
--- tied to a single language or server.
+-- text with no real file position. A name lookup works at any depth, and both
+-- requests are language-agnostic, so nothing here is tied to a single server.
+--
+-- Extraction asks the same server for textDocument/documentSymbol on the
+-- definition's file and takes the symbol's full range -- no per-language node
+-- tables. tree-sitter (a generic outermost-in-window ancestor walk that skips
+-- a small set of transparent container nodes) and a brace counter remain as
+-- fallbacks when no server range is available.
 local M = {}
 
 -- Ask whichever server is attached to the source buffer where `name` is defined.
@@ -43,81 +47,76 @@ function M.locate(name, source_bufnr, cb)
   end)
 end
 
--- Tree-sitter node types that name a definition, across languages. This is a
--- fast/precise allow-list; anything not listed still matches via NODE_PATTERNS.
-local DEFINITION_NODES = {
-  -- C / C++
-  function_definition = true,
-  preproc_def = true,
-  preproc_function_def = true,
-  declaration = true,
-  type_definition = true,
-  struct_specifier = true,
-  enum_specifier = true,
-  union_specifier = true,
-  class_specifier = true,
-  template_declaration = true,
-  -- JavaScript / TypeScript
-  function_declaration = true,
-  generator_function_declaration = true,
-  function_expression = true,
-  arrow_function = true,
-  method_definition = true,
-  class_declaration = true,
-  lexical_declaration = true,
-  variable_declaration = true,
-  type_alias_declaration = true,
-  interface_declaration = true,
-  enum_declaration = true,
-  -- Python
-  class_definition = true,
-  decorated_definition = true,
-  -- Rust
-  function_item = true,
-  struct_item = true,
-  enum_item = true,
-  trait_item = true,
-  impl_item = true,
-  mod_item = true,
-  macro_definition = true,
-  const_item = true,
-  static_item = true,
-  type_item = true,
-  let_declaration = true,
-  -- Go
-  method_declaration = true,
-  type_declaration = true,
-  const_declaration = true,
-  var_declaration = true,
-  -- Java / C#
-  field_declaration = true,
-  constructor_declaration = true,
-  -- Lua
-  local_function = true,
-  assignment_statement = true,
-  -- Ruby
-  method = true,
-  singleton_method = true,
-  module = false, -- explicitly excluded: too broad (whole-file container)
-}
+-- Map an LSP SymbolKind to the label consumers expect: function-ish kinds
+-- become "function_definition" (the inliner keys its function path off that
+-- exact string); anything else becomes the lowercase kind name.
+local FUNCTION_KINDS = { [6] = true, [9] = true, [12] = true } -- Method, Constructor, Function
 
--- Suffix patterns that generically identify a definition node in the long tail
--- of languages not covered above. Deliberately anchored to endings so that
--- whole-file containers (module, program, source_file, translation_unit,
--- chunk, ...) never match.
-local NODE_PATTERNS = { "_definition$", "_declaration$", "_item$", "_def$" }
-
-local function is_definition(node_type)
-  local known = DEFINITION_NODES[node_type]
-  if known ~= nil then
-    return known -- honour explicit true/false (e.g. module = false)
+local function kind_label(kind)
+  if FUNCTION_KINDS[kind] then
+    return "function_definition"
   end
-  for _, pat in ipairs(NODE_PATTERNS) do
-    if node_type:find(pat) then
-      return true
+  local name = vim.lsp.protocol.SymbolKind[kind]
+  return type(name) == "string" and name:lower() or "symbol"
+end
+
+local function le(a, b) -- position a <= b
+  return a.line < b.line or (a.line == b.line and a.character <= b.character)
+end
+
+local function contains(outer, inner)
+  return le(outer.start, inner.start) and le(inner["end"], outer["end"])
+end
+
+local function same_range(a, b)
+  return a.start.line == b.start.line
+    and a.start.character == b.start.character
+    and a["end"].line == b["end"].line
+    and a["end"].character == b["end"].character
+end
+
+-- Pick the definition's full range out of a documentSymbol response. Handles
+-- both shapes: hierarchical DocumentSymbol[] (range + children) and flat
+-- SymbolInformation[] (location.range, name-matched, optionally uri-matched).
+-- The deepest symbol whose range contains `ref_range` wins. DocumentSymbol
+-- .range is full-range by spec, so a hierarchical symbol whose range equals
+-- ref_range is a normal, valid match. SymbolInformation.location.range has
+-- no such guarantee -- some servers report just the name -- so for the flat
+-- shape only, a range identical to ref_range is rejected as name-only and
+-- extraction falls back to tree-sitter instead of splicing a bare name.
+-- `uri`, when given, additionally restricts flat entries to the requested
+-- document (workspace/symbol-shaped responses can span files). Returns
+-- (range, label).
+function M._symbol_range(symbols, ref_range, name, uri)
+  local best, best_label
+  local function consider(range, kind)
+    if contains(range, ref_range) then
+      if not best or contains(best, range) then
+        best, best_label = range, kind_label(kind)
+      end
     end
   end
-  return false
+  local function walk(list)
+    if type(list) ~= "table" then -- vim.NIL / absent children
+      return
+    end
+    for _, s in ipairs(list) do
+      if s.range then -- hierarchical DocumentSymbol
+        consider(s.range, s.kind)
+        walk(s.children)
+      elseif
+        s.location
+        and s.location.range
+        and (name == nil or s.name == name)
+        and (uri == nil or s.location.uri == nil or s.location.uri == uri)
+        and not same_range(s.location.range, ref_range)
+      then
+        consider(s.location.range, s.kind) -- flat SymbolInformation
+      end
+    end
+  end
+  walk(symbols)
+  return best, best_label
 end
 
 -- Resolve the tree-sitter language for a buffer. A buffer that was only
@@ -131,8 +130,36 @@ local function buffer_lang(bufnr)
   return vim.treesitter.language.get_lang(ft) or ft
 end
 
--- Extract the full definition body at `loc`. Returns (lines, label).
-function M.extract(loc)
+-- Small set of transparent container nodes the ancestor walk below must
+-- never select, and must stop ascending past. This is NOT a revival of the
+-- old per-language definition table: it does not say what a definition
+-- looks like, only lists a handful of wrapper nodes (include guards,
+-- linkage blocks, and the declaration list they hold) whose *own* range is
+-- never the right answer, no matter the language.
+local CONTAINER_NODES = {
+  preproc_ifdef = true,
+  preproc_if = true,
+  preproc_else = true,
+  preproc_elif = true,
+  linkage_specification = true,
+  declaration_list = true,
+}
+
+-- Synchronous fallback extraction, used when no server range is available.
+-- Table-free: starting at the located node and walking up through its
+-- ancestors, the OUTERMOST ancestor starting within [srow-3, srow] (return
+-- types / attributes on their own line) wins, stopping the ascent (without
+-- ever recording it) at the first CONTAINER_NODES ancestor -- e.g. an
+-- #ifndef guard or an `extern "C"` block -- so a definition near the top of
+-- a guarded header never comes back as the whole guarded region. There is
+-- deliberately no "innermost ancestor that spans multiple lines" shortcut:
+-- when a parameter list spans lines, the innermost multi-line ancestor is
+-- just the declarator (signature only, body dropped), so outermost-in-window
+-- is the only rule -- the container denylist alone is what keeps it from
+-- also swallowing the guard. For C functions this naturally yields the node
+-- type "function_definition" as the label. Without a parser, the brace
+-- heuristic is the last resort.
+function M.extract_sync(loc)
   local bufnr = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(bufnr)
   local srow = loc.range.start.line
@@ -148,19 +175,97 @@ function M.extract(loc)
       if ok and parser then
         local root = parser:parse()[1]:root()
         local node = root:named_descendant_for_range(srow, scol, srow, scol)
-        while node do
-          if is_definition(node:type()) then
-            local a, _, b, _ = node:range()
-            return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), node:type()
+        local outermost_in_window
+        while node and node:parent() do -- stop before the whole-file root
+          if CONTAINER_NODES[node:type()] then
+            break -- a bigger container reached; keep what was found below it
+          end
+          local a = node:range()
+          if a >= srow - 3 and a <= srow then
+            outermost_in_window = node
           end
           node = node:parent()
         end
-        break -- parsed fine but no definition node here
+        if outermost_in_window then
+          local a, _, b, _ = outermost_in_window:range()
+          return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), outermost_in_window:type()
+        end
+        break -- parsed fine but nothing plausible here
       end
     end
   end
 
   return M.extract_heuristic(bufnr, srow), "heuristic"
+end
+
+-- Extract the definition at `loc`. Asks the server attached to `source_bufnr`
+-- for the target document's symbols and uses the returned full range; falls
+-- back to extract_sync when there is no server, no client actually supports
+-- documentSymbol, the target buffer never attaches to a client, the request
+-- errors, or there is no usable range. cb(lines, label) is called exactly
+-- once on every path -- possibly synchronously (fallback path).
+function M.extract(loc, source_bufnr, cb)
+  local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
+  local clients = vim.lsp.get_clients({ bufnr = bufnr })
+  if #clients == 0 then
+    return cb(M.extract_sync(loc))
+  end
+
+  -- The definition file may not be open anywhere; load it and attach the
+  -- source buffer's clients so the server learns about the document.
+  -- buf_attach_client can return false (e.g. the target ends up with no
+  -- real clients), and a client that never attaches or does not support
+  -- documentSymbol would otherwise mean buf_request_all's handler is either
+  -- never called or called with an error -- either way cb would never fire.
+  -- The capability check below is the exact same predicate buf_request_all
+  -- uses to compute its `remaining` response count (get_clients filtered by
+  -- bufnr + method, which itself filters by attached_buffers and
+  -- client:supports_method), so it cannot drift out of sync with nvim's own
+  -- bookkeeping: if it reports zero, buf_request_all's handler is guaranteed
+  -- never to fire and we must fall back immediately instead of waiting.
+  local target = vim.uri_to_bufnr(loc.uri)
+  vim.fn.bufload(target)
+  for _, c in ipairs(clients) do
+    vim.lsp.buf_attach_client(target, c.id)
+  end
+  if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
+    return cb(M.extract_sync(loc))
+  end
+
+  local params = { textDocument = { uri = loc.uri } }
+  vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
+    -- pcall so a malformed/unexpected response shape can't leave cb unfired.
+    local ok, lines, label = pcall(function()
+      local range, lbl
+      for _, r in pairs(results or {}) do
+        if r.result then
+          range, lbl = M._symbol_range(r.result, loc.range, loc.name, loc.uri)
+          if range then
+            break
+          end
+        end
+      end
+      if not range then
+        return nil, nil
+      end
+      -- LSP ranges are end-exclusive; end.character == 0 on a line after
+      -- start means that line's content is not actually part of the range.
+      local erow = range["end"].line
+      if range["end"].character == 0 and erow > range.start.line then
+        erow = erow - 1
+      end
+      local ls = vim.api.nvim_buf_get_lines(target, range.start.line, erow + 1, false)
+      if #ls == 0 then
+        return nil, nil
+      end
+      return ls, lbl
+    end)
+    if ok and lines then
+      cb(lines, label)
+    else
+      cb(M.extract_sync(loc))
+    end
+  end)
 end
 
 -- Last resort when no tree-sitter parser is available. Brace-oriented, so it
