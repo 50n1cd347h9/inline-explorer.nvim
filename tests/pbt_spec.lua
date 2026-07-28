@@ -80,12 +80,16 @@ end
 
 -- Exemptions taken for the cast-vs-call ambiguity; reported at the end.
 local exempted = 0
+-- Originals that failed to build (generator defect, not an engine bug);
+-- reported at the end so a generator regression cannot hide in silence.
+local skipped_unbuildable = 0
 
 -- The differential for one case. Returns nil if healthy, else a violation tag.
 local function violation(case)
   local rc = gen.render(case)
   local base_out, base_code = build_run(rc.program_src, "orig")
   if base_out == nil then
+    skipped_unbuildable = skipped_unbuildable + 1
     return nil -- original does not build: generator edge, not an engine bug; skip
   end
 
@@ -141,7 +145,12 @@ for i = 1, N_CASES do
       return violation(c) ~= nil
     end)
     local rc = gen.render(small)
-    local cx = tmp .. "/counterexample_" .. seed .. ".c"
+    -- NOT under `tmp`: vim.fn.tempname() lives in nvim's per-session scratch
+    -- directory, which nvim deletes on exit -- the artifact must outlive the
+    -- headless run. Default to the cwd (the repo root under the documented
+    -- invocation); override with IE_PBT_DUMP_DIR.
+    local dump_dir = os.getenv("IE_PBT_DUMP_DIR") or vim.fn.getcwd()
+    local cx = dump_dir .. "/pbt_counterexample_" .. seed .. ".c"
     writef(cx, rc.program_src)
     print("counterexample (seed=" .. seed .. ") saved to: " .. cx)
     print(rc.callee_src)
@@ -169,6 +178,7 @@ else
 end
 print(("info  readable mode compiled %d/%d (compile-only, never failing)"):format(readable_compiled, readable_total))
 print(("info  cast-vs-call exemptions taken: %d"):format(exempted))
+print(("info  unbuildable originals skipped: %d"):format(skipped_unbuildable))
 
 print("")
 print(fails == 0 and "ALL PBT TESTS PASSED" or (fails .. " FAILURE(S)"))
