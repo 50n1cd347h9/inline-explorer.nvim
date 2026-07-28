@@ -262,14 +262,27 @@ local function enclosing_scope(call, src)
 end
 
 -- Innermost enclosing statement (or declaration) that contains the call.
+-- A `for`-loop's initializer/condition/update clauses are grammatically a
+-- `declaration`/expression directly parented by `for_statement`, not a
+-- standalone statement in a statement list -- if the climb lands on one of
+-- those, keep climbing to the `for_statement` itself so it is treated as a
+-- loop header (see analyze_context's `unconditional`), not as an ordinary
+-- statement to hoist above. The for's unbraced `body` child IS a legitimate
+-- statement target and must still be returned as-is.
 local function enclosing_statement(call)
   local n = call
   while n do
     local t = n:type()
     if t:match("_statement$") or t == "declaration" then
-      return n
+      local parent = n:parent()
+      if parent and parent:type() == "for_statement" and parent:field("body")[1] ~= n then
+        n = parent -- for-header clause: keep climbing, re-check the for_statement itself
+      else
+        return n
+      end
+    else
+      n = n:parent()
     end
-    n = n:parent()
   end
   return call
 end

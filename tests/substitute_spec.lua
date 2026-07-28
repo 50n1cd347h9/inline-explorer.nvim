@@ -524,5 +524,33 @@ do
   check("case18 runs equal to original", (run_ok(src18, "c18")))
 end
 
+-- Case 19: call inside a for-loop initializer. The enclosing "statement" is
+-- the for-init declaration, which must NOT be treated as a hoist target: the
+-- engine climbs to the for_statement itself, so correct mode renders an
+-- in-place statement expression and readable hoists above the whole loop.
+do
+  local callee = [[static int lim(int x)
+{
+    int t = x + 1;
+    return t & 7;
+}]]
+  local caller = [[static int caller(int a)
+{
+    int acc = 0;
+    for (int i = lim(a); i > 0; i--)
+        acc = acc + 1;
+    return acc;
+}]]
+  local t = transform(caller, callee, "lim", { { N = 1 } })
+  local main = "int main(void){ return (caller(6)==7 && caller(-1)==0)?0:1; }\n"
+  check("case19 compiles (call in for-init, correct)", (compiles(callee .. "\n" .. t .. main, "c19a")), t)
+  check("case19 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c19a")))
+
+  local tr = transform(caller, callee, "lim", { { N = 1, mode = "readable" } })
+  check("case19 readable compiles (hoist above the loop)", (compiles(callee .. "\n" .. tr .. main, "c19b")), tr)
+  check("case19 readable runs equal", (run_ok(callee .. "\n" .. tr .. main, "c19b")))
+  check("case19 readable has no ({...})/goto", not tr:find("({", 1, true) and not tr:find("goto", 1, true), tr)
+end
+
 print("")
 print(fails == 0 and "ALL SUBSTITUTE TESTS PASSED" or (fails .. " FAILURE(S)"))
