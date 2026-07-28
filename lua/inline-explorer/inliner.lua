@@ -55,6 +55,7 @@ function M.substitute()
         return notify((e2 or ("could not inline '" .. fname .. "'")) .. " (macros/variadic are not supported)")
       end
       st.subst_n = N
+      require("inline-explorer.history").snapshot(st, bufnr)
       -- Whole-buffer rewrite: existing block-expansion extmarks no longer map.
       vim.api.nvim_buf_clear_namespace(bufnr, view.ns, 0, -1)
       st.nodes = {}

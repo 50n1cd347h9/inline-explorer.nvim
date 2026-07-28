@@ -34,12 +34,22 @@ function M.open()
   local lang = vim.treesitter.language.get_lang(ft) or ft
   pcall(vim.treesitter.start, view, lang)
 
-  M.state[view] = { source_bufnr = src, nodes = {} }
+  M.state[view] = { source_bufnr = src, nodes = {}, undo = {}, redo = {} }
 
   vim.api.nvim_set_current_buf(view)
   vim.wo.foldmethod = "manual"
   vim.wo.foldenable = true
   pcall(vim.api.nvim_win_set_cursor, 0, cursor)
+
+  -- Buffer-local undo/redo, so `u`/`r` only rebind inside the view.
+  local hist = require("inline-explorer.history")
+  local km = require("inline-explorer.config").options.keymaps or {}
+  if km.undo then
+    vim.keymap.set("n", km.undo, hist.undo, { buffer = view, desc = "Inline Explorer: undo expansion" })
+  end
+  if km.redo then
+    vim.keymap.set("n", km.redo, hist.redo, { buffer = view, desc = "Inline Explorer: redo expansion" })
+  end
   return view
 end
 

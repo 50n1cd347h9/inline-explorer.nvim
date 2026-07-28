@@ -121,7 +121,13 @@ Open a file (with a language server attached), then:
 | `<leader>ee`  | `:InlineExplorerExpand`     | Block-expand the symbol under the cursor (any lang) |
 | `<leader>ei`  | `:InlineExplorerSubstitute` | Inline-substitute the call under the cursor (C only) |
 | `<leader>ec`  | (`za`)                      | Fold / unfold the expansion under the cursor        |
+| `u` / `r`     | —                           | Undo / redo the last expansion (inside the view)    |
 | `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
+
+Expansions nest: move the cursor onto any function/macro inside an expanded body
+(block) or inlined fragment (substitution) and expand again. `u`/`r` are
+buffer-local snapshots of the view, so they undo/redo whole expansions without
+touching your real files (native undo does not apply — the view is read-only).
 
 Put the cursor on a function call or macro and expand it. Its body is spliced in
 below, indented and folded-open. Move into that body and expand again to go

@@ -134,6 +134,38 @@ local function apply_edits(src, s, e, edits)
   return region
 end
 
+-- Longest common leading-whitespace prefix across the non-blank lines.
+local function common_ws_prefix(lines)
+  local p
+  for _, l in ipairs(lines) do
+    if l:match("%S") then
+      local ws = l:match("^[ \t]*")
+      if not p then
+        p = ws
+      else
+        local i = 1
+        while i <= #p and p:sub(i, i) == ws:sub(i, i) do
+          i = i + 1
+        end
+        p = p:sub(1, i - 1)
+      end
+    end
+  end
+  return p or ""
+end
+
+-- Dedent a fragment to its common indent, then re-indent each line under `target`.
+-- Relative nesting (and the source's tabs/spaces) is preserved.
+local function rebase(fragment, target)
+  local lines = vim.split(fragment, "\n", { plain = true })
+  local strip = #common_ws_prefix(lines)
+  local out = {}
+  for _, l in ipairs(lines) do
+    out[#out + 1] = l:match("%S") and (target .. l:sub(strip + 1)) or ""
+  end
+  return out
+end
+
 -- Collect declarator identifier names visible in the caller's enclosing function.
 local function enclosing_scope(call, src)
   local fn = call
@@ -282,40 +314,35 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
     return eds
   end
 
-  local function indent_lines(lines, pad)
-    local out = {}
-    for _, l in ipairs(lines) do
-      out[#out + 1] = (l == "") and "" or (pad .. l)
-    end
-    return out
-  end
-
   local function splice(edits)
     return apply_edits(caller_src, 0, #caller_src, edits)
   end
+
+  -- Indentation of the statement the call lives in, taken from the caller so
+  -- tabs/spaces match the surrounding source.
+  local stmt = enclosing_statement(call)
+  local stmt_bol = sb(stmt) - scol(stmt)
+  local stmt_indent = caller_src:sub(stmt_bol + 1, sb(stmt))
 
   local last = stmts[#stmts]
   local simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0
 
   if simple then
     -- Pretty hoist. Setup = every statement except the trailing return.
-    local setup_text = (#stmts >= 2) and apply_edits(callee_src, sb(stmts[1]), eb(stmts[#stmts - 1]), body_edits) or ""
+    local hoist = {}
+    for _, b in ipairs(binds) do
+      hoist[#hoist + 1] = stmt_indent .. b
+    end
+    if #stmts >= 2 then
+      local rstart = sb(stmts[1]) - scol(stmts[1]) -- keep line-1 indentation
+      local setup = apply_edits(callee_src, rstart, eb(stmts[#stmts - 1]), body_edits)
+      vim.list_extend(hoist, rebase(setup, stmt_indent))
+    end
     local expr = last:named_child(0)
     local expr_text = apply_edits(callee_src, sb(expr), eb(expr), body_edits)
 
-    local hoist = {}
-    vim.list_extend(hoist, binds)
-    if setup_text ~= "" then
-      vim.list_extend(hoist, vim.split(setup_text, "\n", { plain = true }))
-    end
-
-    local stmt = enclosing_statement(call)
-    local pad = string.rep(" ", scol(stmt))
-    local bol = sb(stmt) - scol(stmt)
-    local block = table.concat(indent_lines(hoist, pad), "\n") .. "\n"
-
     return splice({
-      { bol, bol, block },
+      { stmt_bol, stmt_bol, table.concat(hoist, "\n") .. "\n" },
       { sb(call), eb(call), "(" .. expr_text .. ")" },
     })
   end
@@ -324,7 +351,8 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
   local edits = {}
   vim.list_extend(edits, body_edits)
   vim.list_extend(edits, return_edits())
-  local body_text = apply_edits(callee_src, sb(stmts[1]), eb(stmts[#stmts]), edits)
+  local rstart = sb(stmts[1]) - scol(stmts[1])
+  local body_text = apply_edits(callee_src, rstart, eb(stmts[#stmts]), edits)
 
   local first_ret = returns[1]
   local slot = ""
@@ -332,21 +360,21 @@ function M.inline_call(caller_src, callee_src, fname, N, occ)
     slot = string.format("__typeof__(%s) %s;", text(first_ret:named_child(0), callee_src), ret_var)
   end
 
+  local unit = stmt_indent:find("\t") and "\t" or "    "
+  local inner = stmt_indent .. unit
   local parts = { "({" }
   for _, b in ipairs(binds) do
-    parts[#parts + 1] = "    " .. b
+    parts[#parts + 1] = inner .. b
   end
   if slot ~= "" then
-    parts[#parts + 1] = "    " .. slot
+    parts[#parts + 1] = inner .. slot
   end
-  for _, l in ipairs(vim.split(body_text, "\n", { plain = true })) do
-    parts[#parts + 1] = "    " .. l
-  end
-  parts[#parts + 1] = "    " .. end_label .. ":;"
+  vim.list_extend(parts, rebase(body_text, inner))
+  parts[#parts + 1] = inner .. end_label .. ":;"
   if slot ~= "" then
-    parts[#parts + 1] = "    " .. ret_var .. ";"
+    parts[#parts + 1] = inner .. ret_var .. ";"
   end
-  parts[#parts + 1] = "})"
+  parts[#parts + 1] = stmt_indent .. "})"
 
   return splice({
     { sb(call), eb(call), table.concat(parts, "\n") },

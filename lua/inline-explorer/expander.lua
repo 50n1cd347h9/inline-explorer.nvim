@@ -75,6 +75,7 @@ function M._insert(st, bufnr, lnum, name, body, label)
     out[#out + 1] = pad .. "/* ^ " .. name .. " */"
   end
 
+  require("inline-explorer.history").snapshot(st, bufnr)
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, lnum + 1, lnum + 1, false, out)
   vim.bo[bufnr].modifiable = false
