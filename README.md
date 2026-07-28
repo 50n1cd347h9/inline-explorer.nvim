@@ -115,12 +115,13 @@ If not, expansion fails with `no language server attached to the source buffer`.
 
 Open a file (with a language server attached), then:
 
-| Keymap        | Command                  | Action                                         |
-| ------------- | ------------------------ | ---------------------------------------------- |
-| `<leader>eo`  | `:InlineExplorerOpen`    | Open a reading view for the current file       |
-| `<leader>ee`  | `:InlineExplorerExpand`  | Expand the symbol under the cursor             |
-| `<leader>ec`  | (`za`)                   | Fold / unfold the expansion under the cursor   |
-| `<leader>eq`  | `:InlineExplorerClose`   | Close the reading view                         |
+| Keymap        | Command                     | Action                                              |
+| ------------- | --------------------------- | --------------------------------------------------- |
+| `<leader>eo`  | `:InlineExplorerOpen`       | Open a reading view for the current file            |
+| `<leader>ee`  | `:InlineExplorerExpand`     | Block-expand the symbol under the cursor (any lang) |
+| `<leader>ei`  | `:InlineExplorerSubstitute` | Inline-substitute the call under the cursor (C only) |
+| `<leader>ec`  | (`za`)                      | Fold / unfold the expansion under the cursor        |
+| `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
 
 Put the cursor on a function call or macro and expand it. Its body is spliced in
 below, indented and folded-open. Move into that body and expand again to go
@@ -130,6 +131,46 @@ re-fetched.
 > Tip: until your keymaps are sorted, drive it entirely by command
 > (`:InlineExplorerOpen`, then `:InlineExplorerExpand` on a symbol). The commands
 > never depend on `mapleader`.
+
+## Inline substitution (C)
+
+`:InlineExplorerSubstitute` (`<leader>ei`) does more than paste the definition
+below the call — it **rewrites the call into the effect of the function body**,
+the way a compiler inlines it, so the surrounding statement reads on its own. This
+is C-only and requires the tree-sitter `c` parser.
+
+Given `return snap != acquire(c);`, inlining `acquire` produces:
+
+```c
+__typeof__(c) cpu = (c);
+struct ct *p = per_cpu_ptr(CT, cpu);
+return snap != (p->state & MASK);
+```
+
+How it works:
+
+- **Parameters** become `__typeof__(arg) param = (arg);` bindings — correct
+  call-by-value semantics with no type reconstruction.
+- **Simple functions** (straight-line, single trailing return) are rendered as a
+  *pretty hoist*: setup statements lifted above the call, the returned expression
+  spliced in place (parenthesised, so precedence is preserved).
+- **Anything else** (early returns, loops, control flow) is rendered as a GNU
+  **statement expression** `({ ... })`, with each `return E;` rewritten to
+  `{ __ie_retN = E; goto __ie_endN; }`. There is no fallback to block-paste.
+- **Callee labels** and **locals that would collide** with the caller scope are
+  suffixed `name__ieN` so repeated/nested inlining stays correct.
+
+The transform is compile-correctness tested: `tests/substitute_spec.lua` inlines a
+range of functions and has gcc **compile and run** each result against the
+original's semantics. Run it with:
+
+```sh
+nvim --headless --clean -u NONE -c "luafile tests/substitute_spec.lua" -c "qa!"
+```
+
+Limitations: macros and variadic functions are not inlinable this way; the current
+action rewrites the whole view buffer, so it resets any block-expansion folds in
+the view (undo/redo for the view is planned).
 
 ## Configuration
 

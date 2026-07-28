@@ -41,3 +41,31 @@ depth N. tree-sitter then extracts the exact definition node from the target fil
 - **Expander** (`expander.lua`) — splice the body below the call line, indent,
   wrap in a fold, guard against self-recursion.
 - **Config / init** — options, user commands, keymaps.
+
+## Inline substitution (C-only)
+
+A second, stronger mode (`substitute.lua` + `inliner.lua`): instead of pasting the
+definition below the call, rewrite the call into the effect of the body — true
+compiler-style inlining — so the surrounding statement reads on its own.
+
+Decisions (from brainstorming): C-only, `goto` allowed, no fallback to
+block-paste, rigour level X (compile-correct).
+
+Mechanism:
+
+- Parameters bind via `__typeof__(arg) param = (arg);` — dodges declarator
+  reconstruction and preserves call-by-value.
+- Straight-line single-return functions render as a *pretty hoist* (setup lifted
+  above the call statement, return expression spliced in, parenthesised).
+- Everything else renders as a GNU statement expression `({ ... })` with each
+  `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and
+  `__typeof__(first-return) __ie_retN;` as the value slot. This makes *any*
+  function inlinable as an expression, so there is no block-paste fallback.
+- Callee labels (function-scoped) and hoisted locals that collide with the caller
+  scope are suffixed `name__ieN`, keyed by a per-expansion id N, so repeated and
+  nested inlining stays correct.
+- Truly non-inlinable cases (variadic, macros) report an error rather than
+  producing wrong code.
+
+Guarantee: `tests/substitute_spec.lua` has gcc compile and run each transform
+against the original function's semantics.

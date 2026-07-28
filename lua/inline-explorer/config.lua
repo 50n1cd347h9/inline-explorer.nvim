@@ -2,7 +2,8 @@ local M = {}
 
 M.defaults = {
   keymaps = {
-    expand = "<leader>ee", -- expand the symbol under the cursor
+    expand = "<leader>ee", -- expand the symbol under the cursor (block, any language)
+    substitute = "<leader>ei", -- inline-substitute the call under the cursor (C only)
     toggle_fold = "<leader>ec", -- fold / unfold the expansion under the cursor
     open = "<leader>eo", -- open a reading view for the current file
     close = "<leader>eq", -- close the reading view
