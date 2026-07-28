@@ -489,7 +489,7 @@ function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
 
   -- Readable general form: body hoisted with return -> assignment, no ({})/goto.
   -- Reads top-to-bottom; not faithful for functions with early returns.
-  local function emit_readable_multi()
+  local function emit_readable_multi(wrap)
     local edits = {}
     vim.list_extend(edits, body_edits)
     vim.list_extend(edits, return_edits("assign"))
@@ -497,25 +497,50 @@ function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
     local body_text = apply_edits(callee_src, rstart, eb(stmts[#stmts]), edits)
     local hoist = {}
     for _, b in ipairs(binds) do
-      hoist[#hoist + 1] = stmt_indent .. b
+      hoist[#hoist + 1] = b
     end
     if returns[1] and returns[1]:named_child_count() > 0 then
-      hoist[#hoist + 1] = stmt_indent .. return_type(fdef, callee_src) .. " " .. ret_var .. ";"
+      hoist[#hoist + 1] = return_type(fdef, callee_src) .. " " .. ret_var .. ";"
     end
-    vim.list_extend(hoist, rebase(body_text, stmt_indent))
+    vim.list_extend(hoist, rebase(body_text, ""))
+
+    if wrap then
+      local ttext = text(target, caller_src)
+      local off = sb(call) - sb(target)
+      local modified = ttext:sub(1, off) .. ret_var .. ttext:sub(eb(call) - sb(target) + 1)
+      local inner = stmt_indent .. unit
+      local out = { "{" }
+      for _, l in ipairs(hoist) do
+        out[#out + 1] = inner .. l
+      end
+      for _, l in ipairs(vim.split(modified, "\n", { plain = true })) do
+        out[#out + 1] = inner .. l
+      end
+      out[#out + 1] = stmt_indent .. "}"
+      return splice({ { sb(target), eb(target), table.concat(out, "\n") } })
+    end
+
+    local block = {}
+    for _, l in ipairs(hoist) do
+      block[#block + 1] = stmt_indent .. l
+    end
     return splice({
-      { stmt_bol, stmt_bol, table.concat(hoist, "\n") .. "\n" },
+      { stmt_bol, stmt_bol, table.concat(block, "\n") .. "\n" },
       { sb(call), eb(call), ret_var },
     })
   end
 
+  -- Insert-before is only valid when the statement sits directly in a `{}` block.
+  -- Otherwise (unbraced if/for/while/else body, case/goto label) the hoist would
+  -- break the enclosing construct, so wrap the whole thing in a block.
+  local parent_t = target:parent() and target:parent():type()
+  local wrap = parent_t ~= "compound_statement"
+
   if callee_simple and (mode == "readable" or hoist_safe()) then
-    local parent_t = target:parent() and target:parent():type()
-    local wrap = (mode == "correct") and (parent_t == "case_statement" or parent_t == "labeled_statement")
     return emit_pretty(wrap)
   end
   if mode == "readable" then
-    return emit_readable_multi()
+    return emit_readable_multi(wrap)
   end
   return emit_stmt_expr()
 end

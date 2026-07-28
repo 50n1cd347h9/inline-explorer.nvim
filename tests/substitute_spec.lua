@@ -225,5 +225,26 @@ static __always_inline int ct_rcu_watching_cpu_acquire(int cpu)
   check("case7 pretty-hoisted (no statement expr)", not t:find("({", 1, true), t)
 end
 
+-- Case 8: inline into an unbraced `if` body (single-return callee). The hoist
+-- must be wrapped in a block, not spliced between the `if` and its statement.
+do
+  local callee = "static int acc(int x)\n{\n    int t = x + 1;\n    return t * 2;\n}"
+  local caller = "static int caller(int a)\n{\n    if (a > 0)\n        return acc(a);\n    return 0;\n}"
+  local t = transform(caller, callee, "acc", { { N = 1 } })
+  local main = "int main(void){ return (caller(3)==8 && caller(-1)==0)?0:1; }\n"
+  check("case8 compiles (unbraced if, single-return)", (compiles(callee .. "\n" .. t .. main, "c8")), t)
+  check("case8 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c8")))
+end
+
+-- Case 9: inline a multi-return callee into an unbraced `if` body.
+do
+  local callee = "static int cls(int x)\n{\n    if (x < 0)\n        return -1;\n    return x ? 1 : 0;\n}"
+  local caller = "static int caller(int n)\n{\n    if (n > 10)\n        return cls(n);\n    return 99;\n}"
+  local t = transform(caller, callee, "cls", { { N = 1 } })
+  local main = "int main(void){ return (caller(20)==1 && caller(5)==99 && caller(-1)==99)?0:1; }\n"
+  check("case9 compiles (unbraced if, multi-return)", (compiles(callee .. "\n" .. t .. main, "c9")), t)
+  check("case9 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c9")))
+end
+
 print("")
 print(fails == 0 and "ALL SUBSTITUTE TESTS PASSED" or (fails .. " FAILURE(S)"))
