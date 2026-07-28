@@ -2,13 +2,7 @@
 -- ask the live clangd for the expansion via `textDocument/hover` (read-only) and
 -- splice it in place of the macro use. clangd runs the real preprocessor, so the
 -- result respects include paths / #define / #ifdef.
-local view = require("inline-explorer.view")
-
 local M = {}
-
-local function notify(msg, level)
-  vim.notify("[inline-explorer] " .. msg, level or vim.log.levels.WARN)
-end
 
 local function parse(src)
   return vim.treesitter.get_string_parser(src, "c"):parse()[1]:root()
@@ -57,7 +51,12 @@ local function expansion_lines(md)
       end
     end
   end
-  local out = (seen and #after > 0) and after or all
+  -- Only treat it as a macro expansion when clangd actually showed one; a plain
+  -- function-signature hover (no "Expands to") must NOT be spliced in.
+  if not (seen and #after > 0) then
+    return nil
+  end
+  local out = after
   while out[1] and out[1]:match("^%s*$") do
     table.remove(out, 1)
   end
@@ -133,31 +132,6 @@ function M.fetch_expansion(st, row, col, cb)
       end
     end
     cb(md and md ~= "" and expansion_lines(md) or nil)
-  end)
-end
-
--- Explicit in-place macro expansion (command / keymap).
-function M.expand()
-  local st = view.current()
-  if not st then
-    return notify("open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
-  end
-  local bufnr = vim.api.nvim_get_current_buf()
-  local cur = vim.api.nvim_win_get_cursor(0)
-  local row, col = cur[1] - 1, cur[2]
-  local src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-
-  M.fetch_expansion(st, row, col, function(exp)
-    vim.schedule(function()
-      if not exp or #exp == 0 then
-        return notify("no macro expansion available at the cursor")
-      end
-      local ok, new = pcall(M.replace_in_src, src, row, col, exp)
-      if not ok or not new then
-        return notify("could not place the expansion: " .. tostring(new))
-      end
-      view.rewrite(st, bufnr, new, row)
-    end)
   end)
 end
 

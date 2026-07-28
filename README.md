@@ -119,8 +119,7 @@ Open a file (with a language server attached), then:
 | ------------- | --------------------------- | --------------------------------------------------- |
 | `<leader>eo`  | `:InlineExplorerOpen`       | Open a reading view for the current file            |
 | `<leader>ee`  | `:InlineExplorerExpand`     | Block-expand the symbol under the cursor (any lang) |
-| `<leader>ei`  | `:InlineExplorerSubstitute` | Inline-substitute the call under the cursor (C only) |
-| `<leader>em`  | `:InlineExplorerExpandMacro` | Expand the macro under the cursor via clangd (C)   |
+| `<leader>ei`  | `:InlineExplorerSubstitute` | Inline in place: functions inlined, macros expanded (C) |
 | `<leader>ec`  | (`za`)                      | Fold / unfold the expansion under the cursor        |
 | `u` / `r`     | —                           | Undo / redo the last expansion (inside the view)    |
 | `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
@@ -203,17 +202,20 @@ Limitations: macros and variadic functions are not inlinable this way; the curre
 action rewrites the whole view buffer, so it resets any block-expansion folds in
 the view.
 
-## Macro expansion (C)
+## Macros
 
-Macros have no type or structured body, so they cannot be inline-substituted the
-way functions are. Instead `:InlineExplorerExpandMacro` (`<leader>em`) asks the
-**live clangd** for the expansion — clangd runs the real preprocessor, so the
-result respects your include paths, `#define`s and `#ifdef` state — and drops it
-into the view as a folded block (read-only; your real file is never edited).
+Macros have no type or structured body, so they cannot be transformed like
+functions. Two ways to see one, under the same keys as functions:
 
-The query runs against the original source at the cursor's position, so it is
-reliable at depth 0. Large line shifts from prior expansions above the macro can
-misalign it; expand macros before shifting the lines around them.
+- **`<leader>ei`** (smart inline) replaces the macro use **in place** with its
+  expansion, fetched from the **live clangd** (`textDocument/hover`), so it
+  respects your include paths, `#define`s and `#ifdef` state. The query runs
+  against the original source at the cursor, reliable at depth 0; large line
+  shifts from prior expansions can misalign it.
+- **`<leader>ee`** (block expand) drops the macro's definition below the use as a
+  folded block, like any other symbol.
+
+Both are read-only — your real file is never edited.
 
 ## Configuration
 

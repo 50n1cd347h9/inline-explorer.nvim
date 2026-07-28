@@ -2,9 +2,8 @@ local M = {}
 
 M.defaults = {
   keymaps = {
-    substitute = "<leader>ei", -- primary: smart inline (substitute in place, else block)
-    expand = "<leader>ee", -- explicit block-paste (any language; also the fallback)
-    expand_macro = "<leader>em", -- explicit in-place macro expansion via clangd (C)
+    substitute = "<leader>ei", -- primary: smart inline (functions inlined, macros expanded in place; else block)
+    expand = "<leader>ee", -- explicit block-paste (any language, incl. macros; also the fallback)
     toggle_fold = "<leader>ec", -- fold / unfold the expansion under the cursor
     open = "<leader>eo", -- open a reading view for the current file
     close = "<leader>eq", -- close the reading view

@@ -62,23 +62,22 @@ function M.smart()
       return block_fallback() -- e.g. variadic function
     end
 
-    if type(label) == "string" and label:match("^preproc") then
-      return macro.fetch_expansion(st, row, col, function(exp)
-        if not exp or #exp == 0 then
-          return block_fallback()
+    -- Not a confirmed function (macro, or heuristic-extracted from a header):
+    -- try an in-place macro expansion via clangd hover; block-paste only if that
+    -- yields nothing (so a plain function-signature hover never gets spliced).
+    macro.fetch_expansion(st, row, col, function(exp)
+      if not exp or #exp == 0 then
+        return block_fallback()
+      end
+      vim.schedule(function()
+        local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
+        if ok and new then
+          view.rewrite(st, bufnr, new, row)
+        else
+          expander.expand()
         end
-        vim.schedule(function()
-          local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
-          if ok and new then
-            view.rewrite(st, bufnr, new, row)
-          else
-            expander.expand()
-          end
-        end)
       end)
-    end
-
-    block_fallback() -- declarations, types, etc.
+    end)
   end)
 end
 

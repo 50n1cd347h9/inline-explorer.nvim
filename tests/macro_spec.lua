@@ -34,6 +34,9 @@ do
   local e = table.concat(macro._expansion_lines(hover_inline), "\n")
   check("expansion after inline '// Expands to', #define dropped", e:find("({", 1, true) and not e:find("#define", 1, true), e)
   check("separate-block 'Expands to' -> value", table.concat(macro._expansion_lines(hover_blocks), "\n") == "(0x3U << 0)")
+  -- A plain function-signature hover has no "Expands to" -> not a macro.
+  local sig = "### `foo`\n```c\nint foo(int a)\n```"
+  check("function-signature hover -> nil (not spliced as a macro)", macro._expansion_lines(sig) == nil)
 end
 
 -- Object-like macro in expression context -> parenthesised value.
