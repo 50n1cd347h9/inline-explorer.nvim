@@ -15,6 +15,10 @@
 --
 -- The transform is pure text/tree-sitter and language-specific to C. `N` is a
 -- per-expansion id that keeps injected/renamed names unique.
+--
+-- Structure: analyze_callee -> IR, analyze_context -> ctx, decide (the single
+-- decision point) -> one of three layout-only printers (pretty / canonical
+-- statement-expression / readable-multi).
 local M = {}
 
 local function parse(src)
@@ -267,37 +271,28 @@ local function enclosing_statement(call)
   return call
 end
 
--- Build the transform. Returns (new_caller_src, err).
--- mode: "correct" (default, guaranteed to compile) or "readable" (cleaner output
--- that skips ({...})/goto and safety wrapping, and may not compile in edge cases).
-function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
-  N = N or 1
-  occ = occ or 1
-  mode = mode or "correct"
+-- ---------------------------------------------------------------------------
+-- Analysis: resolve the callee into a small IR and the call site into a ctx,
+-- so that a single decision point picks one of three "dumb" printers. The
+-- printers do layout only; every judgement lives in analyze_* / decide.
+-- ---------------------------------------------------------------------------
 
-  local call = find_calls(parse(caller_src), caller_src, fname)[occ]
-  if not call then
-    return nil, "call to '" .. fname .. "' not found"
-  end
-
-  local eroot = parse(callee_src)
-  local fdef, fd = find_function_def(eroot, callee_src, fname)
+-- IR: everything the printers need to know about the callee.
+--   params/rename   parameter list and planned collision renames (name__ieN)
+--   stmts/returns   body statement nodes and return_statement nodes
+--   body_edits      label-suffix + rename edits on callee_src (absolute bytes)
+--   ret_type        reconstructed declared return type text
+--   has_value       whether returns carry an expression
+--   simple          straight-line body with a single trailing return
+--   ret_var/end_label  injected names, unique per expansion id N
+local function analyze_callee(callee_src, fname, N, scope)
+  local fdef, fd = find_function_def(parse(callee_src), callee_src, fname)
   if not fdef then
     return nil, "definition of '" .. fname .. "' not found"
   end
-
   local params, variadic = get_params(fd, callee_src)
   if variadic then
     return nil, "cannot inline variadic function '" .. fname .. "'"
-  end
-
-  local arglist = call:field("arguments")[1]
-  local args = {}
-  for i = 0, arglist:named_child_count() - 1 do
-    args[#args + 1] = text(arglist:named_child(i), caller_src)
-  end
-  if #args ~= #params then
-    return nil, string.format("arity mismatch (%d args, %d params)", #args, #params)
   end
 
   local body = fdef:field("body")[1]
@@ -311,7 +306,6 @@ function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
   local returns = query_nodes(body, callee_src, "(return_statement) @r")
 
   -- Names hoisted into the caller scope; rename those that would collide.
-  local scope = enclosing_scope(call, caller_src)
   local rename = {}
   local function maybe_rename(nm)
     if nm and scope[nm] then
@@ -355,201 +349,251 @@ function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
     end
   end
 
-  local binds = {}
-  for i, p in ipairs(params) do
-    binds[#binds + 1] = build_bind(p, args[i], rename, N, i, callee_src)
-  end
+  local last = stmts[#stmts]
+  return {
+    src = callee_src,
+    params = params,
+    rename = rename,
+    stmts = stmts,
+    returns = returns,
+    body_edits = body_edits,
+    ret_type = return_type(fdef, callee_src),
+    has_value = returns[1] ~= nil and returns[1]:named_child_count() > 0,
+    simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0,
+    ret_var = "__ie_ret" .. N,
+    end_label = "__ie_end" .. N,
+  }
+end
 
-  local ret_var = "__ie_ret" .. N
-  local end_label = "__ie_end" .. N
-
-  -- Rewrite `return E;` -> `{ ret = E; goto end; }` by editing only the `return`
-  -- keyword and the `;` (leaving E for the label/rename edits above).
-  -- style "goto": `return E;` -> `{ ret = E; goto end; }` (correct, self-contained)
-  -- style "assign": `return E;` -> `ret = E;`            (readable, no control flow)
-  local function return_edits(style)
-    local eds = {}
-    for _, r in ipairs(returns) do
-      local kw = r:child(0)
-      local semi = r:child(r:child_count() - 1)
-      local has_expr = r:named_child_count() > 0
-      if style == "assign" then
-        eds[#eds + 1] = { sb(kw), eb(kw), has_expr and (ret_var .. " =") or "(void)0" }
-      elseif has_expr then
-        eds[#eds + 1] = { sb(kw), eb(kw), "{ " .. ret_var .. " =" }
-        eds[#eds + 1] = { sb(semi), eb(semi), "; goto " .. end_label .. "; }" }
-      else
-        eds[#eds + 1] = { sb(kw), eb(kw), "{ goto " .. end_label .. ";" }
-        eds[#eds + 1] = { sb(semi), eb(semi), " }" }
-      end
-    end
-    return eds
-  end
-
-  local function splice(edits)
-    return apply_edits(caller_src, 0, #caller_src, edits)
-  end
-
-  -- The statement the call lives in, and its indentation (tabs/spaces preserved).
+-- ctx: everything the printers need to know about the call site.
+--   braced          the enclosing statement sits directly inside a {} block
+--                   (if not, hoisting printers must wrap in a block: a
+--                   declaration cannot follow a bare label / unbraced if body)
+--   unconditional   the call is reached unconditionally in a plain statement
+--                   (not in a loop/if header, ?: arm, or after &&/||)
+--   stmt_bol/indent/unit  layout facts; the source's tabs/spaces are preserved
+local function analyze_context(caller_src, call)
   local target = enclosing_statement(call)
-  local target_type = target:type()
-  local stmt_bol = sb(target) - scol(target)
-  local stmt_indent = caller_src:sub(stmt_bol + 1, sb(target))
-  local unit = stmt_indent:find("\t") and "\t" or "    "
-
-  -- Hoisting is only valid (in correct mode) when the call is reached
-  -- unconditionally within a plain statement; short-circuit / ternary contexts
-  -- and loop/if headers are not.
-  local function hoist_safe()
-    if not (target_type == "return_statement" or target_type == "expression_statement" or target_type == "declaration") then
-      return false
-    end
+  local t = target:type()
+  local unconditional = t == "return_statement" or t == "expression_statement" or t == "declaration"
+  if unconditional then
     local n = call
     while n and n ~= target do
-      local t = n:type()
-      if t == "conditional_expression" then
-        return false
-      end
-      if t == "binary_expression" then
+      local ty = n:type()
+      if ty == "conditional_expression" then
+        unconditional = false
+      elseif ty == "binary_expression" then
         for i = 0, n:child_count() - 1 do
           local ch = n:child(i)
           if not ch:named() and (text(ch, caller_src) == "&&" or text(ch, caller_src) == "||") then
-            return false
+            unconditional = false
           end
         end
       end
       n = n:parent()
     end
-    return true
   end
-
-  local last = stmts[#stmts]
-  local callee_simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0
-
-  -- Pretty hoist: setup lifted above the statement, return expression spliced in.
-  local function emit_pretty(wrap)
-    local hoist = {}
-    for _, b in ipairs(binds) do
-      hoist[#hoist + 1] = b
-    end
-    if #stmts >= 2 then
-      local rstart = sb(stmts[1]) - scol(stmts[1])
-      vim.list_extend(hoist, rebase(apply_edits(callee_src, rstart, eb(stmts[#stmts - 1]), body_edits), ""))
-    end
-    local expr = last:named_child(0)
-    local expr_text = apply_edits(callee_src, sb(expr), eb(expr), body_edits)
-
-    if wrap then
-      -- After a case/goto label a declaration needs a block to be a statement.
-      local ttext = text(target, caller_src)
-      local off = sb(call) - sb(target)
-      local modified = ttext:sub(1, off) .. "(" .. expr_text .. ")" .. ttext:sub(eb(call) - sb(target) + 1)
-      local inner = stmt_indent .. unit
-      local out = { "{" }
-      for _, l in ipairs(hoist) do
-        out[#out + 1] = inner .. l
-      end
-      for _, l in ipairs(vim.split(modified, "\n", { plain = true })) do
-        out[#out + 1] = inner .. l
-      end
-      out[#out + 1] = stmt_indent .. "}"
-      return splice({ { sb(target), eb(target), table.concat(out, "\n") } })
-    end
-
-    local block = {}
-    for _, l in ipairs(hoist) do
-      block[#block + 1] = stmt_indent .. l
-    end
-    return splice({
-      { stmt_bol, stmt_bol, table.concat(block, "\n") .. "\n" },
-      { sb(call), eb(call), "(" .. expr_text .. ")" },
-    })
-  end
-
-  -- Correct general form: GNU statement expression (self-contained, compiles).
-  local function emit_stmt_expr()
-    local edits = {}
-    vim.list_extend(edits, body_edits)
-    vim.list_extend(edits, return_edits("goto"))
-    local rstart = sb(stmts[1]) - scol(stmts[1])
-    local body_text = apply_edits(callee_src, rstart, eb(stmts[#stmts]), edits)
-    local slot = ""
-    if returns[1] and returns[1]:named_child_count() > 0 then
-      slot = return_type(fdef, callee_src) .. " " .. ret_var .. ";"
-    end
-    local inner = stmt_indent .. unit
-    local parts = { "({" }
-    for _, b in ipairs(binds) do
-      parts[#parts + 1] = inner .. b
-    end
-    if slot ~= "" then
-      parts[#parts + 1] = inner .. slot
-    end
-    vim.list_extend(parts, rebase(body_text, inner))
-    parts[#parts + 1] = inner .. end_label .. ":;"
-    if slot ~= "" then
-      parts[#parts + 1] = inner .. ret_var .. ";"
-    end
-    parts[#parts + 1] = stmt_indent .. "})"
-    return splice({ { sb(call), eb(call), table.concat(parts, "\n") } })
-  end
-
-  -- Readable general form: body hoisted with return -> assignment, no ({})/goto.
-  -- Reads top-to-bottom; not faithful for functions with early returns.
-  local function emit_readable_multi(wrap)
-    local edits = {}
-    vim.list_extend(edits, body_edits)
-    vim.list_extend(edits, return_edits("assign"))
-    local rstart = sb(stmts[1]) - scol(stmts[1])
-    local body_text = apply_edits(callee_src, rstart, eb(stmts[#stmts]), edits)
-    local hoist = {}
-    for _, b in ipairs(binds) do
-      hoist[#hoist + 1] = b
-    end
-    if returns[1] and returns[1]:named_child_count() > 0 then
-      hoist[#hoist + 1] = return_type(fdef, callee_src) .. " " .. ret_var .. ";"
-    end
-    vim.list_extend(hoist, rebase(body_text, ""))
-
-    if wrap then
-      local ttext = text(target, caller_src)
-      local off = sb(call) - sb(target)
-      local modified = ttext:sub(1, off) .. ret_var .. ttext:sub(eb(call) - sb(target) + 1)
-      local inner = stmt_indent .. unit
-      local out = { "{" }
-      for _, l in ipairs(hoist) do
-        out[#out + 1] = inner .. l
-      end
-      for _, l in ipairs(vim.split(modified, "\n", { plain = true })) do
-        out[#out + 1] = inner .. l
-      end
-      out[#out + 1] = stmt_indent .. "}"
-      return splice({ { sb(target), eb(target), table.concat(out, "\n") } })
-    end
-
-    local block = {}
-    for _, l in ipairs(hoist) do
-      block[#block + 1] = stmt_indent .. l
-    end
-    return splice({
-      { stmt_bol, stmt_bol, table.concat(block, "\n") .. "\n" },
-      { sb(call), eb(call), ret_var },
-    })
-  end
-
-  -- Insert-before is only valid when the statement sits directly in a `{}` block.
-  -- Otherwise (unbraced if/for/while/else body, case/goto label) the hoist would
-  -- break the enclosing construct, so wrap the whole thing in a block.
+  local stmt_bol = sb(target) - scol(target)
+  local indent = caller_src:sub(stmt_bol + 1, sb(target))
   local parent_t = target:parent() and target:parent():type()
-  local wrap = parent_t ~= "compound_statement"
+  return {
+    call = call,
+    target = target,
+    braced = parent_t == "compound_statement",
+    unconditional = unconditional,
+    stmt_bol = stmt_bol,
+    indent = indent,
+    unit = indent:find("\t") and "\t" or "    ",
+  }
+end
 
-  if callee_simple and (mode == "readable" or hoist_safe()) then
-    return emit_pretty(wrap)
+-- The single decision point: which printer renders this expansion.
+--   pretty          simple callee, and hoisting is provably safe (or the user
+--                   asked for readable output, which tolerates the risk)
+--   readable_multi  readable mode for everything else: no ({...})/goto, may
+--                   not preserve semantics (documented trade-off)
+--   canonical       the always-correct GNU statement expression + goto form
+local function decide(ir, ctx, mode)
+  if ir.simple and (mode == "readable" or ctx.unconditional) then
+    return "pretty"
   end
   if mode == "readable" then
-    return emit_readable_multi(wrap)
+    return "readable_multi"
   end
-  return emit_stmt_expr()
+  return "canonical"
+end
+
+-- ---------------------------------------------------------------------------
+-- Printers: pure layout. Each receives (caller_src, ir, ctx) and returns the
+-- transformed caller source. No judgements here beyond mechanical wrapping.
+-- ---------------------------------------------------------------------------
+
+local function splice(caller_src, edits)
+  return apply_edits(caller_src, 0, #caller_src, edits)
+end
+
+-- Rewrite `return E;` inside the body region.
+-- style "goto":   `return E;` -> `{ ret = E; goto end; }` (self-contained)
+-- style "assign": `return E;` -> `ret = E;`               (no control flow)
+local function return_edits(ir, style)
+  local eds = {}
+  for _, r in ipairs(ir.returns) do
+    local kw = r:child(0)
+    local semi = r:child(r:child_count() - 1)
+    local has_expr = r:named_child_count() > 0
+    if style == "assign" then
+      eds[#eds + 1] = { sb(kw), eb(kw), has_expr and (ir.ret_var .. " =") or "(void)0" }
+    elseif has_expr then
+      eds[#eds + 1] = { sb(kw), eb(kw), "{ " .. ir.ret_var .. " =" }
+      eds[#eds + 1] = { sb(semi), eb(semi), "; goto " .. ir.end_label .. "; }" }
+    else
+      eds[#eds + 1] = { sb(kw), eb(kw), "{ goto " .. ir.end_label .. ";" }
+      eds[#eds + 1] = { sb(semi), eb(semi), " }" }
+    end
+  end
+  return eds
+end
+
+-- Body statements [1..last_i] with `extra` edits applied, dedented to "".
+local function body_text(ir, last_i, extra)
+  local edits = {}
+  vim.list_extend(edits, ir.body_edits)
+  vim.list_extend(edits, extra or {})
+  local rstart = sb(ir.stmts[1]) - scol(ir.stmts[1])
+  return apply_edits(ir.src, rstart, eb(ir.stmts[last_i]), edits)
+end
+
+-- Replace the whole target statement with `{ hoist...; modified target }`.
+local function print_wrapped(caller_src, ir, ctx, hoist, replacement)
+  local ttext = text(ctx.target, caller_src)
+  local off = sb(ctx.call) - sb(ctx.target)
+  local modified = ttext:sub(1, off) .. replacement .. ttext:sub(eb(ctx.call) - sb(ctx.target) + 1)
+  local inner = ctx.indent .. ctx.unit
+  local out = { "{" }
+  for _, l in ipairs(hoist) do
+    out[#out + 1] = inner .. l
+  end
+  for _, l in ipairs(vim.split(modified, "\n", { plain = true })) do
+    out[#out + 1] = inner .. l
+  end
+  out[#out + 1] = ctx.indent .. "}"
+  return splice(caller_src, { { sb(ctx.target), eb(ctx.target), table.concat(out, "\n") } })
+end
+
+-- Insert `hoist` lines above the target statement and swap the call for
+-- `replacement`; wraps in a block when the target is not directly braced.
+local function print_hoisted(caller_src, ir, ctx, hoist, replacement)
+  if not ctx.braced then
+    return print_wrapped(caller_src, ir, ctx, hoist, replacement)
+  end
+  local block = {}
+  for _, l in ipairs(hoist) do
+    block[#block + 1] = ctx.indent .. l
+  end
+  return splice(caller_src, {
+    { ctx.stmt_bol, ctx.stmt_bol, table.concat(block, "\n") .. "\n" },
+    { sb(ctx.call), eb(ctx.call), replacement },
+  })
+end
+
+-- Pretty hoist: setup lifted above the statement, the returned expression
+-- spliced in place (parenthesised, so precedence is preserved).
+local function print_pretty(caller_src, ir, ctx)
+  local hoist = {}
+  vim.list_extend(hoist, ir.binds)
+  if #ir.stmts >= 2 then
+    vim.list_extend(hoist, rebase(body_text(ir, #ir.stmts - 1), ""))
+  end
+  local expr = ir.stmts[#ir.stmts]:named_child(0)
+  local expr_text = apply_edits(ir.src, sb(expr), eb(expr), ir.body_edits)
+  return print_hoisted(caller_src, ir, ctx, hoist, "(" .. expr_text .. ")")
+end
+
+-- Canonical form: GNU statement expression + return->goto. Legal in any
+-- expression context, so it needs no wrapping and no safety analysis.
+local function print_canonical(caller_src, ir, ctx)
+  local inner = ctx.indent .. ctx.unit
+  local parts = { "({" }
+  for _, b in ipairs(ir.binds) do
+    parts[#parts + 1] = inner .. b
+  end
+  if ir.has_value then
+    parts[#parts + 1] = inner .. ir.ret_type .. " " .. ir.ret_var .. ";"
+  end
+  vim.list_extend(parts, rebase(body_text(ir, #ir.stmts, return_edits(ir, "goto")), inner))
+  parts[#parts + 1] = inner .. ir.end_label .. ":;"
+  if ir.has_value then
+    parts[#parts + 1] = inner .. ir.ret_var .. ";"
+  end
+  parts[#parts + 1] = ctx.indent .. "})"
+  return splice(caller_src, { { sb(ctx.call), eb(ctx.call), table.concat(parts, "\n") } })
+end
+
+-- Readable general form: body hoisted with return -> assignment, no ({})/goto.
+-- Reads top-to-bottom; not faithful for functions with early returns.
+local function print_readable_multi(caller_src, ir, ctx)
+  local hoist = {}
+  vim.list_extend(hoist, ir.binds)
+  if ir.has_value then
+    hoist[#hoist + 1] = ir.ret_type .. " " .. ir.ret_var .. ";"
+  end
+  vim.list_extend(hoist, rebase(body_text(ir, #ir.stmts, return_edits(ir, "assign")), ""))
+  return print_hoisted(caller_src, ir, ctx, hoist, ir.ret_var)
+end
+
+local PRINTERS = {
+  pretty = print_pretty,
+  canonical = print_canonical,
+  readable_multi = print_readable_multi,
+}
+
+-- Build the transform. Returns (new_caller_src, err).
+-- mode: "correct" (default, guaranteed to compile) or "readable" (cleaner
+-- output that skips ({...})/goto and may not compile in edge cases).
+function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
+  N = N or 1
+  occ = occ or 1
+  mode = mode or "correct"
+
+  local call = find_calls(parse(caller_src), caller_src, fname)[occ]
+  if not call then
+    return nil, "call to '" .. fname .. "' not found"
+  end
+
+  local ir, err = analyze_callee(callee_src, fname, N, enclosing_scope(call, caller_src))
+  if not ir then
+    return nil, err
+  end
+
+  local arglist = call:field("arguments")[1]
+  local args = {}
+  for i = 0, arglist:named_child_count() - 1 do
+    args[#args + 1] = text(arglist:named_child(i), caller_src)
+  end
+  if #args ~= #ir.params then
+    return nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
+  end
+  ir.binds = {}
+  for i, p in ipairs(ir.params) do
+    ir.binds[i] = build_bind(p, args[i], ir.rename, N, i, callee_src)
+  end
+
+  local ctx = analyze_context(caller_src, call)
+  return PRINTERS[decide(ir, ctx, mode)](caller_src, ir, ctx)
+end
+
+-- Test/introspection hook: run the analysis without printing.
+function M._probe(caller_src, callee_src, fname, occ, mode)
+  local call = find_calls(parse(caller_src), caller_src, fname)[occ or 1]
+  if not call then
+    return nil, "call to '" .. fname .. "' not found"
+  end
+  local ir, err = analyze_callee(callee_src, fname, 1, enclosing_scope(call, caller_src))
+  if not ir then
+    return nil, err
+  end
+  local ctx = analyze_context(caller_src, call)
+  return { ir = ir, ctx = ctx, decision = decide(ir, ctx, mode or "correct") }
 end
 
 -- Climb from (row, col) to the innermost enclosing call_expression node.
