@@ -9,6 +9,8 @@ source is never touched. Each expansion is a real block of text you can move the
 cursor into and expand further, and every block is a fold you can collapse when
 you want the big picture back.
 
+![Expanding a function inline, then expanding a struct inside it, in the kernel's rmnet_config.c](assets/demo.gif)
+
 ```
 ret = do_work(x);
   /* v do_work (function_definition) */
