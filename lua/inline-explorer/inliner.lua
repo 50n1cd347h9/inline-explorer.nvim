@@ -48,34 +48,34 @@ function M.smart()
     if not loc then
       return block_fallback() -- expander.expand re-resolves and reports if unknown
     end
-    local lines, label = resolver.extract(loc)
-
-    if fname and label == "function_definition" then
-      local N = (st.subst_n or 0) + 1
-      local ok, new = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
-      if ok and new then
-        return vim.schedule(function()
-          st.subst_n = N
-          view.rewrite(st, bufnr, new, row)
-        end)
-      end
-      return block_fallback() -- e.g. variadic function
-    end
-
-    -- Not a confirmed function (macro, or heuristic-extracted from a header):
-    -- try an in-place macro expansion via clangd hover; block-paste only if that
-    -- yields nothing (so a plain function-signature hover never gets spliced).
-    macro.fetch_expansion(st, row, col, function(exp)
-      if not exp or #exp == 0 then
-        return block_fallback()
-      end
-      vim.schedule(function()
-        local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
+    resolver.extract(loc, st.source_bufnr, function(lines, label)
+      if fname and label == "function_definition" then
+        local N = (st.subst_n or 0) + 1
+        local ok, new = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
         if ok and new then
-          view.rewrite(st, bufnr, new, row)
-        else
-          expander.expand()
+          return vim.schedule(function()
+            st.subst_n = N
+            view.rewrite(st, bufnr, new, row)
+          end)
         end
+        return block_fallback() -- e.g. variadic function
+      end
+
+      -- Not a confirmed function (macro, or heuristic-extracted from a header):
+      -- try an in-place macro expansion via clangd hover; block-paste only if that
+      -- yields nothing (so a plain function-signature hover never gets spliced).
+      macro.fetch_expansion(st, row, col, function(exp)
+        if not exp or #exp == 0 then
+          return block_fallback()
+        end
+        vim.schedule(function()
+          local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
+          if ok and new then
+            view.rewrite(st, bufnr, new, row)
+          else
+            expander.expand()
+          end
+        end)
       end)
     end)
   end)

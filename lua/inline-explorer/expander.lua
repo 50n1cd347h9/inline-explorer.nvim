@@ -47,12 +47,13 @@ function M.expand()
         notify(err or "not found")
       end)
     end
-    local body, label = resolver.extract(loc)
-    vim.schedule(function()
-      if not body or #body == 0 then
-        return notify("could not extract a body for '" .. name .. "'")
-      end
-      M._insert(st, bufnr, lnum, name, body, label)
+    resolver.extract(loc, st.source_bufnr, function(body, label)
+      vim.schedule(function()
+        if not body or #body == 0 then
+          return notify("could not extract a body for '" .. name .. "'")
+        end
+        M._insert(st, bufnr, lnum, name, body, label)
+      end)
     end)
   end)
 end
