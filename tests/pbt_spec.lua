@@ -55,7 +55,7 @@ end
 
 -- Substitute rc's call in the caller and rebuild the whole program.
 local function program_with(rc, new_caller)
-  return rc.callee_src .. "\n" .. new_caller .. "\n" .. rc.program_src:match("#include.*$")
+  return rc.callee_src .. "\n" .. new_caller .. "\n" .. rc.main_src
 end
 
 -- Does src actually contain a call_expression naming fname, per tree-sitter's

@@ -10,7 +10,7 @@
 -- needs the original to build), so no use-def tracking is required.
 local M = {}
 
-M.CTX_N = 9
+M.CTX_N = 11
 
 -- Park-Miller LCG. Deterministic and portable; math.random is neither.
 function M.rng(seed)
@@ -37,7 +37,7 @@ end
 local OPS = { "+", "-", "&", "|", "^" }
 
 local function iexpr(r, operands, depth)
-  if depth <= 0 or (#operands == 0 and true) or r.chance(35) then
+  if depth <= 0 or #operands == 0 or r.chance(35) then
     if #operands > 0 and r.chance(70) then
       return r.pick(operands)
     end
@@ -162,6 +162,11 @@ local CONTEXTS = {
   "    if (a > 0)\n        return CALL;\n    return t;",
   "    switch (a) {\n    case 1:\n        return CALL;\n    default:\n        return s;\n    }",
   "    {\n        int acc = 0;\n        for (int i = (CALL) & 7; i > 0; i--)\n            acc = acc + 1;\n        return acc;\n    }",
+  -- for-CONDITION: the call is re-evaluated each iteration; masked so the
+  -- bound is finite either way.
+  "    {\n        int acc = 0;\n        for (int i = 0; i < ((CALL) & 3); i++)\n            acc = acc + 1;\n        return acc;\n    }",
+  -- for-UPDATE: the decrement is at least 1, so termination is guaranteed.
+  "    {\n        int acc = 0;\n        for (int i = 6; i > 0; i = i - (1 + ((CALL) & 1)))\n            acc = acc + 1;\n        return acc;\n    }",
 }
 
 -- Render the abstract case to sources. Pure: same case, same strings.
@@ -217,11 +222,13 @@ function M.render(case)
     "    return 0;",
     "}",
   }
-  local program_src = callee_src .. "\n" .. caller_src .. "\n" .. table.concat(main, "\n") .. "\n"
+  local main_src = table.concat(main, "\n") .. "\n"
+  local program_src = callee_src .. "\n" .. caller_src .. "\n" .. main_src
 
   return {
     callee_src = callee_src,
     caller_src = caller_src,
+    main_src = main_src,
     program_src = program_src,
     fname = "f",
     row = row,

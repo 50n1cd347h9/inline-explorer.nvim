@@ -292,6 +292,15 @@ do
   check("kernel-shaped expansion loses the redundant nest", new:find("!= ({ int v = 1; v; });", 1, true) ~= nil, new)
 end
 
+-- _edit_lines trims blank edge lines from the applyEdit's newText.
+do
+  local uri = "file:///src/x.c"
+  local range14 = { start = { line = 1, character = 0 }, ["end"] = { line = 4, character = 0 } }
+  local padded = { changes = { [uri] = { { range = range14, newText = "\n\n(v + 1)\n\n" } } } }
+  local lines = macro._edit_lines(padded, uri)
+  check("edit: blank edge lines trimmed", lines ~= nil and #lines == 1 and lines[1] == "(v + 1)", lines and vim.inspect(lines))
+end
+
 -- Housekeeping: claims and interceptor bookkeeping for dead client ids are
 -- pruned on the next fetch.
 do

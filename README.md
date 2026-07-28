@@ -204,11 +204,17 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
   byte-identical stdout — and whenever the engine chooses the pretty form, the
   canonical form of the same call must agree too. Failures shrink to a minimal
   counterexample and print their seed (`IE_PBT_SEED` / `IE_PBT_CASES` /
-  `IE_PROP_CASES` control reproduction and budget). A zero-argument call wrapped as `(f()) & k` parses as a cast in tree-sitter-c (no semantic type info), so the engine's rejection of that shape is expected and exempted by the property layers.
+  `IE_PROP_CASES` control reproduction and budget). A zero-argument call
+  wrapped as `(f()) & k` parses as a cast in tree-sitter-c (no semantic type
+  info), so the engine's rejection of that shape is expected and exempted by
+  the property layers.
 
 ```sh
 nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!"
 nvim --headless --clean -u NONE -c "luafile tests/substitute_spec.lua" -c "qa!"
+nvim --headless --clean -u NONE -c "luafile tests/properties_spec.lua" -c "qa!"
+IE_PBT_CASES=100 IE_PBT_SEED=42 \
+  nvim --headless --clean -u NONE -c "luafile tests/pbt_spec.lua" -c "qa!"
 ```
 
 Limitations: macros and variadic functions are not inlinable this way; the current

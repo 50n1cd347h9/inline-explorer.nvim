@@ -568,22 +568,18 @@ local PRINTERS = {
   readable_multi = print_readable_multi,
 }
 
--- Build the transform. Returns (new_caller_src, err).
--- mode: "correct" (default, guaranteed to compile) or "readable" (cleaner
--- output that skips ({...})/goto and may not compile in edge cases).
-function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
-  N = N or 1
-  occ = occ or 1
-  mode = mode or "correct"
-
+-- Full analysis for one call: locate the occurrence, build the IR (including
+-- binds, so arity is checked here) and the ctx. Shared by inline_call and the
+-- _render test hook so the two can never drift apart.
+local function analyze_call(caller_src, callee_src, fname, N, occ)
   local call = find_calls(parse(caller_src), caller_src, fname)[occ]
   if not call then
-    return nil, "call to '" .. fname .. "' not found"
+    return nil, nil, "call to '" .. fname .. "' not found"
   end
 
   local ir, err = analyze_callee(callee_src, fname, N, enclosing_scope(call, caller_src))
   if not ir then
-    return nil, err
+    return nil, nil, err
   end
 
   local arglist = call:field("arguments")[1]
@@ -592,14 +588,28 @@ function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
     args[#args + 1] = text(arglist:named_child(i), caller_src)
   end
   if #args ~= #ir.params then
-    return nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
+    return nil, nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
   end
   ir.binds = {}
   for i, p in ipairs(ir.params) do
     ir.binds[i] = build_bind(p, args[i], ir.rename, N, i, callee_src)
   end
 
-  local ctx = analyze_context(caller_src, call)
+  return ir, analyze_context(caller_src, call)
+end
+
+-- Build the transform. Returns (new_caller_src, err).
+-- mode: "correct" (default, guaranteed to compile) or "readable" (cleaner
+-- output that skips ({...})/goto and may not compile in edge cases).
+function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
+  N = N or 1
+  occ = occ or 1
+  mode = mode or "correct"
+
+  local ir, ctx, err = analyze_call(caller_src, callee_src, fname, N, occ)
+  if not ir then
+    return nil, err
+  end
   return PRINTERS[decide(ir, ctx, mode)](caller_src, ir, ctx)
 end
 
@@ -628,30 +638,11 @@ function M._render(caller_src, callee_src, fname, N, occ, printer)
   if not p then
     return nil, "unknown printer '" .. tostring(printer) .. "'"
   end
-  N = N or 1
-  occ = occ or 1
-
-  local call = find_calls(parse(caller_src), caller_src, fname)[occ]
-  if not call then
-    return nil, "call to '" .. fname .. "' not found"
-  end
-  local ir, err = analyze_callee(callee_src, fname, N, enclosing_scope(call, caller_src))
+  local ir, ctx, err = analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
   if not ir then
     return nil, err
   end
-  local arglist = call:field("arguments")[1]
-  local args = {}
-  for i = 0, arglist:named_child_count() - 1 do
-    args[#args + 1] = text(arglist:named_child(i), caller_src)
-  end
-  if #args ~= #ir.params then
-    return nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
-  end
-  ir.binds = {}
-  for i, pa in ipairs(ir.params) do
-    ir.binds[i] = build_bind(pa, args[i], ir.rename, N, i, callee_src)
-  end
-  return p(caller_src, ir, analyze_context(caller_src, call))
+  return p(caller_src, ir, ctx)
 end
 
 -- Climb from (row, col) to the innermost enclosing call_expression node.

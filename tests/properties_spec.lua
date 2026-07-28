@@ -147,7 +147,7 @@ do
         if has_error(twice) then
           bad, bad_seed = "second inlining produced ERROR nodes", seed
         elseif have_gcc and i <= 30 then
-          local tail = rc.program_src:match("#include.*$")
+          local tail = rc.main_src
           local path = tmpdir .. "/uniq" .. i .. ".c"
           local fh = assert(io.open(path, "w"))
           fh:write(rc.callee_src .. "\n" .. twice .. "\n" .. tail)
