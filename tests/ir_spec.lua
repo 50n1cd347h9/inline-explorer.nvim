@@ -126,5 +126,28 @@ do
   check("variadic: nil + err", err ~= nil and tostring(err):find("variadic") ~= nil, tostring(err))
 end
 
+-- _render: force a specific printer, bypassing decide().
+do
+  local callee = [[static int acc(int x)
+{
+    int t = x + 1;
+    return t * 2;
+}]]
+  local caller = [[static int caller(int n)
+{
+    return acc(n) + 1;
+}]]
+  local S2 = require("inline-explorer.substitute")
+  local pretty = assert(S2._render(caller, callee, "acc", 1, 1, "pretty"))
+  local canon = assert(S2._render(caller, callee, "acc", 1, 1, "canonical"))
+  check("_render pretty == inline_call on a pretty-decided case", pretty == (S2.inline_call(caller, callee, "acc", 1, 1, "correct")), pretty)
+  check("_render canonical emits a statement expression", canon:find("({", 1, true) ~= nil, canon)
+  check("_render canonical differs from pretty", canon ~= pretty)
+  local _, err = S2._render(caller, callee, "acc", 1, 1, "bogus")
+  check("_render rejects unknown printer", err ~= nil and tostring(err):find("printer") ~= nil, tostring(err))
+
+  check("_rebase/_common_ws_prefix exported", type(S2._rebase) == "function" and type(S2._common_ws_prefix) == "function")
+end
+
 print("")
 print(fails == 0 and "ALL IR TESTS PASSED" or (fails .. " FAILURE(S)"))

@@ -601,6 +601,43 @@ function M._probe(caller_src, callee_src, fname, occ, mode)
   return { ir = ir, ctx = ctx, decision = decide(ir, ctx, mode or "correct") }
 end
 
+-- Test hooks for the property suites: the layout helpers, and a renderer that
+-- forces a named printer, bypassing decide() -- used to check that canonical
+-- and pretty output of the same call are semantically identical.
+M._rebase = rebase
+M._common_ws_prefix = common_ws_prefix
+
+function M._render(caller_src, callee_src, fname, N, occ, printer)
+  local p = PRINTERS[printer]
+  if not p then
+    return nil, "unknown printer '" .. tostring(printer) .. "'"
+  end
+  N = N or 1
+  occ = occ or 1
+
+  local call = find_calls(parse(caller_src), caller_src, fname)[occ]
+  if not call then
+    return nil, "call to '" .. fname .. "' not found"
+  end
+  local ir, err = analyze_callee(callee_src, fname, N, enclosing_scope(call, caller_src))
+  if not ir then
+    return nil, err
+  end
+  local arglist = call:field("arguments")[1]
+  local args = {}
+  for i = 0, arglist:named_child_count() - 1 do
+    args[#args + 1] = text(arglist:named_child(i), caller_src)
+  end
+  if #args ~= #ir.params then
+    return nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
+  end
+  ir.binds = {}
+  for i, pa in ipairs(ir.params) do
+    ir.binds[i] = build_bind(pa, args[i], ir.rename, N, i, callee_src)
+  end
+  return p(caller_src, ir, analyze_context(caller_src, call))
+end
+
 -- Climb from (row, col) to the innermost enclosing call_expression node.
 local function call_at(root, row, col)
   local node = root:named_descendant_for_range(row, col, row, col)
