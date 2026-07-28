@@ -424,7 +424,9 @@ end
 -- Fetch a macro's expansion from clangd hover at (row, col). cb(lines|nil).
 -- Fallback path: works on any clangd, but scrapes markdown.
 local function fetch_via_hover(st, row, col, cb)
-  if #vim.lsp.get_clients({ name = "clangd" }) == 0 then
+  -- Filter by the source buffer: buf_request_all never invokes its handler
+  -- when the buffer has no attached clients, which would starve cb entirely.
+  if #vim.lsp.get_clients({ bufnr = st.source_bufnr, name = "clangd" }) == 0 then
     return cb(nil)
   end
   local params = {
