@@ -26,7 +26,7 @@ real, cursor-navigable buffer text. The copy buffer makes that safe.
 
 ## Why name-based resolution
 
-clangd is not attached to the copy buffer, and nested expansions sit on inserted
+No server is attached to the copy buffer, and nested expansions sit on inserted
 text that has no position in any real file. So the symbol under the cursor is
 resolved by **name** (`workspace/symbol`), which works identically at depth 0 and
 depth N. tree-sitter then extracts the exact definition node from the target file.
@@ -35,8 +35,9 @@ depth N. tree-sitter then extracts the exact definition node from the target fil
 
 - **View** (`view.lua`) — open/close the copy buffer, track per-view expansion
   nodes (extmarks).
-- **Resolver** (`resolver.lua`) — `name -> definition location` via clangd, then
-  `location -> body lines` via tree-sitter (brace/continuation heuristic fallback).
+- **Resolver** (`resolver.lua`) — `name -> definition location` via the attached
+  server's `workspace/symbol` (any language), then `location -> body lines` via
+  tree-sitter with a language-agnostic node matcher (brace heuristic fallback).
 - **Expander** (`expander.lua`) — splice the body below the call line, indent,
   wrap in a fold, guard against self-recursion.
 - **Config / init** — options, user commands, keymaps.

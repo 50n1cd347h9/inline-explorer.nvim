@@ -1,18 +1,21 @@
--- Resolver: given an identifier name, find where clangd says it is defined,
--- then extract the full definition text with tree-sitter (heuristic fallback).
+-- Resolver: given an identifier name, ask the language server where it is
+-- defined, then extract the full definition text with tree-sitter (heuristic
+-- fallback).
 --
 -- Resolution is name-based (workspace/symbol) on purpose: the reading view is a
--- copy buffer that clangd is NOT attached to, and nested expansions live on
--- inserted text with no real file position. A name lookup works at any depth.
+-- copy buffer no server is attached to, and nested expansions live on inserted
+-- text with no real file position. A name lookup works at any depth, and
+-- workspace/symbol + tree-sitter are both language-agnostic, so nothing here is
+-- tied to a single language or server.
 local M = {}
 
--- Ask clangd (via any buffer it is attached to) where `name` is defined.
+-- Ask whichever server is attached to the source buffer where `name` is defined.
 -- Calls cb(location, err) where location = { uri, range, kind, name }.
 function M.locate(name, source_bufnr, cb)
-  if #vim.lsp.get_clients({ name = "clangd" }) == 0 then
-    return cb(nil, "clangd is not running")
-  end
   local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
+  if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+    return cb(nil, "no language server attached to the source buffer")
+  end
 
   vim.lsp.buf_request_all(bufnr, "workspace/symbol", { query = name }, function(results)
     local all = {}
@@ -25,7 +28,7 @@ function M.locate(name, source_bufnr, cb)
       return cb(nil, "no symbol named '" .. name .. "'")
     end
 
-    -- Prefer an exact-name match; clangd fuzzy-matches otherwise.
+    -- Prefer an exact-name match; servers fuzzy-match otherwise.
     local pick
     for _, s in ipairs(all) do
       if s.name == name then
@@ -40,8 +43,10 @@ function M.locate(name, source_bufnr, cb)
   end)
 end
 
--- Tree-sitter node types that represent an expandable definition.
+-- Tree-sitter node types that name a definition, across languages. This is a
+-- fast/precise allow-list; anything not listed still matches via NODE_PATTERNS.
 local DEFINITION_NODES = {
+  -- C / C++
   function_definition = true,
   preproc_def = true,
   preproc_function_def = true,
@@ -50,7 +55,79 @@ local DEFINITION_NODES = {
   struct_specifier = true,
   enum_specifier = true,
   union_specifier = true,
+  class_specifier = true,
+  template_declaration = true,
+  -- JavaScript / TypeScript
+  function_declaration = true,
+  generator_function_declaration = true,
+  function_expression = true,
+  arrow_function = true,
+  method_definition = true,
+  class_declaration = true,
+  lexical_declaration = true,
+  variable_declaration = true,
+  type_alias_declaration = true,
+  interface_declaration = true,
+  enum_declaration = true,
+  -- Python
+  class_definition = true,
+  decorated_definition = true,
+  -- Rust
+  function_item = true,
+  struct_item = true,
+  enum_item = true,
+  trait_item = true,
+  impl_item = true,
+  mod_item = true,
+  macro_definition = true,
+  const_item = true,
+  static_item = true,
+  type_item = true,
+  let_declaration = true,
+  -- Go
+  method_declaration = true,
+  type_declaration = true,
+  const_declaration = true,
+  var_declaration = true,
+  -- Java / C#
+  field_declaration = true,
+  constructor_declaration = true,
+  -- Lua
+  local_function = true,
+  assignment_statement = true,
+  -- Ruby
+  method = true,
+  singleton_method = true,
+  module = false, -- explicitly excluded: too broad (whole-file container)
 }
+
+-- Suffix patterns that generically identify a definition node in the long tail
+-- of languages not covered above. Deliberately anchored to endings so that
+-- whole-file containers (module, program, source_file, translation_unit,
+-- chunk, ...) never match.
+local NODE_PATTERNS = { "_definition$", "_declaration$", "_item$", "_def$" }
+
+local function is_definition(node_type)
+  local known = DEFINITION_NODES[node_type]
+  if known ~= nil then
+    return known -- honour explicit true/false (e.g. module = false)
+  end
+  for _, pat in ipairs(NODE_PATTERNS) do
+    if node_type:find(pat) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Resolve the tree-sitter language for a buffer, falling back to filetype.
+local function buffer_lang(bufnr)
+  local ft = vim.bo[bufnr].filetype
+  if ft == "" then
+    ft = vim.filetype.match({ buf = bufnr }) or ""
+  end
+  return vim.treesitter.language.get_lang(ft) or ft
+end
 
 -- Extract the full definition body at `loc`. Returns (lines, label).
 function M.extract(loc)
@@ -59,12 +136,13 @@ function M.extract(loc)
   local srow = loc.range.start.line
   local scol = loc.range.start.character
 
-  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, "c")
+  local lang = buffer_lang(bufnr)
+  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
   if ok and parser then
     local root = parser:parse()[1]:root()
     local node = root:named_descendant_for_range(srow, scol, srow, scol)
     while node do
-      if DEFINITION_NODES[node:type()] then
+      if is_definition(node:type()) then
         local a, _, b, _ = node:range()
         return vim.api.nvim_buf_get_lines(bufnr, a, b + 1, false), node:type()
       end
@@ -75,8 +153,8 @@ function M.extract(loc)
   return M.extract_heuristic(bufnr, srow), "heuristic"
 end
 
--- Fallback when tree-sitter is unavailable: macros follow `\` continuations,
--- functions are captured by naive brace matching.
+-- Last resort when no tree-sitter parser is available. Brace-oriented, so it
+-- only really helps C-family languages; anything else needs a parser installed.
 function M.extract_heuristic(bufnr, srow)
   local total = vim.api.nvim_buf_line_count(bufnr)
   local first = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""

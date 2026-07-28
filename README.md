@@ -1,8 +1,12 @@
 # inline-explorer.nvim
 
-Read large C codebases (the Linux kernel, in particular) by **expanding function
-and macro definitions inline**, right where they are called — and expanding again
-inside what you just expanded. No window-hopping, no floating peek windows.
+Read large codebases by **expanding function, type, and macro definitions
+inline**, right where they are called — and expanding again inside what you just
+expanded. No window-hopping, no floating peek windows.
+
+Built for reading the Linux kernel, but **language-agnostic**: it works for any
+language whose server implements `workspace/symbol` and that has a tree-sitter
+parser installed (C/C++, TypeScript/JavaScript, Python, Rust, Go, Lua, …).
 
 Expansions happen in a dedicated **read-only copy** of the file, so your real
 source is never touched. Each expansion is a real block of text you can move the
@@ -27,15 +31,19 @@ ret = do_work(x);
 ## Requirements
 
 - Neovim 0.10+
-- **clangd** attached to your C files (resolution is powered by its index)
-- A `compile_commands.json` clangd can find — essential for the kernel:
+- **A language server** attached to your files that implements `workspace/symbol`
+  (clangd, ts_ls / vtsls, pyright, rust-analyzer, gopls, lua_ls, …). Resolution is
+  powered by its index.
+- **The tree-sitter parser for your language** (`:TSInstall <lang>`, or via
+  `nvim-treesitter`). It is used for two things: extracting exact definition
+  bodies, and **highlighting the reading view**
+  (see [Syntax highlighting](#syntax-highlighting-in-the-view)).
+- For C specifically, a `compile_commands.json` clangd can find — essential for
+  the kernel:
   ```sh
   make defconfig
   ./scripts/clang-tools/gen_compile_commands.py
   ```
-- **The tree-sitter `c` parser** (`:TSInstall c`, or via `nvim-treesitter`).
-  It is used for two things: extracting exact definition bodies, and
-  **highlighting the reading view** (see [Syntax highlighting](#syntax-highlighting-in-the-view)).
 
 ## Install
 
@@ -99,13 +107,13 @@ vim.keymap.set("n", "<space>ec", "za")
 vim.keymap.set("n", "<space>eq", "<cmd>InlineExplorerClose<cr>")
 ```
 
-**3. Confirm clangd is attached.** Open a C file and run `:LspInfo` (or
-`:checkhealth lsp`). You should see **clangd** attached. If not, expansion fails
-with `clangd is not running`.
+**3. Confirm a language server is attached.** Open a file and run `:LspInfo` (or
+`:checkhealth lsp`). You should see a server attached (clangd, ts_ls, pyright, …).
+If not, expansion fails with `no language server attached to the source buffer`.
 
 ## Usage
 
-Open a C file (with clangd attached), then:
+Open a file (with a language server attached), then:
 
 | Keymap        | Command                  | Action                                         |
 | ------------- | ------------------------ | ---------------------------------------------- |
@@ -145,11 +153,11 @@ so `<leader>` here follows the same timing rule as above.
 
 ## Syntax highlighting in the view
 
-The reading view is a detached copy that clangd is **not** attached to, so its
-**semantic-token** highlighting (the clangd-driven colors) is not available there.
-To keep the view from falling back to bare regex syntax, the plugin starts
-**tree-sitter** highlighting on the view buffer explicitly. Install the `c`
-parser (`:TSInstall c`) and the view stays richly highlighted.
+The reading view is a detached copy that no language server is attached to, so
+its **semantic-token** highlighting (the server-driven colors) is not available
+there. To keep the view from falling back to bare regex syntax, the plugin starts
+**tree-sitter** highlighting on the view buffer explicitly. Install the parser for
+your language (`:TSInstall <lang>`) and the view stays richly highlighted.
 
 Note that once you expand a body mid-file the buffer is no longer valid C as a
 whole; tree-sitter is error-tolerant and still highlights recognizable tokens,
@@ -185,29 +193,34 @@ cross build.
 | ------------------------------------ | ----------------------------------------------------------------- |
 | `<leader>ee` does nothing, commands work | `mapleader` not set to space before load, or a typo. See [Setup](#setup--verification). |
 | `open a reading view first`          | Run `:InlineExplorerOpen` first.                                  |
-| `clangd is not running`              | clangd not attached — check `:LspInfo`.                          |
-| `no symbol named 'x'`                | clangd's index does not cover it — check `compile_commands.json`. |
-| View looks washed out                | Install the tree-sitter `c` parser (`:TSInstall c`).             |
+| `no language server attached ...`    | No server attached — check `:LspInfo`.                          |
+| `no symbol named 'x'`                | The server's index does not cover it (for C, check `compile_commands.json`). |
+| View looks washed out                | Install the tree-sitter parser for the language (`:TSInstall <lang>`). |
 
 ## How it works
 
 - **View** — a scratch copy of the source buffer, `nomodifiable`,
   `foldmethod=manual`, with tree-sitter highlighting started explicitly.
-- **Resolver** — looks the symbol up by name via clangd `workspace/symbol`, then
-  extracts the exact definition with tree-sitter. Name-based lookup is what makes
+- **Resolver** — looks the symbol up by name via the server's `workspace/symbol`,
+  then extracts the exact definition with tree-sitter (a language-agnostic node
+  matcher, with a brace heuristic as last resort). Name-based lookup is what makes
   nesting possible: inserted text has no real file position to query by.
 - **Expander** — splices the body below the call line, tracks it with extmarks,
   and wraps it in a fold.
 
 ## Known limitations
 
-- **No clangd semantic highlighting in the view** — tree-sitter is used instead
+- **No server semantic highlighting in the view** — tree-sitter is used instead
   (see above).
-- **Name-based resolution.** Two `static` functions sharing a name in different
-  files may resolve to the wrong one. The exact-name match picks clangd's first
-  hit.
-- **Macros show their `#define` body**, not a fully flattened expansion — which is
-  usually what you want when exploring, since you can keep expanding identifiers
+- **Name-based resolution.** Symbols that share a name (C `static` functions in
+  different files, TS overloads / re-exports, …) may resolve to the wrong one. The
+  exact-name match picks the server's first hit.
+- **Coverage depends on the server and parser.** A definition is only found if the
+  server's `workspace/symbol` returns it and a tree-sitter parser is installed for
+  the language; without a parser the brace-based fallback only handles C-family
+  syntax.
+- **C macros show their `#define` body**, not a fully flattened expansion — which
+  is usually what you want when exploring, since you can keep expanding identifiers
   inside it.
 - **Recursion guard is ancestor-only**: a symbol will not expand inside its own
   body, but mutual recursion across siblings is not detected.
