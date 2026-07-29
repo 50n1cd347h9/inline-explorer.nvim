@@ -215,5 +215,38 @@ do
   profile.clear()
 end
 
+-- Fixture generation is pure file IO and checkable without clangd.
+do
+  local fixture = require("tests.fixtures.bench.gen")
+  local dir = vim.fn.tempname()
+  local meta = fixture.generate(dir)
+
+  check("fixture: main.c written", vim.fn.filereadable(meta.main) == 1, meta.main)
+  check("fixture: heavy chain written",
+    vim.fn.filereadable(dir .. "/heavy_0.h") == 1 and vim.fn.filereadable(dir .. "/heavy_" .. (fixture.HEAVY_DEPTH - 1) .. ".h") == 1)
+  check("fixture: enough distinct cold headers for a full run",
+    #meta.cold >= 18 and vim.fn.filereadable(dir .. "/c1.h") == 1, #meta.cold)
+  check("fixture: enough warm symbols in one header", #meta.warm >= 18, #meta.warm)
+
+  local main = table.concat(vim.fn.readfile(meta.main), "\n")
+  check("fixture: one call site per cold symbol on its own line",
+    main:find("acc %+= " .. meta.cold[1] .. "%(") ~= nil and main:find("acc %+= " .. meta.cold[18] .. "%(") ~= nil)
+  check("fixture: one call site per warm symbol on its own line",
+    main:find("acc %+= " .. meta.warm[18] .. "%(") ~= nil)
+  check("fixture: same-file definition present", main:find("static int " .. meta.same_file .. "%(") ~= nil)
+  check("fixture: macro use present", main:find(meta.macro_call .. "%(") ~= nil)
+  check("fixture: struct for the non-inlinable path", main:find("struct " .. meta.struct_name) ~= nil)
+
+  local cc = table.concat(vim.fn.readfile(dir .. "/compile_commands.json"), "\n")
+  check("fixture: compile_commands has an absolute file path", cc:find(meta.main, 1, true) ~= nil, cc:sub(1, 200))
+  check("fixture: compile_commands is valid json", pcall(vim.json.decode, cc))
+
+  -- Generation is deterministic: same input, same bytes.
+  local dir2 = vim.fn.tempname()
+  fixture.generate(dir2)
+  check("fixture: generation is deterministic",
+    table.concat(vim.fn.readfile(dir .. "/c1.h"), "\n") == table.concat(vim.fn.readfile(dir2 .. "/c1.h"), "\n"))
+end
+
 print("")
 print(fails == 0 and "ALL BENCH LIB TESTS PASSED" or (fails .. " FAILURE(S)"))
