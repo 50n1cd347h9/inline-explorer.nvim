@@ -141,6 +141,40 @@ do
   vim.api.nvim_win_set_cursor(0, { 3, 0 })
 end
 
+-- Prefetched body: a caller that already resolved the symbol (the inliner,
+-- when it falls back to block-pasting) hands the result over instead of
+-- making us repeat the round trip. Argument tables that carry no body -- the
+-- ones nvim passes to command callbacks -- must be ignored.
+do
+  local st = view.current()
+  require("inline-explorer.history").undo() -- back to the bare file
+  local located = 0
+  local saved_locate = resolver.locate
+  resolver.locate = function(name, _, cb)
+    located = located + 1
+    saved_locate(name, _, cb)
+  end
+
+  vim.api.nvim_win_set_cursor(0, { 3, ("    int r = helper(1);"):find("helper") - 1 })
+  local before_lines = vim.api.nvim_buf_line_count(vbuf)
+  expander.expand({ name = "prefetched_fn", body = { "static int prefetched_fn(void)", "{", "    return 7;", "}" }, label = "function_definition" })
+  check("prefetched body splices without a lookup", located == 0 and vim.api.nvim_buf_line_count(vbuf) > before_lines,
+    ("located=%d lines=%d->%d"):format(located, before_lines, vim.api.nvim_buf_line_count(vbuf)))
+  check("prefetched body is what got spliced",
+    table.concat(vim.api.nvim_buf_get_lines(vbuf, 0, -1, false), "\n"):find("prefetched_fn(void)", 1, true) ~= nil)
+  check("prefetched splice is tracked as a node", #st.nodes >= 1, #st.nodes)
+
+  -- A command-callback style table (no body) must fall through to a lookup.
+  require("inline-explorer.history").undo()
+  vim.api.nvim_win_set_cursor(0, { 3, ("    int r = helper(1);"):find("helper") - 1 })
+  expander.expand({ name = "InlineExplorerExpand", args = "", fargs = {} })
+  vim.wait(1000, function()
+    return located > 0
+  end, 10)
+  check("bodyless argument table falls through to a real lookup", located == 1, located)
+  resolver.locate = saved_locate
+end
+
 -- Re-entrancy guard: while a resolver round trip is in flight, a second
 -- expand is refused; the stamp goes stale after FETCH_GUARD_MS so a leaked
 -- flag self-heals.
@@ -221,7 +255,7 @@ do
   profile.clear()
   run_expand()
   check("profile on records the expand span", #profile.events > 0, #profile.events)
-  check("report names the span", profile.report():find("expand (total)", 1, true) ~= nil, profile.report())
+  check("report names the span", profile.report():find("total:expand", 1, true) ~= nil, profile.report())
 
   -- The log file is the durable record: spans land there too, clear(true)
   -- truncates it, and logfile = false keeps everything in memory.
@@ -235,7 +269,7 @@ do
     fh:close()
     return s
   end
-  check("span appended to the log file", logtext():find("expand (total)", 1, true) ~= nil, logtext())
+  check("span appended to the log file", logtext():find("total:expand", 1, true) ~= nil, logtext())
   check("report points at the log file", profile.report():find(profile.logfile, 1, true) ~= nil)
   profile.clear(true)
   check("clear(true) truncates the log file", logtext() == "", logtext())

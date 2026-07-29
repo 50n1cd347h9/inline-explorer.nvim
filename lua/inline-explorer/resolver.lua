@@ -35,7 +35,7 @@ function M.locate(name, source_bufnr, cb)
 
   local span = profile.start()
   local finish = once_with_timeout(function(loc, err)
-    span(loc and "locate" or "locate:miss")
+    span(loc and "locate:ok" or "locate:miss")
     cb(loc, err)
   end, function()
     return nil, "workspace/symbol timed out (server busy or stuck?)"
@@ -277,9 +277,6 @@ function M.extract(loc, source_bufnr, cb)
   -- bookkeeping: if it reports zero, buf_request_all's handler is guaranteed
   -- never to fire and we must fall back immediately instead of waiting.
   local target = vim.uri_to_bufnr(loc.uri)
-  -- Whether this definition file is already attached decides the dominant
-  -- cost (server preamble rebuild vs not), so the span says which it was.
-  local was_cached = M._attach_cache[target] ~= nil
   vim.fn.bufload(target)
   -- Attachments WE create are cached, not dropped when the request settles:
   -- re-attaching a definition header makes clangd rebuild its whole preamble
@@ -297,6 +294,11 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
   cache_attachment(target, newly_attached)
+  -- The span says whether WE made the server open a new document, which is
+  -- what actually costs a preamble build. "already open" covers both our own
+  -- attachment cache and a file the user has open anyway (a definition in the
+  -- current file is the common case, and is always fast).
+  local stage = #newly_attached > 0 and "extract:cold" or "extract:warm"
   if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
     local lines, label = M.extract_sync(loc)
     span("extract:no-capability")
@@ -306,7 +308,7 @@ function M.extract(loc, source_bufnr, cb)
   -- A wedged server must not hang the keypress: after the timeout, extract
   -- locally and say so (the late response, if any, is dropped by the guard).
   local finish = once_with_timeout(function(lines, label)
-    span(was_cached and "extract:cached" or "extract:cold")
+    span(stage)
     cb(lines, label)
   end, function()
     vim.notify("[inline-explorer] documentSymbol timed out; extracted locally", vim.log.levels.WARN)

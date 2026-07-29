@@ -195,7 +195,7 @@ function M.rewrite(st, bufnr, new_src, row)
   end
 
   pcall(vim.api.nvim_win_set_cursor, 0, { math.min((row or 0) + 1, n), 0 })
-  span("view.rewrite")
+  span("rewrite")
 end
 
 return M

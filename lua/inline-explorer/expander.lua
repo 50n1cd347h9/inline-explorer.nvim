@@ -24,14 +24,22 @@ local function notify(msg, level)
   vim.notify("[inline-explorer] " .. msg, level or vim.log.levels.WARN)
 end
 
-function M.expand()
+-- Block-expand the symbol under the cursor.
+--
+-- `prefetched` ({ name, body, label }) lets a caller that ALREADY resolved the
+-- symbol hand the result over instead of making us repeat the round trip --
+-- the inliner does this when it falls back to block-pasting. Anything without
+-- a `body` is ignored, so the plain command/keymap callbacks (which are
+-- invoked with their own argument tables) behave exactly as before.
+function M.expand(prefetched)
   local st = view.current()
   if not st then
     return notify("open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
   end
 
-  local name = vim.fn.expand("<cword>")
-  if name == "" then
+  local pre = (type(prefetched) == "table" and prefetched.body and #prefetched.body > 0) and prefetched or nil
+  local name = pre and pre.name or vim.fn.expand("<cword>")
+  if not name or name == "" then
     return
   end
   local bufnr = vim.api.nvim_get_current_buf()
@@ -39,6 +47,10 @@ function M.expand()
 
   if ancestor_names(st, bufnr, lnum)[name] then
     return notify("'" .. name .. "' is already expanded above (recursion guard)", vim.log.levels.INFO)
+  end
+
+  if pre then
+    return M._insert(st, bufnr, lnum, name, pre.body, pre.label)
   end
 
   if not view.begin_fetch(st) then
@@ -50,11 +62,11 @@ function M.expand()
     vim.schedule(function()
       view.end_fetch(st)
       if not body or #body == 0 then
-        span("expand:failed")
+        span("total:expand-failed")
         return notify(err or ("could not extract a body for '" .. name .. "'"))
       end
       M._insert(st, bufnr, lnum, name, body, label)
-      span("expand (total)")
+      span("total:expand")
     end)
   end)
 end

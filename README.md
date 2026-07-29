@@ -304,23 +304,33 @@ tail -f ~/.local/state/nvim/inline-explorer-profile.log
 ```
 
 ```
-2026-07-29T10:43:20 extract:cold                562.6ms
-2026-07-29T10:43:20 expand (total)              563.3ms
-2026-07-29T10:43:20 macro:tweak                 103.1ms
-2026-07-29T10:43:20 inline (total, macro)       308.3ms
+2026-07-29T10:55:15 locate:ok                     0.4ms
+2026-07-29T10:55:15 extract:cold                580.8ms
+2026-07-29T10:55:15 total:expand                581.7ms
+2026-07-29T10:55:16 extract:cold                208.6ms
+2026-07-29T10:55:16 macro:tweak                 111.8ms
+2026-07-29T10:55:16 rewrite                       3.2ms
+2026-07-29T10:55:16 total:inline-macro          332.0ms
 ```
+
+Span names read as `stage:variant`, and the end-to-end numbers all start with
+`total:`, so they group together in the report. `extract:cold` means the plugin
+made the server open a definition file it did not have open yet — the case that
+costs a preamble build; `extract:warm` is one that was already open.
+`substitute:rejected-variadic` and friends say why an in-place inline was
+declined instead of just that it was.
 
 `:InlineExplorerProfile` aggregates the same data in memory:
 
 ```
 span                       n     total     mean      max     last
 ----------------------------------------------------------------
-extract:cold               2      768ms     384ms     568ms     200ms
-expand (total)             1      575ms     575ms     575ms     575ms
-inline (total, macro)      1      320ms     320ms     320ms     320ms
-macro:tweak                1      108ms     108ms     108ms     108ms
-locate                     2       10ms       5ms       7ms       3ms
-view.rewrite               1        2ms       2ms       2ms       2ms
+extract:cold               2      789ms     395ms     581ms     209ms
+total:expand               1      582ms     582ms     582ms     582ms
+total:inline-macro         1      332ms     332ms     332ms     332ms
+macro:tweak                1      112ms     112ms     112ms     112ms
+locate:ok                  3        3ms       1ms       2ms       2ms
+rewrite                    1        3ms       3ms       3ms       3ms
 ```
 
 `extract:cold` is the server building the definition header's preamble the

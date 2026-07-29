@@ -47,33 +47,49 @@ function M.smart()
   local profile = require("inline-explorer.profile")
   local total = profile.start()
 
-  -- The guard is released before delegating: expander.expand acquires its own.
-  local function block_fallback()
-    total("inline:fallback-to-block")
+  -- Hand whatever we already resolved to the block-paste path instead of
+  -- making it repeat the round trip. The guard is released first: expand
+  -- acquires its own when it does have to fetch.
+  local function block_fallback(prefetched)
+    total("total:block-fallback")
     view.end_fetch(st)
-    vim.schedule(expander.expand)
+    vim.schedule(function()
+      expander.expand(prefetched)
+    end)
+  end
+
+  -- Aggregate rejections by cause, not as one opaque bucket.
+  local function reject_stage(err)
+    local e = tostring(err)
+    for _, pat in ipairs({ "variadic", "arity", "not found", "empty" }) do
+      if e:find(pat, 1, true) then
+        return "substitute:rejected-" .. pat:gsub(" ", "-")
+      end
+    end
+    return "substitute:rejected-other"
   end
 
   resolver.fetch(ident, st.source_bufnr, function(lines, label, err)
     if not lines then
-      local _ = err -- expander.expand re-resolves and reports if unknown
+      local _ = err -- expand re-resolves and reports if the name is unknown
       return block_fallback()
     end
     do
+      local prefetched = { name = ident, body = lines, label = label }
       if fname and label == "function_definition" then
         local N = (st.subst_n or 0) + 1
         local sspan = profile.start()
-        local ok, new = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
-        sspan(ok and new and "substitute (cpu)" or "substitute:rejected")
+        local ok, new, serr = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
+        sspan(ok and new and "substitute:ok" or reject_stage(ok and serr or new))
         if ok and new then
           return vim.schedule(function()
             view.end_fetch(st)
             st.subst_n = N
             view.rewrite(st, bufnr, new, row)
-            total("inline (total, function)")
+            total("total:inline-function")
           end)
         end
-        return block_fallback() -- e.g. variadic function
+        return block_fallback(prefetched) -- e.g. variadic function
       end
 
       -- Not a confirmed function (macro, or heuristic-extracted from a header):
@@ -84,18 +100,18 @@ function M.smart()
       -- and skips straight to the fallback.
       macro.fetch_expansion(st, view.src_line(st, row), col, function(exp)
         if not exp or #exp == 0 then
-          return block_fallback()
+          return block_fallback(prefetched)
         end
         vim.schedule(function()
           local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
           if ok and new then
             view.end_fetch(st)
             view.rewrite(st, bufnr, new, row)
-            total("inline (total, macro)")
+            total("total:inline-macro")
           else
-            total("inline:macro-splice-failed")
+            total("total:macro-splice-failed")
             view.end_fetch(st)
-            expander.expand()
+            expander.expand(prefetched)
           end
         end)
       end)
