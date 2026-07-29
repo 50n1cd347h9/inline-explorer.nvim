@@ -763,7 +763,51 @@ reported but rarely fail (CI wall-clock varies 2-3x)."
 
 **Interfaces:**
 - Consumes: Task 1 の `bench.run` / `bench.stats` / `bench.noise_floor`
-- Produces: なし
+- Produces: `bench.elapsed_ms(spans)`（新規）、`capture` の `opts.until_span`（新規）
+
+**Task 3 レビューからの持ち越し（このタスクで先に潰す）:**
+
+1. **`total_ms` は時間レポートの根拠に使えない。** 最後の `total:` スパンを返す仕様のため、
+   ブロックフォールバック経路では splice だけを包む `total:expand`（実測 0.077ms）を返し、
+   実際に 2ms 掛かったアクションを 25 倍過小報告する。resolve が 10 倍遅くなっても
+   この数字は動かない。**スパンの時刻から end-to-end を導出する** `bench.elapsed_ms(spans)`
+   を追加し、Task 4 のレイテンシ源はこちらにする（`total_ms` は残すが、単一フェーズの
+   便宜関数であることをコメントに明記）:
+
+```lua
+-- End-to-end latency of one captured action, derived from the span
+-- timestamps rather than from any single span. A multi-phase action's last
+-- total: span covers only its last phase -- for a block-paste fallback that
+-- is the splice alone, which does not move at all when the resolve it
+-- followed gets slower -- so reading one span's duration is not end to end.
+-- Each event carries `at` (when it stopped) and `ms` (how long it took), so
+-- the action began at `first.at - first.ms` and ended at `last.at`.
+function M.elapsed_ms(spans)
+  if #spans == 0 then
+    return nil
+  end
+  local first, last = spans[1], spans[#spans]
+  return last.at - (first.at - first.ms)
+end
+```
+
+2. **無条件 settle は健全だが広すぎる。** 単一フェーズのシナリオまで毎回 300ms 眠るため
+   bench_spec が 1.4s → 5.15s、Task 4 は ~126 capture で +38s。レビュアーが検証した
+   解法は **呼び出し側が終端スパンを宣言する** `opts.until_span`（bench.lua 側の
+   ハードコード名リストは、将来ハンドオフが増えた日に黙って壊れるので採らない）。
+   実測: 5.15s → 2.29s、M3slow mutant の検出は維持。
+
+```lua
+-- `opts.until_span` (a Lua pattern) lets the CALLER declare what its own
+-- action's terminal span looks like, so the settle can exit as soon as one
+-- appears (and >=120ms has passed) instead of always waiting out
+-- settle_cap_ms. It is caller-declared on purpose: a list of handoff names
+-- kept here would silently stop working the day another handoff span is
+-- added, and nothing would catch it.
+```
+
+   `bench_spec` の不変量3の呼び出しは
+   `{ settle_cap_ms = 3000, until_span = "^total:expand" }` とする。
 
 - [ ] **Step 1: `tests/bench_spec.lua` の最終 print の直前にレポート部を追加する**
 
@@ -784,7 +828,7 @@ local scenarios = {
       local sym = meta.cold[((i - 1) % #meta.cold) + 1]
       local spans, complete = expand_on(sym .. "%(")
       if complete and bench.count(spans, "^extract:cold") == 1 then
-        return bench.total_ms(spans)
+        return bench.elapsed_ms(spans)
       end
       return nil -- not actually cold: do not pollute the population
     end,
@@ -795,7 +839,7 @@ local scenarios = {
       local sym = meta.warm[((i - 1) % #meta.warm) + 1]
       local spans, complete = expand_on(sym .. "%(")
       if complete and bench.count(spans, "^extract:warm") == 1 then
-        return bench.total_ms(spans)
+        return bench.elapsed_ms(spans)
       end
       return nil
     end,
@@ -804,21 +848,21 @@ local scenarios = {
     name = "inline:function",
     action = function()
       local spans, complete = inline_on(meta.fn_call .. "%(")
-      return complete and bench.count(spans, "^total:inline%-function") == 1 and bench.total_ms(spans) or nil
+      return complete and bench.count(spans, "^total:inline%-function") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
   {
     name = "inline:macro",
     action = function()
       local spans, complete = inline_on(meta.macro_call .. "%(")
-      return complete and bench.count(spans, "^total:inline%-macro") == 1 and bench.total_ms(spans) or nil
+      return complete and bench.count(spans, "^total:inline%-macro") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
   {
     name = "expand:same-file",
     action = function()
       local spans, complete = expand_on(meta.same_file .. "%(3%)")
-      return complete and bench.total_ms(spans) or nil
+      return complete and bench.elapsed_ms(spans) or nil
     end,
   },
 }
