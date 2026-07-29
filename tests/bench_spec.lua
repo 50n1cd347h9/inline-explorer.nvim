@@ -228,7 +228,10 @@ local scenarios = {
   {
     name = "inline:macro",
     action = function()
-      local spans, complete = inline_on(meta.macro_call .. "%(")
+      -- "%(" alone matches the #define line itself, ahead of the call site in
+      -- the generated file; disambiguate with the call's argument, same
+      -- idiom as invariant 5 above, so the cursor lands on the invocation.
+      local spans, complete = inline_on(meta.macro_call .. "%(4%)")
       return complete and bench.count(spans, "^total:inline%-macro") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
@@ -249,6 +252,11 @@ end
 -- The harness's own reproducibility, measured now rather than assumed: the
 -- same scenario run as two independent populations. A difference smaller
 -- than this is not a difference.
+--
+-- This is measured only from expand:warm (scenarios[2]) -- it is a single
+-- global noise floor applied below to every scenario's tolerance, not a
+-- per-scenario measurement. A scenario with different jitter characteristics
+-- still gets this same number.
 local noise = bench.noise_floor(scenarios[2].action, { warmup = WARMUP, reps = REPS })
 
 print(("%-18s %4s %9s %9s %9s %9s"):format("scenario", "n", "p50", "p90", "mad", "max"))
@@ -285,12 +293,22 @@ elseif vim.fn.filereadable(baseline_path) == 1 then
     print(("WARN  this run is noisy (%.1fms vs %.1fms when recorded); timings below are unreliable")
       :format(noise, base.noise_floor_ms or 0))
   end
+  -- Below a couple of milliseconds the harness cannot separate a real change
+  -- from scheduler jitter -- see the 3x/25%-of-baseline terms above the floor,
+  -- either of which can fall under this on a fast, low-noise scenario. A
+  -- change that small is also not user-visible in an action that involves a
+  -- language-server round trip, so it is not worth failing the gate over.
+  local MIN_TOLERANCE_MS = 2
+
   for name, s in pairs(measured) do
     local b = base.scenarios and base.scenarios[name]
     if b and s.n > 0 then
-      local tolerance = math.max(3 * noise, b.p50 * 0.25)
+      local by_noise, by_pct, by_floor = 3 * noise, b.p50 * 0.25, MIN_TOLERANCE_MS
+      local tolerance = math.max(by_noise, by_pct, by_floor)
+      local provenance = tolerance == by_floor and "floor" or (tolerance == by_noise and "3xnoise" or "25%")
       local delta = s.p50 - b.p50
-      local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms)"):format(name, b.p50, s.p50, delta, tolerance)
+      local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s])")
+        :format(name, b.p50, s.p50, delta, tolerance, provenance)
       if delta > tolerance then
         fails = fails + 1
         print("FAIL  " .. line)
