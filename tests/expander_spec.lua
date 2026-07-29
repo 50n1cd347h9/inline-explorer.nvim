@@ -188,6 +188,8 @@ end
 -- contributes a span that shows up in the report.
 do
   local profile = require("inline-explorer.profile")
+  -- Keep the real user log out of the test run.
+  profile.logfile = vim.fn.tempname() .. ".log"
   resolver.locate = function(name, _, cb)
     cb({
       uri = "file:///fake.c",
@@ -220,6 +222,27 @@ do
   run_expand()
   check("profile on records the expand span", #profile.events > 0, #profile.events)
   check("report names the span", profile.report():find("expand (total)", 1, true) ~= nil, profile.report())
+
+  -- The log file is the durable record: spans land there too, clear(true)
+  -- truncates it, and logfile = false keeps everything in memory.
+  local logpath = profile.logfile
+  local function logtext()
+    local fh = io.open(logpath, "r")
+    if not fh then
+      return ""
+    end
+    local s = fh:read("*a")
+    fh:close()
+    return s
+  end
+  check("span appended to the log file", logtext():find("expand (total)", 1, true) ~= nil, logtext())
+  check("report points at the log file", profile.report():find(profile.logfile, 1, true) ~= nil)
+  profile.clear(true)
+  check("clear(true) truncates the log file", logtext() == "", logtext())
+  profile.logfile = false
+  run_expand()
+  check("logfile = false keeps it in memory only", logtext() == "" and #profile.events > 0, #profile.events)
+  profile.logfile = logpath
 
   -- Ring buffer stays bounded.
   profile.max_events = 3

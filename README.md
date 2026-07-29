@@ -293,7 +293,24 @@ than guessing:
 :InlineExplorerProfile on     " start recording (off by default, free when off)
 " ... use <leader>ee / <leader>ei a few times ...
 :InlineExplorerProfile        " report
+:InlineExplorerProfile open   " the raw log in a tab (also: path, clear)
 ```
+
+Every span is appended to `stdpath("log")/inline-explorer-profile.log`, so a
+session can be inspected afterwards — or watched live from another shell:
+
+```sh
+tail -f ~/.local/state/nvim/inline-explorer-profile.log
+```
+
+```
+2026-07-29T10:43:20 extract:cold                562.6ms
+2026-07-29T10:43:20 expand (total)              563.3ms
+2026-07-29T10:43:20 macro:tweak                 103.1ms
+2026-07-29T10:43:20 inline (total, macro)       308.3ms
+```
+
+`:InlineExplorerProfile` aggregates the same data in memory:
 
 ```
 span                       n     total     mean      max     last
@@ -310,9 +327,11 @@ view.rewrite               1        2ms       2ms       2ms       2ms
 first time that header is touched — on the Linux kernel that is ~0.5s for a
 big header like `net/sock.h`, while `extract:cached` for a later symbol in the
 same header is ~20ms. The plugin keeps the last few definition files attached
-for exactly that reason (`:InlineExplorerProfile clear` between experiments).
+for exactly that reason (`:InlineExplorerProfile clear` wipes both the report
+and the log between experiments).
 
-Enable it permanently with `setup({ profile = true })`.
+Enable it permanently with `setup({ profile = true })`; set
+`require("inline-explorer.profile").logfile = false` to keep it in memory only.
 
 ## Buildroot / cross-compiled kernel
 

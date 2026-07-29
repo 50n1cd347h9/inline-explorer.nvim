@@ -23,19 +23,28 @@ function M.setup(opts)
     if arg == "on" or arg == "off" then
       profile.enabled = arg == "on"
       profile.clear()
-      vim.notify("[inline-explorer] profiling " .. arg)
+      vim.notify(("[inline-explorer] profiling %s%s"):format(
+        arg, (arg == "on" and profile.logfile) and (" -> " .. profile.logfile) or ""))
     elseif arg == "clear" then
-      profile.clear()
+      profile.clear(true) -- ring AND log file
       vim.notify("[inline-explorer] profile cleared")
+    elseif arg == "path" then
+      vim.notify("[inline-explorer] " .. (profile.logfile or "logging to file is disabled"))
+    elseif arg == "open" then
+      if profile.logfile then
+        vim.cmd.tabedit(vim.fn.fnameescape(profile.logfile))
+      else
+        vim.notify("[inline-explorer] logging to file is disabled", vim.log.levels.WARN)
+      end
     else
       vim.api.nvim_echo({ { profile.report() } }, true, {})
     end
   end, {
     nargs = "?",
     complete = function()
-      return { "on", "off", "clear", "report" }
+      return { "on", "off", "clear", "report", "path", "open" }
     end,
-    desc = "Latency profile: on | off | clear | report (default)",
+    desc = "Latency profile: on | off | clear | report (default) | path | open",
   })
 
   local nav = require("inline-explorer.nav")
