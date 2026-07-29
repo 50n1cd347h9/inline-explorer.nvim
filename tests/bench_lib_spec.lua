@@ -72,7 +72,7 @@ do
   profile.clear()
   profile.start()("stale:before") -- must not be captured
 
-  local spans = bench.capture(function()
+  local spans, clean = bench.capture(function()
     profile.start()("locate:ok")
     profile.start()("extract:warm")
     profile.start()("total:expand")
@@ -83,11 +83,40 @@ do
   check("capture: total_ms reads the total: span", type(bench.total_ms(spans)) == "number", vim.inspect(spans))
   check("capture: names joins for diagnostics", bench.names(spans):find("total:expand", 1, true) ~= nil, bench.names(spans))
 
-  -- No total: span -> capture gives up at the timeout and returns what it saw.
-  local partial = bench.capture(function()
+  -- clean flag: true for a normal, single-total: action, and
+  -- assert_one_action agrees with a nil reason.
+  check("capture: clean flag true for a normal action", clean == true, clean)
+  local ok1, reason1 = bench.assert_one_action(spans)
+  check("assert_one_action: true, nil reason for a normal action", ok1 == true and reason1 == nil, tostring(reason1))
+
+  -- No total: span -> capture gives up at the timeout and returns what it saw,
+  -- and reports itself as not clean (the action never finished).
+  local partial, partial_clean = bench.capture(function()
     profile.start()("locate:ok")
   end, 300)
   check("capture: returns partial spans when no total: arrives", #partial == 1, bench.names(partial))
+  check("capture: clean flag false when no total: span arrives", partial_clean == false, partial_clean)
+  local ok2, reason2 = bench.assert_one_action(partial)
+  check(
+    "assert_one_action: false with a 'no total' reason",
+    ok2 == false and reason2 ~= nil and reason2:find("no total", 1, true) ~= nil,
+    tostring(reason2)
+  )
+
+  -- Two total: spans in one capture -> a straggler from an earlier capture
+  -- bled in. Not clean, and the reason says so.
+  local doubled, doubled_clean = bench.capture(function()
+    profile.start()("locate:ok")
+    profile.start()("total:expand")
+    profile.start()("total:expand")
+  end, 1000)
+  check("capture: clean flag false with two total: spans", doubled_clean == false, doubled_clean)
+  local ok3, reason3 = bench.assert_one_action(doubled)
+  check(
+    "assert_one_action: false with a 'straggler' reason",
+    ok3 == false and reason3 ~= nil and reason3:find("straggler", 1, true) ~= nil,
+    tostring(reason3)
+  )
 
   -- Ring pressure: profile.events evicts from the front once full, so an
   -- index-based slice loses spans as soon as the ring is full. capture
@@ -126,6 +155,24 @@ do
   end, 1000)
   check("capture: waits out a straggler span scheduled past total:", #q_spans == 4, bench.names(q_spans))
   check("capture: the straggler span itself is present", bench.count(q_spans, "^extract:late") == 1, bench.names(q_spans))
+
+  -- Settle floor: the quiescence loop must never observe for less time than
+  -- the flat 120ms wait it replaced. total:expand lands immediately, so the
+  -- span count goes quiet (stable) well within the first few 20ms polls;
+  -- without a 120ms floor the loop would exit around ~60-80ms and miss a
+  -- span deferred to ~90ms, silently handing it to the NEXT capture instead.
+  local floor_spans = bench.capture(function()
+    profile.start()("total:expand")
+    vim.defer_fn(function()
+      profile.start()("extract:late")
+    end, 90)
+  end, 1000)
+  check("capture: settle floor still catches a span deferred ~90ms out", #floor_spans == 2, bench.names(floor_spans))
+  check(
+    "capture: settle floor -- the deferred span itself is present",
+    bench.count(floor_spans, "^extract:late") == 1,
+    bench.names(floor_spans)
+  )
 
   profile.enabled = false
   profile.clear()
