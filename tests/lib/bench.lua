@@ -69,8 +69,10 @@ function M.noise_floor(action, opts)
 end
 
 -- Spans produced by one user action, attributed by time window: capture owns
--- the ring for the duration of `fn`, so every span recorded while it runs
--- belongs to this action and nothing else does.
+-- the ring from before `fn` is called until the settle below finishes -- `fn`
+-- itself usually returns immediately, having only started an async chain, so
+-- the window that matters is the settle, not the call. Everything recorded in
+-- that window is taken as this action's.
 --
 -- `profile.events` is a ring buffer (`profile.max_events`, default 200) that
 -- evicts from the FRONT via `table.remove(events, 1)` once full. An
