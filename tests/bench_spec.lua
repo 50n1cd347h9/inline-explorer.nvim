@@ -274,11 +274,83 @@ print(("noise floor: %.1fms (p50 gap between two runs of expand:warm)"):format(n
 -- Baseline comparison. The tolerance is derived from the measured noise, not
 -- hardcoded, so a slow CI runner widens the band instead of failing.
 local baseline_path = root .. "/tests/bench_baseline.json"
+
+-- A comparison against a handful of samples is not a comparison: p50 over
+-- n=1 or n=2 is a single draw from a right-skewed distribution and will
+-- swing far more than any tolerance worth setting. Below this, the run
+-- FAILS with "not compared" rather than quietly passing on noise. (The old
+-- `s.n > 0` guard admitted n=1, which the plan's own rules forbid.)
+local MIN_SAMPLES = 5
+
+-- Both terms below were re-derived from measurement after `elapsed_ms` was
+-- fixed to sum the `total:` spans. The previous 25%/2ms pair was tuned
+-- against the vim.uv.now() derivation, which was counting event-loop tick
+-- boundaries rather than latency, so it was fitted to numbers that did not
+-- mean what they said -- two scenarios' baselines moved by 1.9x and 4.5x on
+-- the fix alone. What follows is what the fixed metric actually does.
+--
+-- Method: record a baseline, then run the comparison 4 more times on an idle
+-- machine. Observed p50 across those 5 populations (ms):
+--
+--   scenario          base    r1    r2    r3    r4   range   range/base
+--   expand:cold       32.23  35.6  33.5  31.7  33.4  3.9ms     12.1%
+--   inline:macro       3.92   4.1   4.1   3.9   3.9  0.2ms      5.1%
+--   inline:function    2.45   2.6   2.6   2.6   2.5  0.15ms     6.1%
+--   expand:warm        1.16   1.1   1.3   1.1   1.2  0.2ms     17.2%
+--   expand:same-file   0.75   0.9   0.8   0.8   0.8  0.15ms    19.9%
+--
+-- Relative term. It only ever governs expand:cold -- for every other
+-- scenario a fifth of a sub-4ms baseline lands under the floor. So the
+-- number has to be chosen for expand:cold, whose worst run-to-run excursion
+-- above baseline was +3.4ms (10.6%) and whose full range was 3.9ms (12.1%).
+-- 20% gives a 6.4ms band: 1.9x the worst observed excursion and 1.6x the
+-- full range -- clear of jitter, while still catching a fifth-slower cold
+-- expansion. 15% (4.8ms) would sit only 1.2x above the observed range and
+-- would flake. 25% (the old value) is 2.4x, more slack than the data asks
+-- for, and would let an 8ms regression on the slowest scenario through.
+local PCT_TOLERANCE = 0.20
+
+-- Absolute floor, for the four scenarios whose entire p50 is under 4ms.
+-- LOWERED from 2ms to 1ms, because a measurement showed the floor is not
+-- what protects a slow machine. Re-running the comparison with every core
+-- saturated pushed expand:cold to 109ms and expand:warm to 3.4ms -- but it
+-- also pushed the measured noise floor from 0.15ms to 1.31ms, so the
+-- `3 * noise` term widened to 3.9ms on its own and was what admitted
+-- expand:warm (+2.2ms), expand:same-file (+1.2ms) and inline:function
+-- (+3.2ms). The 2ms floor was never the binding term in that run, and would
+-- not have been at 1ms either. Absorbing a slow runner is the noise term's
+-- job, and it does it.
+--
+-- That leaves the floor with one job: covering jitter on an idle machine,
+-- where the noise term measures near zero. The worst excursion above
+-- baseline there was 0.2ms, so 1ms is 5x the observed jitter -- ample -- and
+-- it halves the smallest regression the gate can see on all four fast
+-- scenarios (e.g. expand:same-file could previously triple and still pass).
+-- Dropping the floor entirely is NOT safe: 3*noise fell to 0.0ms in three of
+-- the four idle runs, which would leave sub-millisecond scenarios gated on
+-- 20% of 0.75ms = 0.15ms, i.e. exactly their own jitter.
+local MIN_TOLERANCE_MS = 1
+
 if os.getenv("IE_BENCH_WRITE_BASELINE") == "1" then
-  local out = { recorded = os.date("%Y-%m-%d"), noise_floor_ms = noise, scenarios = {} }
+  -- Record enough to tell what produced these numbers: p50 alone cannot be
+  -- audited later. `n` says whether the p50 is worth anything, `mad` says
+  -- how spread the population was, and the commit + nvim version say which
+  -- code and which runtime they came from.
+  local commit = vim.trim(vim.fn.system({ "git", "rev-parse", "--short", "HEAD" }))
+  if vim.v.shell_error ~= 0 then
+    commit = "unknown"
+  end
+  local v = vim.version()
+  local out = {
+    recorded = os.date("%Y-%m-%d"),
+    commit = commit,
+    nvim = ("%d.%d.%d"):format(v.major, v.minor, v.patch),
+    noise_floor_ms = noise,
+    scenarios = {},
+  }
   for name, s in pairs(measured) do
     if s.n > 0 then
-      out.scenarios[name] = { p50 = s.p50 }
+      out.scenarios[name] = { p50 = s.p50, n = s.n, mad = s.mad }
     end
   end
   local f = assert(io.open(baseline_path, "w"))
@@ -288,33 +360,64 @@ if os.getenv("IE_BENCH_WRITE_BASELINE") == "1" then
 elseif vim.fn.filereadable(baseline_path) == 1 then
   local base = vim.json.decode(table.concat(vim.fn.readfile(baseline_path), "\n"))
   print("")
-  print("=== vs baseline recorded " .. tostring(base.recorded) .. " ===")
-  if noise > (base.noise_floor_ms or 0) * 4 + 20 then
-    print(("WARN  this run is noisy (%.1fms vs %.1fms when recorded); timings below are unreliable")
-      :format(noise, base.noise_floor_ms or 0))
+  print(("=== vs baseline recorded %s (commit %s, nvim %s) ===")
+    :format(tostring(base.recorded), tostring(base.commit or "?"), tostring(base.nvim or "?")))
+  -- Purely relative: the question is whether THIS run is as reproducible as
+  -- the run that recorded the baseline, which has nothing to do with any
+  -- absolute number of milliseconds. The old test added +20ms, which no
+  -- scenario here can ever exceed (the slowest p50 is ~34ms and the noise
+  -- floor is a fraction of a millisecond), so it could never fire. The 1ms
+  -- term only stops a baseline that recorded a near-zero floor from making
+  -- any jitter at all look like a 4x blowup.
+  local recorded_noise = base.noise_floor_ms or 0
+  if noise > recorded_noise * 4 and noise >= 1 then
+    print(("WARN  this run is noisy (%.2fms vs %.2fms when recorded); timings below are unreliable")
+      :format(noise, recorded_noise))
   end
-  -- Below a couple of milliseconds the harness cannot separate a real change
-  -- from scheduler jitter -- see the 3x/25%-of-baseline terms above the floor,
-  -- either of which can fall under this on a fast, low-noise scenario. A
-  -- change that small is also not user-visible in an action that involves a
-  -- language-server round trip, so it is not worth failing the gate over.
-  local MIN_TOLERANCE_MS = 2
 
-  for name, s in pairs(measured) do
-    local b = base.scenarios and base.scenarios[name]
-    if b and s.n > 0 then
-      local by_noise, by_pct, by_floor = 3 * noise, b.p50 * 0.25, MIN_TOLERANCE_MS
+  -- Iterate the BASELINE's scenarios, not the measured ones. A scenario that
+  -- the baseline knows about but that produced no usable samples this run is
+  -- a broken scenario -- it used to print nothing at all and slip through
+  -- the gate silently, which is exactly how a harness stops measuring
+  -- without anyone noticing.
+  local names = {}
+  for name in pairs(base.scenarios or {}) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+
+  for _, name in ipairs(names) do
+    local b = base.scenarios[name]
+    local s = measured[name] or { n = 0 }
+    if s.n < MIN_SAMPLES then
+      fails = fails + 1
+      print(("FAIL  %-18s NOT COMPARED: %d usable sample(s), need %d (baseline p50 %.1fms). %s")
+        :format(name, s.n, MIN_SAMPLES,
+          b.p50 or 0,
+          s.n == 0 and "The scenario produced nothing -- its action returned nil every rep (incomplete capture, or its span-shape guard never matched)."
+            or "Too few reps completed to form a p50 worth comparing."))
+    else
+      local by_noise, by_pct, by_floor = 3 * noise, b.p50 * PCT_TOLERANCE, MIN_TOLERANCE_MS
       local tolerance = math.max(by_noise, by_pct, by_floor)
-      local provenance = tolerance == by_floor and "floor" or (tolerance == by_noise and "3xnoise" or "25%")
+      local provenance = tolerance == by_floor and "floor"
+        or (tolerance == by_noise and "3xnoise" or ("%d%%"):format(PCT_TOLERANCE * 100))
       local delta = s.p50 - b.p50
-      local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s])")
-        :format(name, b.p50, s.p50, delta, tolerance, provenance)
+      local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s], n=%d)")
+        :format(name, b.p50, s.p50, delta, tolerance, provenance, s.n)
       if delta > tolerance then
         fails = fails + 1
         print("FAIL  " .. line)
       else
         print("ok    " .. line)
       end
+    end
+  end
+
+  -- A scenario the baseline has never seen is not a failure, but it is not
+  -- compared either -- say so instead of leaving it out of the section.
+  for _, sc in ipairs(scenarios) do
+    if not (base.scenarios or {})[sc.name] then
+      print(("note  %-18s not in the baseline; re-record to start gating it"):format(sc.name))
     end
   end
 else

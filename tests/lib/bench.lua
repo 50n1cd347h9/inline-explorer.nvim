@@ -193,19 +193,52 @@ function M.capture(fn, timeout, opts)
   return out, complete
 end
 
--- End-to-end latency of one captured action, derived from the span
--- timestamps rather than from any single span. A multi-phase action's last
--- total: span covers only its last phase -- for a block-paste fallback that
--- is the splice alone, which does not move at all when the resolve it
--- followed gets slower -- so reading one span's duration is not end to end.
--- Each event carries `at` (when it stopped) and `ms` (how long it took), so
--- the action began at `first.at - first.ms` and ended at `last.at`.
+-- End-to-end latency of one captured action: the SUM of its `total:` spans'
+-- own `ms` values.
+--
+-- Why the sum, and why only `total:` spans. Each `total:` span already covers
+-- one whole phase of the action, end to end: `expander.expand` starts its
+-- span immediately before `resolver.fetch` and stops it after the splice, and
+-- `inliner.smart` starts `total` before its own fetch and stops it after the
+-- rewrite. A single-phase action therefore has exactly one `total:` span
+-- whose ms IS the latency; a multi-phase action's phases run one after
+-- another and never overlap (the block-paste fallback stops
+-- `total:block-fallback` and only then hands off to `expander.expand`, which
+-- starts a fresh span and emits `total:expand`), so adding the phases up
+-- covers the whole action. Non-`total:` spans (`locate:`, `extract:`,
+-- `substitute:`, `macro:`) are nested INSIDE a `total:` span and would be
+-- double-counted if they were included.
+--
+-- Why not the timestamps. Every span also carries `at`, but `at` is
+-- `vim.uv.now()` -- libuv's CACHED loop time, an integral millisecond
+-- refreshed once per event-loop iteration. Several `uv.now()` calls within
+-- one tick return the same number, so a difference of `at` values measures
+-- how many tick boundaries an action crossed, not how long it took: a 10ms
+-- busy-spin inside a synchronous callback moves it by zero. `ms`, by
+-- contrast, is `vim.uv.hrtime()`-derived (see `profile.start`), nanosecond
+-- resolution. Summing `ms` is hrtime throughout -- no wall clock is read at
+-- all, so there is no clock mixing and no millisecond quantization.
+--
+-- What this does NOT cover. `inliner.smart` does its whole-buffer concat and
+-- its `substitute.call_name_at` tree-sitter parse BEFORE starting the `total`
+-- span, so an `ei` (smart-inline) measurement EXCLUDES that parse -- measured
+-- at roughly 7ms on a large real file, i.e. not negligible. Read an
+-- `inline:*` number as "from the fetch onwards", not as the whole keypress.
+-- The scheduler hop between two phases (the `vim.schedule` inside
+-- `block_fallback`) falls between spans and is likewise not counted.
+--
+-- Returns nil when the action produced no `total:` span at all (an incomplete
+-- capture -- see `assert_complete`), so a caller cannot mistake "never
+-- finished" for "took 0ms".
 function M.elapsed_ms(spans)
-  if #spans == 0 then
-    return nil
+  local sum, seen = 0, false
+  for _, s in ipairs(spans) do
+    if s.name:find("^total:") then
+      sum = sum + s.ms
+      seen = true
+    end
   end
-  local first, last = spans[1], spans[#spans]
-  return last.at - (first.at - first.ms)
+  return seen and sum or nil
 end
 
 function M.count(spans, pattern)
@@ -233,12 +266,18 @@ function M.assert_complete(spans)
   return false, ("action did not finish within the timeout (last span: %s)"):format(last.name)
 end
 
--- The LAST `^total:` span's ms, not the first. A two-phase action (e.g. a
--- block-paste fallback reached via `inliner.smart`'s failed initial resolve)
--- emits an intermediate `total:block-fallback` and then, once its own
--- independent `expander.expand` round trip finishes, a final `total:expand`
--- -- the end-to-end latency the harness cares about is that final one, not
--- the intermediate span that only marks a handoff.
+-- The LAST `^total:` span's ms, not the first. This is a SINGLE-PHASE
+-- convenience -- a diagnostic for "how long did the final phase take" -- and
+-- is NOT the harness's latency metric. `M.elapsed_ms` is: it sums every
+-- `total:` span, so it stays correct when one user action produces several.
+--
+-- Concretely, a two-phase action (e.g. a block-paste fallback reached via
+-- `inliner.smart`'s failed initial resolve) emits an intermediate
+-- `total:block-fallback` and then, once `expander.expand` has spliced the
+-- prefetched body, a final `total:expand` that covers the splice ALONE. That
+-- last span does not move at all when the resolve preceding it gets slower,
+-- so reading it as the action's latency understates a real regression. Use it
+-- to attribute time to a phase; use `elapsed_ms` to measure the action.
 function M.total_ms(spans)
   local ms = nil
   for _, s in ipairs(spans) do

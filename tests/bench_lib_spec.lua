@@ -65,27 +65,48 @@ do
   check("noise_floor: reports the p50 gap between populations", floor2 == 20, floor2)
 end
 
--- elapsed_ms: end-to-end latency derived from span timestamps, not from any
--- single span's own duration.
+-- elapsed_ms: end-to-end latency as the SUM of the total: spans' own
+-- hrtime-derived ms, never from the `at` timestamps (which are vim.uv.now(),
+-- libuv's cached per-iteration loop time -- quantized to whole milliseconds
+-- and unchanged across calls made in one tick, so differencing them counts
+-- tick boundaries rather than elapsed time).
 do
-  -- Two-phase action: the first span covers a slow phase (started at 500,
-  -- stopped -- and so recorded with at=1000, ms=500); the second span
-  -- covers a fast phase that starts right after and stops at at=1500 with
-  -- an own duration of just 5ms. The true end-to-end is 500..1500 = 1000ms
-  -- -- elapsed_ms must report that, not the last span's own 5ms, which is
-  -- exactly what a block-paste fallback's final splice span would look like
-  -- if the resolve before it got ten times slower: the splice's own ms
-  -- barely moves, but the action's true latency does.
+  -- A two-phase block-paste fallback: phase one (the failed resolve) costs
+  -- 500ms, phase two (the splice of the already-fetched body) costs 5ms.
+  -- The nested locate:/extract: spans are inside phase one and must not be
+  -- added again. Every span here shares the SAME `at` -- which is exactly
+  -- what a synchronous chain within one event-loop iteration produces, and
+  -- is why any `at`-based derivation would report 0.
   local spans = {
-    { name = "total:block-fallback", ms = 500, at = 1000 },
-    { name = "total:expand", ms = 5, at = 1500 },
+    { name = "locate:ok", ms = 120, at = 7000 },
+    { name = "extract:cold", ms = 370, at = 7000 },
+    { name = "total:block-fallback", ms = 500, at = 7000 },
+    { name = "total:expand", ms = 5, at = 7000 },
   }
-  check("elapsed_ms: reports the whole action's span, not the last span's own ms",
-    bench.elapsed_ms(spans) == 1000, bench.elapsed_ms(spans))
-  check("elapsed_ms: differs from the last span's own (far smaller) duration",
-    bench.elapsed_ms(spans) ~= spans[#spans].ms, bench.elapsed_ms(spans))
+  check("elapsed_ms: sums the total: spans (both phases), 500 + 5",
+    bench.elapsed_ms(spans) == 505, bench.elapsed_ms(spans))
+  check("elapsed_ms: is not the last total: span's own (far smaller) ms",
+    bench.elapsed_ms(spans) ~= bench.total_ms(spans) and bench.total_ms(spans) == 5,
+    ("elapsed=%s total_ms=%s"):format(tostring(bench.elapsed_ms(spans)), tostring(bench.total_ms(spans))))
+  check("elapsed_ms: does not double-count spans nested inside a total:",
+    bench.elapsed_ms(spans) < 505 + 120, bench.elapsed_ms(spans))
+  -- Identical `at` values throughout: a derivation that read the timestamps
+  -- would return 0 (or the first span's own ms) here rather than 505.
+  check("elapsed_ms: does not read the `at` timestamps at all",
+    bench.elapsed_ms(spans) == 505 and spans[1].at == spans[#spans].at, bench.elapsed_ms(spans))
+  -- A single-phase action: the one total: span IS the latency, so elapsed_ms
+  -- and total_ms agree.
+  local single = { { name = "locate:ok", ms = 9, at = 7000 }, { name = "total:expand", ms = 33, at = 7000 } }
+  check("elapsed_ms: single-phase action agrees with total_ms",
+    bench.elapsed_ms(single) == 33 and bench.total_ms(single) == 33, bench.elapsed_ms(single))
   check("elapsed_ms: empty list is safe and returns nil",
     bench.elapsed_ms({}) == nil, bench.elapsed_ms({}))
+  -- No total: span at all (an incomplete capture) must be nil, not 0 -- a
+  -- rep that never finished must be skipped by bench.run, not recorded as
+  -- an impossibly fast sample.
+  check("elapsed_ms: nil (not 0) when no total: span was recorded",
+    bench.elapsed_ms({ { name = "locate:ok", ms = 9, at = 7000 } }) == nil,
+    tostring(bench.elapsed_ms({ { name = "locate:ok", ms = 9, at = 7000 } })))
 end
 
 -- capture: collects the spans a call produced, waiting for the total: span.
