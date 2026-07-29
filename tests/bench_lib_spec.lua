@@ -72,7 +72,7 @@ do
   profile.clear()
   profile.start()("stale:before") -- must not be captured
 
-  local spans, clean = bench.capture(function()
+  local spans, complete = bench.capture(function()
     profile.start()("locate:ok")
     profile.start()("extract:warm")
     profile.start()("total:expand")
@@ -83,40 +83,77 @@ do
   check("capture: total_ms reads the total: span", type(bench.total_ms(spans)) == "number", vim.inspect(spans))
   check("capture: names joins for diagnostics", bench.names(spans):find("total:expand", 1, true) ~= nil, bench.names(spans))
 
-  -- clean flag: true for a normal, single-total: action, and
-  -- assert_one_action agrees with a nil reason.
-  check("capture: clean flag true for a normal action", clean == true, clean)
-  local ok1, reason1 = bench.assert_one_action(spans)
-  check("assert_one_action: true, nil reason for a normal action", ok1 == true and reason1 == nil, tostring(reason1))
+  -- complete: true for a normal action whose last span is a total: one, and
+  -- assert_complete agrees with a nil reason.
+  check("capture: complete true for a normal action", complete == true, complete)
+  local ok1, reason1 = bench.assert_complete(spans)
+  check("assert_complete: true, nil reason for a normal action", ok1 == true and reason1 == nil, tostring(reason1))
 
   -- No total: span -> capture gives up at the timeout and returns what it saw,
-  -- and reports itself as not clean (the action never finished).
-  local partial, partial_clean = bench.capture(function()
+  -- and reports itself as not complete (the action never finished).
+  local partial, partial_complete = bench.capture(function()
     profile.start()("locate:ok")
   end, 300)
   check("capture: returns partial spans when no total: arrives", #partial == 1, bench.names(partial))
-  check("capture: clean flag false when no total: span arrives", partial_clean == false, partial_clean)
-  local ok2, reason2 = bench.assert_one_action(partial)
+  check("capture: complete false when no total: span arrives", partial_complete == false, partial_complete)
+  local ok2, reason2 = bench.assert_complete(partial)
   check(
-    "assert_one_action: false with a 'no total' reason",
-    ok2 == false and reason2 ~= nil and reason2:find("no total", 1, true) ~= nil,
+    "assert_complete: false with a 'did not finish' reason",
+    ok2 == false and reason2 ~= nil and reason2:find("did not finish", 1, true) ~= nil,
     tostring(reason2)
   )
 
-  -- Two total: spans in one capture -> a straggler from an earlier capture
-  -- bled in. Not clean, and the reason says so.
-  local doubled, doubled_clean = bench.capture(function()
-    profile.start()("locate:ok")
-    profile.start()("total:expand")
-    profile.start()("total:expand")
-  end, 1000)
-  check("capture: clean flag false with two total: spans", doubled_clean == false, doubled_clean)
-  local ok3, reason3 = bench.assert_one_action(doubled)
+  -- Empty action: no spans at all within a short timeout -> not complete,
+  -- and the reason says so distinctly from "did not finish".
+  local empty, empty_complete = bench.capture(function() end, 300)
+  check("capture: no spans at all for an empty action", #empty == 0, bench.names(empty))
+  check("capture: complete false for an empty action", empty_complete == false, empty_complete)
+  local ok_empty, reason_empty = bench.assert_complete(empty)
   check(
-    "assert_one_action: false with a 'straggler' reason",
-    ok3 == false and reason3 ~= nil and reason3:find("straggler", 1, true) ~= nil,
-    tostring(reason3)
+    "assert_complete: false with a 'no spans' reason for an empty action",
+    ok_empty == false and reason_empty ~= nil and reason_empty:find("no spans", 1, true) ~= nil,
+    tostring(reason_empty)
   )
+
+  -- Two-phase action: inliner.smart's block-paste fallback (reached when the
+  -- initial resolve fails to locate anything) emits total:block-fallback and
+  -- then hands off to expander.expand, which performs its own independent
+  -- round trip and emits its own total:expand. That is ONE user action
+  -- legitimately producing TWO total: spans -- complete must be true (this is
+  -- not an error), and total_ms must read the LAST total:, not the first, so
+  -- the end-to-end number reflects the whole two-phase action.
+  local twophase, twophase_complete = bench.capture(function()
+    profile.start()("locate:ok")
+    -- A span's ms is the time between profile.start() and invoking the
+    -- returned closure, so delaying only the first total:'s invocation
+    -- deterministically makes its ms bigger than the second's -- the test
+    -- really pins "last, not first" rather than tying on ~0ms for both.
+    local first = profile.start()
+    vim.wait(30)
+    first("total:block-fallback")
+    local second = profile.start()
+    second("total:expand")
+  end, 1000)
+  check("capture: two-phase action is complete, not an error", twophase_complete == true, twophase_complete)
+  local ok_two, reason_two = bench.assert_complete(twophase)
+  check("assert_complete: true for a two-phase action", ok_two == true and reason_two == nil, tostring(reason_two))
+  check("capture: two-phase action has both total: spans", bench.count(twophase, "^total:") == 2, bench.names(twophase))
+  do
+    local first_ms, last_ms
+    for _, s in ipairs(twophase) do
+      if s.name:find("^total:") then
+        if not first_ms then
+          first_ms = s.ms
+        end
+        last_ms = s.ms
+      end
+    end
+    check(
+      "total_ms: reads the LAST total: span, and it differs from the first",
+      bench.total_ms(twophase) == last_ms and last_ms ~= first_ms,
+      ("total_ms=%s first=%s last=%s"):format(tostring(bench.total_ms(twophase)), tostring(first_ms), tostring(last_ms))
+    )
+  end
 
   -- Ring pressure: profile.events evicts from the front once full, so an
   -- index-based slice loses spans as soon as the ring is full. capture
