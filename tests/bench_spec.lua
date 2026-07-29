@@ -156,7 +156,7 @@ do
   -- Cursor must land on the type name itself so <cword> resolves the struct
   -- symbol, not on a preceding "struct " keyword (which <cword> would read
   -- as the C keyword "struct", not a resolvable name).
-  local spans, complete = inline_on(meta.struct_name, { settle_cap_ms = 3000 })
+  local spans, complete = inline_on(meta.struct_name, { settle_cap_ms = 3000, until_span = "^total:expand" })
   check("block fallback happened",
     complete and bench.count(spans, "^total:block%-fallback") == 1, spans and bench.names(spans))
   check("block fallback costs no second lookup",
@@ -184,6 +184,124 @@ do
     complete and bench.count(spans, "^macro:tweak$") == 1, spans and bench.names(spans))
   check("macro does not fall back to hover scraping",
     complete and bench.count(spans, "^macro:hover") == 0, spans and bench.names(spans))
+end
+
+-- ---------------------------------------------------------------------------
+-- Timing -- reported always, fails only on a change bigger than the noise
+-- ---------------------------------------------------------------------------
+print("")
+print("=== timing (p50/p90 over " .. REPS .. " reps, " .. WARMUP .. " discarded) ===")
+
+-- Each scenario is its own population; cold and warm are never mixed. The
+-- cold reps walk distinct headers (touching each exactly once) rather than
+-- restarting the server, which is cheaper and means the same thing.
+local scenarios = {
+  {
+    name = "expand:cold",
+    action = function(i)
+      local sym = meta.cold[((i - 1) % #meta.cold) + 1]
+      local spans, complete = expand_on(sym .. "%(")
+      if complete and bench.count(spans, "^extract:cold") == 1 then
+        return bench.elapsed_ms(spans)
+      end
+      return nil -- not actually cold: do not pollute the population
+    end,
+  },
+  {
+    name = "expand:warm",
+    action = function(i)
+      local sym = meta.warm[((i - 1) % #meta.warm) + 1]
+      local spans, complete = expand_on(sym .. "%(")
+      if complete and bench.count(spans, "^extract:warm") == 1 then
+        return bench.elapsed_ms(spans)
+      end
+      return nil
+    end,
+  },
+  {
+    name = "inline:function",
+    action = function()
+      local spans, complete = inline_on(meta.fn_call .. "%(")
+      return complete and bench.count(spans, "^total:inline%-function") == 1 and bench.elapsed_ms(spans) or nil
+    end,
+  },
+  {
+    name = "inline:macro",
+    action = function()
+      local spans, complete = inline_on(meta.macro_call .. "%(")
+      return complete and bench.count(spans, "^total:inline%-macro") == 1 and bench.elapsed_ms(spans) or nil
+    end,
+  },
+  {
+    name = "expand:same-file",
+    action = function()
+      local spans, complete = expand_on(meta.same_file .. "%(3%)")
+      return complete and bench.elapsed_ms(spans) or nil
+    end,
+  },
+}
+
+local measured = {}
+for _, sc in ipairs(scenarios) do
+  measured[sc.name] = bench.stats(bench.run(sc.action, { warmup = WARMUP, reps = REPS }))
+end
+
+-- The harness's own reproducibility, measured now rather than assumed: the
+-- same scenario run as two independent populations. A difference smaller
+-- than this is not a difference.
+local noise = bench.noise_floor(scenarios[2].action, { warmup = WARMUP, reps = REPS })
+
+print(("%-18s %4s %9s %9s %9s %9s"):format("scenario", "n", "p50", "p90", "mad", "max"))
+print(string.rep("-", 64))
+for _, sc in ipairs(scenarios) do
+  local s = measured[sc.name]
+  if s.n > 0 then
+    print(("%-18s %4d %8.1fms %8.1fms %8.1fms %8.1fms"):format(sc.name, s.n, s.p50, s.p90, s.mad, s.max))
+  else
+    print(("%-18s %4d  (no usable samples)"):format(sc.name, 0))
+  end
+end
+print(("noise floor: %.1fms (p50 gap between two runs of expand:warm)"):format(noise))
+
+-- Baseline comparison. The tolerance is derived from the measured noise, not
+-- hardcoded, so a slow CI runner widens the band instead of failing.
+local baseline_path = root .. "/tests/bench_baseline.json"
+if os.getenv("IE_BENCH_WRITE_BASELINE") == "1" then
+  local out = { recorded = os.date("%Y-%m-%d"), noise_floor_ms = noise, scenarios = {} }
+  for name, s in pairs(measured) do
+    if s.n > 0 then
+      out.scenarios[name] = { p50 = s.p50 }
+    end
+  end
+  local f = assert(io.open(baseline_path, "w"))
+  f:write(vim.json.encode(out))
+  f:close()
+  print("baseline written: " .. baseline_path)
+elseif vim.fn.filereadable(baseline_path) == 1 then
+  local base = vim.json.decode(table.concat(vim.fn.readfile(baseline_path), "\n"))
+  print("")
+  print("=== vs baseline recorded " .. tostring(base.recorded) .. " ===")
+  if noise > (base.noise_floor_ms or 0) * 4 + 20 then
+    print(("WARN  this run is noisy (%.1fms vs %.1fms when recorded); timings below are unreliable")
+      :format(noise, base.noise_floor_ms or 0))
+  end
+  for name, s in pairs(measured) do
+    local b = base.scenarios and base.scenarios[name]
+    if b and s.n > 0 then
+      local tolerance = math.max(3 * noise, b.p50 * 0.25)
+      local delta = s.p50 - b.p50
+      local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms)"):format(name, b.p50, s.p50, delta, tolerance)
+      if delta > tolerance then
+        fails = fails + 1
+        print("FAIL  " .. line)
+      else
+        print("ok    " .. line)
+      end
+    end
+  end
+else
+  print("")
+  print("no baseline yet: re-run with IE_BENCH_WRITE_BASELINE=1 to record one")
 end
 
 print("")

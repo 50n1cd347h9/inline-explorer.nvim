@@ -107,15 +107,22 @@ end
 -- phase hasn't started yet" when the first phase's own span already matches
 -- `^total:` (as `total:block-fallback` does) -- that is precisely how a
 -- genuinely-violating multi-phase action can look complete before it is. So
--- there is no shortcut: this is a real limitation, not just a tuning knob. A
--- phase that lands LATER than `settle_cap_ms` after `fn` was called is not
--- captured here at all -- it is silently attributed to the NEXT capture
--- instead (whose ring gets cleared out from under it once that capture
--- starts, or which picks it up as a foreign span if it arrives after that
--- clear). Callers whose action can have a phase landing near or past the
--- default 300ms after its first total: must pass a larger `settle_cap_ms`
--- explicitly; there is no way for `capture` to detect that this happened
--- after the fact.
+-- there is no shortcut in general: this is a real limitation, not just a
+-- tuning knob. A phase that lands LATER than `settle_cap_ms` after `fn` was
+-- called is not captured here at all -- it is silently attributed to the
+-- NEXT capture instead (whose ring gets cleared out from under it once that
+-- capture starts, or which picks it up as a foreign span if it arrives after
+-- that clear). Callers whose action can have a phase landing near or past
+-- the default 300ms after its first total: must pass a larger
+-- `settle_cap_ms` explicitly; there is no way for `capture` to detect that
+-- this happened after the fact.
+--
+-- `opts.until_span` (a Lua pattern) lets the CALLER declare what its own
+-- action's terminal span looks like, so the settle can exit as soon as one
+-- appears (and >=120ms has passed) instead of always waiting out
+-- settle_cap_ms. It is caller-declared on purpose: a list of handoff names
+-- kept here would silently stop working the day another handoff span is
+-- added, and nothing would catch it.
 --
 -- Returns `spans, complete`. `complete` is true iff the LAST span in the
 -- list matches `^total:` -- i.e. the action ran to its own end within
@@ -135,6 +142,7 @@ end
 function M.capture(fn, timeout, opts)
   opts = opts or {}
   local settle_cap_ms = opts.settle_cap_ms or 300
+  local until_span = opts.until_span
   profile.clear()
   fn()
   vim.wait(timeout or 20000, function()
@@ -156,14 +164,48 @@ function M.capture(fn, timeout, opts)
   -- only waiting long enough can. So there is no shortcut here: this always
   -- observes for the full window, and whatever lands inside it is this
   -- capture's; whatever lands after belongs to whichever capture is running
-  -- when it arrives.
-  vim.wait(math.max(settle_cap_ms, 120))
+  -- when it arrives. When the caller declared `until_span`, exit as soon as
+  -- a span matching it has appeared AND the 120ms floor has elapsed --
+  -- still no early exit on stability alone, just on the caller's own
+  -- declared terminal span, which is a judgment only the caller can make.
+  local settle_ms = math.max(settle_cap_ms, 120)
+  if until_span then
+    local settle_start = vim.uv.now()
+    vim.wait(settle_ms, function()
+      if vim.uv.now() - settle_start < 120 then
+        return false
+      end
+      for i = 1, #profile.events do
+        if profile.events[i].name:find(until_span) then
+          return true
+        end
+      end
+      return false
+    end, 5)
+  else
+    vim.wait(settle_ms)
+  end
   local out = {}
   for i = 1, #profile.events do
     out[i] = profile.events[i]
   end
   local complete = #out > 0 and out[#out].name:find("^total:") ~= nil
   return out, complete
+end
+
+-- End-to-end latency of one captured action, derived from the span
+-- timestamps rather than from any single span. A multi-phase action's last
+-- total: span covers only its last phase -- for a block-paste fallback that
+-- is the splice alone, which does not move at all when the resolve it
+-- followed gets slower -- so reading one span's duration is not end to end.
+-- Each event carries `at` (when it stopped) and `ms` (how long it took), so
+-- the action began at `first.at - first.ms` and ended at `last.at`.
+function M.elapsed_ms(spans)
+  if #spans == 0 then
+    return nil
+  end
+  local first, last = spans[1], spans[#spans]
+  return last.at - (first.at - first.ms)
 end
 
 function M.count(spans, pattern)

@@ -65,6 +65,29 @@ do
   check("noise_floor: reports the p50 gap between populations", floor2 == 20, floor2)
 end
 
+-- elapsed_ms: end-to-end latency derived from span timestamps, not from any
+-- single span's own duration.
+do
+  -- Two-phase action: the first span covers a slow phase (started at 500,
+  -- stopped -- and so recorded with at=1000, ms=500); the second span
+  -- covers a fast phase that starts right after and stops at at=1500 with
+  -- an own duration of just 5ms. The true end-to-end is 500..1500 = 1000ms
+  -- -- elapsed_ms must report that, not the last span's own 5ms, which is
+  -- exactly what a block-paste fallback's final splice span would look like
+  -- if the resolve before it got ten times slower: the splice's own ms
+  -- barely moves, but the action's true latency does.
+  local spans = {
+    { name = "total:block-fallback", ms = 500, at = 1000 },
+    { name = "total:expand", ms = 5, at = 1500 },
+  }
+  check("elapsed_ms: reports the whole action's span, not the last span's own ms",
+    bench.elapsed_ms(spans) == 1000, bench.elapsed_ms(spans))
+  check("elapsed_ms: differs from the last span's own (far smaller) duration",
+    bench.elapsed_ms(spans) ~= spans[#spans].ms, bench.elapsed_ms(spans))
+  check("elapsed_ms: empty list is safe and returns nil",
+    bench.elapsed_ms({}) == nil, bench.elapsed_ms({}))
+end
+
 -- capture: collects the spans a call produced, waiting for the total: span.
 do
   profile.enabled = true
@@ -244,6 +267,39 @@ do
       #capped_spans == 2 and bench.count(capped_spans, "^total:expand") == 1, bench.names(capped_spans))
     check("capture: with the larger cap, the action reports complete",
       capped_spans[#capped_spans] and capped_spans[#capped_spans].name:find("^total:") ~= nil, bench.names(capped_spans))
+  end
+
+  -- until_span: the caller declares its own action's terminal span so the
+  -- settle can exit as soon as one appears (and the 120ms floor has
+  -- elapsed), instead of always waiting out settle_cap_ms.
+  do
+    -- The terminal span is emitted synchronously, so once the 120ms floor
+    -- passes, until_span should match immediately -- wall time should land
+    -- near the floor, nowhere close to the generous 3000ms cap given here.
+    local start = vim.uv.now()
+    local spans, complete = bench.capture(function()
+      profile.start()("total:expand")
+    end, 1000, { settle_cap_ms = 3000, until_span = "^total:expand" })
+    local elapsed = vim.uv.now() - start
+    check("until_span: a matching terminal span exits well under settle_cap_ms",
+      elapsed < 1000, elapsed)
+    check("until_span: still respects the 120ms floor even on early exit",
+      elapsed >= 120, elapsed)
+    check("until_span: the terminal span is still present in the result",
+      complete == true and bench.count(spans, "^total:expand") == 1, bench.names(spans))
+
+    -- A pattern that never matches must wait out the full settle_cap_ms --
+    -- until_span is caller-declared, not a promise that capture can detect
+    -- "nothing more is coming" on its own.
+    local start2 = vim.uv.now()
+    local never_spans = bench.capture(function()
+      profile.start()("total:block-fallback")
+    end, 1000, { settle_cap_ms = 500, until_span = "^total:expand" })
+    local elapsed2 = vim.uv.now() - start2
+    check("until_span: a pattern that never matches waits out the full cap",
+      elapsed2 >= 500, elapsed2)
+    check("until_span: no total:expand span appears when it never matched",
+      bench.count(never_spans, "^total:expand") == 0, bench.names(never_spans))
   end
 
   profile.enabled = false
