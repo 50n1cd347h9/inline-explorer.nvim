@@ -239,7 +239,12 @@ local scenarios = {
     name = "expand:same-file",
     action = function()
       local spans, complete = expand_on(meta.same_file .. "%(3%)")
-      return complete and bench.elapsed_ms(spans) or nil
+      -- Unlike every other scenario above, this one had no span-shape guard
+      -- at all: `total:expand-failed` satisfies both `complete` and the
+      -- `^total:` sum in elapsed_ms, so a silently-failing expansion would
+      -- report a (fast) latency and pass. Require exactly one genuine
+      -- `total:expand` span, same idiom as the other scenarios' guards.
+      return complete and bench.count(spans, "^total:expand$") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
 }
@@ -259,27 +264,69 @@ end
 -- still gets this same number.
 local noise = bench.noise_floor(scenarios[2].action, { warmup = WARMUP, reps = REPS })
 
+-- `noise_floor` returns `math.huge` when either of its two populations came
+-- back with zero usable samples (e.g. the calibration scenario's action
+-- timed out on every rep). Left unguarded, `3 * math.huge` makes every
+-- tolerance below infinite, so every comparison prints "ok ... tolerance
+-- infms" -- a vacuous pass, not a measurement. Treat "not finite" as its own
+-- case: the harness could not measure its own clock this run, which gets the
+-- same timing-gate suspension as a run independently detected as noisy (see
+-- below).
+local function is_finite(x)
+  return x == x and x ~= math.huge and x ~= -math.huge
+end
+
 print(("%-18s %4s %9s %9s %9s %9s"):format("scenario", "n", "p50", "p90", "mad", "max"))
 print(string.rep("-", 64))
+local has_excluded_row = false
 for _, sc in ipairs(scenarios) do
   local s = measured[sc.name]
+  -- inline:function and inline:macro exclude inliner.smart's pre-span
+  -- whole-buffer concat and its call_name_at tree-sitter parse -- see the
+  -- footnote below and bench.lua's elapsed_ms comment.
+  local excluded = sc.name == "inline:function" or sc.name == "inline:macro"
+  has_excluded_row = has_excluded_row or excluded
+  local label = sc.name .. (excluded and "*" or "")
   if s.n > 0 then
-    print(("%-18s %4d %8.1fms %8.1fms %8.1fms %8.1fms"):format(sc.name, s.n, s.p50, s.p90, s.mad, s.max))
+    print(("%-18s %4d %8.1fms %8.1fms %8.1fms %8.1fms"):format(label, s.n, s.p50, s.p90, s.mad, s.max))
   else
-    print(("%-18s %4d  (no usable samples)"):format(sc.name, 0))
+    print(("%-18s %4d  (no usable samples)"):format(label, 0))
   end
 end
-print(("noise floor: %.1fms (p50 gap between two runs of expand:warm)"):format(noise))
+if has_excluded_row then
+  print("* excludes inliner.smart's pre-span whole-buffer concat and call_name_at tree-sitter parse"
+    .. " (~0.4ms on this fixture, ~15% of the number; larger on real files) -- these run before the"
+    .. " total: span starts. See bench.lua's elapsed_ms comment.")
+end
+if is_finite(noise) then
+  print(("noise floor: %.2fms (p50 gap between two runs of expand:warm)"):format(noise))
+else
+  print("noise floor: unmeasurable (both populations of the calibration scenario produced zero"
+    .. " usable samples this run) -- the harness could not measure its own clock")
+end
 
--- Baseline comparison. The tolerance is derived from the measured noise, not
--- hardcoded, so a slow CI runner widens the band instead of failing.
+-- Baseline comparison. The structural invariants above are the pass/fail
+-- gate regardless of machine speed; these timings are a report against that
+-- gate ONLY when the run's own clock can be trusted. No tolerance formula
+-- can be made load-invariant: a contended machine and a genuine regression
+-- widen the exact same measurements, including the calibration scenario
+-- itself (an injected 10ms delay on the shared completion path moves
+-- expand:warm's own p50 from 1.2ms to 11.2ms, right along with everything
+-- else it touches). So instead of trying to build a tolerance that widens
+-- for load but not for a regression, a run already flagged noisy (see
+-- `noisy` below) has its vs-baseline timing comparisons downgraded to WARN
+-- and cannot fail the run on timing alone -- only the structural invariants
+-- above, which do not depend on the clock, still can.
 local baseline_path = root .. "/tests/bench_baseline.json"
 
 -- A comparison against a handful of samples is not a comparison: p50 over
 -- n=1 or n=2 is a single draw from a right-skewed distribution and will
 -- swing far more than any tolerance worth setting. Below this, the run
 -- FAILS with "not compared" rather than quietly passing on noise. (The old
--- `s.n > 0` guard admitted n=1, which the plan's own rules forbid.)
+-- `s.n > 0` guard admitted n=1, which the plan's own rules forbid.) The same
+-- floor applies to what a baseline is allowed to RECORD: a baseline itself
+-- built from fewer than MIN_SAMPLES samples poisons every comparison made
+-- against it later, so both the write path and the read path enforce it.
 local MIN_SAMPLES = 5
 
 -- Both terms below were re-derived from measurement after `elapsed_ms` was
@@ -310,69 +357,113 @@ local MIN_SAMPLES = 5
 -- for, and would let an 8ms regression on the slowest scenario through.
 local PCT_TOLERANCE = 0.20
 
--- Absolute floor, for the four scenarios whose entire p50 is under 4ms.
--- LOWERED from 2ms to 1ms, because a measurement showed the floor is not
--- what protects a slow machine. Re-running the comparison with every core
--- saturated pushed expand:cold to 109ms and expand:warm to 3.4ms -- but it
--- also pushed the measured noise floor from 0.15ms to 1.31ms, so the
--- `3 * noise` term widened to 3.9ms on its own and was what admitted
--- expand:warm (+2.2ms), expand:same-file (+1.2ms) and inline:function
--- (+3.2ms). The 2ms floor was never the binding term in that run, and would
--- not have been at 1ms either. Absorbing a slow runner is the noise term's
--- job, and it does it.
+-- Absolute floor, for the four scenarios whose entire p50 is under 4ms. The
+-- worst idle-machine excursion above baseline was 0.2ms, so 1ms is 5x that
+-- -- ample -- and it halves the smallest regression the gate can see on all
+-- four fast scenarios versus the old 2ms floor.
 --
--- That leaves the floor with one job: covering jitter on an idle machine,
--- where the noise term measures near zero. The worst excursion above
--- baseline there was 0.2ms, so 1ms is 5x the observed jitter -- ample -- and
--- it halves the smallest regression the gate can see on all four fast
--- scenarios (e.g. expand:same-file could previously triple and still pass).
--- Dropping the floor entirely is NOT safe: 3*noise fell to 0.0ms in three of
--- the four idle runs, which would leave sub-millisecond scenarios gated on
--- 20% of 0.75ms = 0.15ms, i.e. exactly their own jitter.
+-- This floor and the 3*noise term do NOT, between them, make the tolerance
+-- safe to trust under load -- see the comment above `noisy` below for why,
+-- and for what a 12-core-saturated run actually did to expand:cold and
+-- inline:macro even with this floor and the 20% relative term both in
+-- place.
 local MIN_TOLERANCE_MS = 1
 
 if os.getenv("IE_BENCH_WRITE_BASELINE") == "1" then
-  -- Record enough to tell what produced these numbers: p50 alone cannot be
-  -- audited later. `n` says whether the p50 is worth anything, `mad` says
-  -- how spread the population was, and the commit + nvim version say which
-  -- code and which runtime they came from.
-  local commit = vim.trim(vim.fn.system({ "git", "rev-parse", "--short", "HEAD" }))
-  if vim.v.shell_error ~= 0 then
-    commit = "unknown"
-  end
-  local v = vim.version()
-  local out = {
-    recorded = os.date("%Y-%m-%d"),
-    commit = commit,
-    nvim = ("%d.%d.%d"):format(v.major, v.minor, v.patch),
-    noise_floor_ms = noise,
-    scenarios = {},
-  }
-  for name, s in pairs(measured) do
-    if s.n > 0 then
-      out.scenarios[name] = { p50 = s.p50, n = s.n, mad = s.mad }
+  -- Refuse outright rather than write a baseline that would poison every
+  -- comparison made against it: either a scenario fell short of
+  -- MIN_SAMPLES, or this run's own noise floor is unmeasurable (in which
+  -- case recording it would also disable the noisy-run detection below for
+  -- every future run compared against this baseline, since `noise >
+  -- recorded_noise * 4` can never fire once `recorded_noise` itself is
+  -- infinite).
+  local short = {}
+  for _, sc in ipairs(scenarios) do
+    local s = measured[sc.name]
+    if not s or s.n < MIN_SAMPLES then
+      short[#short + 1] = ("%s (%d/%d samples)"):format(sc.name, s and s.n or 0, MIN_SAMPLES)
     end
   end
-  local f = assert(io.open(baseline_path, "w"))
-  f:write(vim.json.encode(out))
-  f:close()
-  print("baseline written: " .. baseline_path)
+  if not is_finite(noise) then
+    short[#short + 1] = "noise floor unmeasurable this run"
+  end
+  if #short > 0 then
+    fails = fails + 1
+    print("FAIL  refusing to write a baseline: " .. table.concat(short, "; ")
+      .. " -- a baseline recorded on too few samples (or an unmeasured clock) poisons every"
+      .. " later comparison")
+  else
+    -- Record enough to tell what produced these numbers: p50 alone cannot be
+    -- audited later. `n` says whether the p50 is worth anything, `mad` says
+    -- how spread the population was, and the commit + nvim version say which
+    -- code and which runtime they came from.
+    local commit = vim.trim(vim.fn.system({ "git", "rev-parse", "--short", "HEAD" }))
+    if vim.v.shell_error ~= 0 then
+      commit = "unknown"
+    else
+      -- A baseline recorded with uncommitted changes names a commit that did
+      -- not actually produce these numbers. Mark it rather than silently
+      -- misattribute the measurement to a clean tree.
+      local dirty = vim.fn.system({ "git", "status", "--porcelain" })
+      if vim.v.shell_error == 0 and vim.trim(dirty) ~= "" then
+        commit = commit .. "-dirty"
+      end
+    end
+    local v = vim.version()
+    local out = {
+      recorded = os.date("%Y-%m-%d"),
+      commit = commit,
+      nvim = ("%d.%d.%d"):format(v.major, v.minor, v.patch),
+      noise_floor_ms = noise,
+      scenarios = {},
+    }
+    for name, s in pairs(measured) do
+      if s.n >= MIN_SAMPLES then
+        out.scenarios[name] = { p50 = s.p50, n = s.n, mad = s.mad }
+      end
+    end
+    local f = assert(io.open(baseline_path, "w"))
+    f:write(vim.json.encode(out))
+    f:close()
+    print("baseline written: " .. baseline_path)
+  end
 elseif vim.fn.filereadable(baseline_path) == 1 then
   local base = vim.json.decode(table.concat(vim.fn.readfile(baseline_path), "\n"))
   print("")
   print(("=== vs baseline recorded %s (commit %s, nvim %s) ===")
     :format(tostring(base.recorded), tostring(base.commit or "?"), tostring(base.nvim or "?")))
-  -- Purely relative: the question is whether THIS run is as reproducible as
-  -- the run that recorded the baseline, which has nothing to do with any
-  -- absolute number of milliseconds. The old test added +20ms, which no
-  -- scenario here can ever exceed (the slowest p50 is ~34ms and the noise
-  -- floor is a fraction of a millisecond), so it could never fire. The 1ms
-  -- term only stops a baseline that recorded a near-zero floor from making
-  -- any jitter at all look like a 4x blowup.
+
   local recorded_noise = base.noise_floor_ms or 0
-  if noise > recorded_noise * 4 and noise >= 1 then
-    print(("WARN  this run is noisy (%.2fms vs %.2fms when recorded); timings below are unreliable")
-      :format(noise, recorded_noise))
+  -- `noisy` covers two ways this run's clock cannot be trusted: it could not
+  -- be measured at all (non-finite noise), or it measured four times noisier
+  -- than the run the baseline was recorded on. Reproduced on a 12-core-
+  -- saturated machine: this WARN fired correctly (1.31ms vs 0.15ms) but,
+  -- before this fix, that was all it did -- the comparison below still went
+  -- on to FAIL expand:cold (32.0 -> 100.5ms against a 6.4ms band: the
+  -- relative term is pinned to expand:cold's own baseline, which a
+  -- contended machine does not widen) and inline:macro (3.8 -> 9.4ms
+  -- against 3*noise's 3.9ms band: it scales faster under load than
+  -- expand:warm, the ~1.2ms scenario the noise floor is calibrated on).
+  -- Meanwhile expand:warm, expand:same-file and inline:function -- all
+  -- close in magnitude to the calibration scenario -- passed under that
+  -- same 3*noise band. That split is exactly why no single tolerance
+  -- formula can be trusted here: once a run is this noisy, a timing
+  -- comparison cannot tell "the machine is slow" from "the code is slow",
+  -- so it is suspended rather than allowed to fail (or vacuously pass) the
+  -- run. The structural invariants above do not depend on the clock and are
+  -- unaffected.
+  local noisy = (not is_finite(noise)) or (noise > recorded_noise * 4 and noise >= 1)
+  if noisy then
+    if not is_finite(noise) then
+      print("WARN  this run's noise floor could not be measured (the calibration scenario produced"
+        .. " zero usable samples in one or both populations); timings below are unreliable")
+    else
+      print(("WARN  this run is noisy (%.2fms vs %.2fms when recorded); timings below are unreliable")
+        :format(noise, recorded_noise))
+    end
+    print("WARN  timing gate suspended for this run: the harness could not trust its own clock, so"
+      .. " the vs-baseline timing comparisons below are reported as warnings and cannot fail the"
+      .. " run; the structural invariants above still applied and still gate it.")
   end
 
   -- Iterate the BASELINE's scenarios, not the measured ones. A scenario that
@@ -388,27 +479,46 @@ elseif vim.fn.filereadable(baseline_path) == 1 then
 
   for _, name in ipairs(names) do
     local b = base.scenarios[name]
-    local s = measured[name] or { n = 0 }
-    if s.n < MIN_SAMPLES then
+    if (b.n or 0) < MIN_SAMPLES then
+      -- Defensive: the write path above now refuses to record a scenario
+      -- below MIN_SAMPLES, but a baseline can predate that guard or be
+      -- hand-edited (this is exactly the stale-baseline-n path the audit
+      -- exercises with a phantom scenario). Comparing against a p50 that was
+      -- itself an unreliable draw is worse than not comparing at all, so
+      -- this always fails -- it is a baseline-provenance problem, not a
+      -- clock-trust one, and is not suspended by `noisy`.
       fails = fails + 1
-      print(("FAIL  %-18s NOT COMPARED: %d usable sample(s), need %d (baseline p50 %.1fms). %s")
-        :format(name, s.n, MIN_SAMPLES,
-          b.p50 or 0,
-          s.n == 0 and "The scenario produced nothing -- its action returned nil every rep (incomplete capture, or its span-shape guard never matched)."
-            or "Too few reps completed to form a p50 worth comparing."))
+      print(("FAIL  %-18s BASELINE UNTRUSTWORTHY: recorded with %d sample(s), need %d -- re-record"
+        .. " the baseline before comparing")
+        :format(name, b.n or 0, MIN_SAMPLES))
     else
-      local by_noise, by_pct, by_floor = 3 * noise, b.p50 * PCT_TOLERANCE, MIN_TOLERANCE_MS
-      local tolerance = math.max(by_noise, by_pct, by_floor)
-      local provenance = tolerance == by_floor and "floor"
-        or (tolerance == by_noise and "3xnoise" or ("%d%%"):format(PCT_TOLERANCE * 100))
-      local delta = s.p50 - b.p50
-      local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s], n=%d)")
-        :format(name, b.p50, s.p50, delta, tolerance, provenance, s.n)
-      if delta > tolerance then
+      local s = measured[name] or { n = 0 }
+      if s.n < MIN_SAMPLES then
         fails = fails + 1
-        print("FAIL  " .. line)
+        print(("FAIL  %-18s NOT COMPARED: %d usable sample(s), need %d (baseline p50 %.1fms). %s")
+          :format(name, s.n, MIN_SAMPLES,
+            b.p50 or 0,
+            s.n == 0 and "The scenario produced nothing -- its action returned nil every rep (incomplete capture, or its span-shape guard never matched)."
+              or "Too few reps completed to form a p50 worth comparing."))
       else
-        print("ok    " .. line)
+        local by_noise = is_finite(noise) and (3 * noise) or 0
+        local by_pct, by_floor = b.p50 * PCT_TOLERANCE, MIN_TOLERANCE_MS
+        local tolerance = math.max(by_noise, by_pct, by_floor)
+        local provenance = tolerance == by_floor and "floor"
+          or (by_noise > 0 and tolerance == by_noise and "3xnoise" or ("%d%%"):format(PCT_TOLERANCE * 100))
+        local delta = s.p50 - b.p50
+        local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s], n=%d)")
+          :format(name, b.p50, s.p50, delta, tolerance, provenance, s.n)
+        if delta > tolerance then
+          if noisy then
+            print("WARN  " .. line)
+          else
+            fails = fails + 1
+            print("FAIL  " .. line)
+          end
+        else
+          print("ok    " .. line)
+        end
       end
     end
   end
