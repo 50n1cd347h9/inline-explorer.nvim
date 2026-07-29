@@ -106,11 +106,11 @@ end
 -- Returns (spans, complete). `complete` is false when the action never
 -- reached its own final total: span within the timeout. Callers must not
 -- read counts off an incomplete capture.
-local function act(pat, fn)
+local function act(pat, fn, capture_opts)
   if not goto_pattern(pat) then
     return nil, false
   end
-  local spans, complete = bench.capture(fn, 30000)
+  local spans, complete = bench.capture(fn, 30000, capture_opts)
   history.undo()
   return spans, complete
 end
@@ -118,8 +118,8 @@ end
 local function expand_on(pat)
   return act(pat, expander.expand)
 end
-local function inline_on(pat)
-  return act(pat, inliner.smart)
+local function inline_on(pat, capture_opts)
+  return act(pat, inliner.smart, capture_opts)
 end
 
 -- ---------------------------------------------------------------------------
@@ -148,12 +148,15 @@ do
 end
 
 -- 3. Falling back to block-paste must not re-resolve: the inliner already has
---    the body and hands it over.
+--    the body and hands it over. This is a two-phase action (block-fallback,
+--    then expander.expand's own splice), so give the capture a generous
+--    settle_cap_ms -- the default 300ms cap is sized for single-phase
+--    scenarios and can cut off before the second phase's total: span lands.
 do
   -- Cursor must land on the type name itself so <cword> resolves the struct
   -- symbol, not on a preceding "struct " keyword (which <cword> would read
   -- as the C keyword "struct", not a resolvable name).
-  local spans, complete = inline_on(meta.struct_name)
+  local spans, complete = inline_on(meta.struct_name, { settle_cap_ms = 3000 })
   check("block fallback happened",
     complete and bench.count(spans, "^total:block%-fallback") == 1, spans and bench.names(spans))
   check("block fallback costs no second lookup",

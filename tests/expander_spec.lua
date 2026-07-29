@@ -157,12 +157,32 @@ do
 
   vim.api.nvim_win_set_cursor(0, { 3, ("    int r = helper(1);"):find("helper") - 1 })
   local before_lines = vim.api.nvim_buf_line_count(vbuf)
+
+  -- The prefetched path must record its own total:expand span, exactly like
+  -- the fetching one -- otherwise the harness (and any caller waiting on a
+  -- final total: span) has no way to know this completion ever finished.
+  local profile = require("inline-explorer.profile")
+  profile.logfile = false
+  profile.enabled = true
+  profile.clear()
+
   expander.expand({ name = "prefetched_fn", body = { "static int prefetched_fn(void)", "{", "    return 7;", "}" }, label = "function_definition" })
   check("prefetched body splices without a lookup", located == 0 and vim.api.nvim_buf_line_count(vbuf) > before_lines,
     ("located=%d lines=%d->%d"):format(located, before_lines, vim.api.nvim_buf_line_count(vbuf)))
   check("prefetched body is what got spliced",
     table.concat(vim.api.nvim_buf_get_lines(vbuf, 0, -1, false), "\n"):find("prefetched_fn(void)", 1, true) ~= nil)
   check("prefetched splice is tracked as a node", #st.nodes >= 1, #st.nodes)
+  check("prefetched expand records a total:expand span", (function()
+    for _, e in ipairs(profile.events) do
+      if e.name == "total:expand" then
+        return true
+      end
+    end
+    return false
+  end)(), vim.inspect(profile.events))
+
+  profile.enabled = false
+  profile.clear()
 
   -- A command-callback style table (no body) must fall through to a lookup.
   require("inline-explorer.history").undo()

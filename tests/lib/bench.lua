@@ -97,6 +97,26 @@ end
 -- changes -- an instrumented call after the final total: gets added -- this
 -- becomes approximate and would need revisiting.
 --
+-- `opts.settle_cap_ms` (default 300, floored at 120ms) is the settle wait
+-- below -- the observation window for a multi-phase action such as a
+-- block-paste fallback, whose second phase (the handoff to
+-- `expander.expand`) can legitimately land well after the first `total:`
+-- span. capture observes for exactly this long, unconditionally: an earlier
+-- version of this wait tried to be clever and return early once the span
+-- count looked stable, but "stable" is indistinguishable from "the next
+-- phase hasn't started yet" when the first phase's own span already matches
+-- `^total:` (as `total:block-fallback` does) -- that is precisely how a
+-- genuinely-violating multi-phase action can look complete before it is. So
+-- there is no shortcut: this is a real limitation, not just a tuning knob. A
+-- phase that lands LATER than `settle_cap_ms` after `fn` was called is not
+-- captured here at all -- it is silently attributed to the NEXT capture
+-- instead (whose ring gets cleared out from under it once that capture
+-- starts, or which picks it up as a foreign span if it arrives after that
+-- clear). Callers whose action can have a phase landing near or past the
+-- default 300ms after its first total: must pass a larger `settle_cap_ms`
+-- explicitly; there is no way for `capture` to detect that this happened
+-- after the fact.
+--
 -- Returns `spans, complete`. `complete` is true iff the LAST span in the
 -- list matches `^total:` -- i.e. the action ran to its own end within
 -- `timeout` rather than being cut off mid-flight. This is deliberately not a
@@ -112,7 +132,9 @@ end
 -- `total:` span at all within the timeout; `complete` is false in that case
 -- and the caller must not treat the returned spans as usable for anything
 -- that depends on the action having finished (e.g. `M.total_ms`).
-function M.capture(fn, timeout)
+function M.capture(fn, timeout, opts)
+  opts = opts or {}
+  local settle_cap_ms = opts.settle_cap_ms or 300
   profile.clear()
   fn()
   vim.wait(timeout or 20000, function()
@@ -123,34 +145,19 @@ function M.capture(fn, timeout)
     end
     return false
   end, 5)
-  -- Quiescence wait: poll for the span count to stop changing instead of
-  -- guessing a fixed trailing delay. This answers "did every span for this
-  -- action land?" directly. It floors at 120ms: the flat trailing wait this
-  -- replaced was always 120ms, and this must never observe for less time
-  -- than that fixed wait did, or a straggler the old wait would have caught
-  -- exits this settle early and silently lands in the NEXT capture instead
-  -- (e.g. a rep's span list gaining a foreign `extract:` span). So: poll
-  -- every 20ms and keep going until the span count has been stable for 3
-  -- consecutive polls AND at least 120ms has elapsed since this wait began,
-  -- subject to the existing 300ms hard cap.
-  do
-    local start = vim.loop.now()
-    local stable = 0
-    local last = #profile.events
-    while vim.loop.now() - start < 300 do
-      vim.wait(20)
-      local n = #profile.events
-      if n == last then
-        stable = stable + 1
-      else
-        stable = 0
-        last = n
-      end
-      if stable >= 3 and vim.loop.now() - start >= 120 then
-        break
-      end
-    end
-  end
+  -- Settle wait: observe for `settle_cap_ms` (floored at 120ms, see above)
+  -- with no early exit. This used to poll for the span count to go quiet and
+  -- return as soon as it looked stable -- fast in the common case, but
+  -- unsound for exactly the case this option exists for: a multi-phase
+  -- action's first phase (e.g. `total:block-fallback`) itself matches
+  -- `^total:`, so the ring can go quiet -- and LOOK finished -- well before
+  -- the second phase has even started, let alone landed. A stability check
+  -- cannot tell "genuinely done" from "the next phase hasn't started yet";
+  -- only waiting long enough can. So there is no shortcut here: this always
+  -- observes for the full window, and whatever lands inside it is this
+  -- capture's; whatever lands after belongs to whichever capture is running
+  -- when it arrives.
+  vim.wait(math.max(settle_cap_ms, 120))
   local out = {}
   for i = 1, #profile.events do
     out[i] = profile.events[i]

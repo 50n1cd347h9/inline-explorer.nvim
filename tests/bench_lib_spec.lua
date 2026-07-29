@@ -179,9 +179,10 @@ do
   check("capture: no filler span leaks into the capture", not has_filler, bench.names(ring_spans))
   profile.max_events = 200
 
-  -- Quiescence: the trailing wait polls for the span count to go quiet
-  -- rather than sleeping a fixed delay, so a straggler span landing shortly
-  -- after total: (e.g. scheduled via vim.defer_fn) must still be captured.
+  -- Settle wait: capture observes for the full settle window (default
+  -- 300ms) regardless of when the ring last changed, so a straggler span
+  -- landing shortly after total: (e.g. scheduled via vim.defer_fn) is still
+  -- within that window and gets captured.
   local q_spans = bench.capture(function()
     profile.start()("locate:ok")
     profile.start()("extract:warm")
@@ -193,11 +194,10 @@ do
   check("capture: waits out a straggler span scheduled past total:", #q_spans == 4, bench.names(q_spans))
   check("capture: the straggler span itself is present", bench.count(q_spans, "^extract:late") == 1, bench.names(q_spans))
 
-  -- Settle floor: the quiescence loop must never observe for less time than
-  -- the flat 120ms wait it replaced. total:expand lands immediately, so the
-  -- span count goes quiet (stable) well within the first few 20ms polls;
-  -- without a 120ms floor the loop would exit around ~60-80ms and miss a
-  -- span deferred to ~90ms, silently handing it to the NEXT capture instead.
+  -- Settle floor: the settle wait must never observe for less time than the
+  -- flat 120ms wait it replaced, so a span deferred to ~90ms (comfortably
+  -- inside the floor) must still be caught even though nothing else happens
+  -- in between.
   local floor_spans = bench.capture(function()
     profile.start()("total:expand")
     vim.defer_fn(function()
@@ -210,6 +210,41 @@ do
     bench.count(floor_spans, "^extract:late") == 1,
     bench.names(floor_spans)
   )
+
+  -- settle_cap_ms: a multi-phase action (e.g. inliner.smart's block-fallback
+  -- handing off to expander.expand) can have its second phase land well past
+  -- the default 300ms cap. With the default, that second total: span is not
+  -- captured at all -- capture stops observing before it arrives, and the
+  -- span silently lands in whatever capture runs next. Passing an explicit,
+  -- larger settle_cap_ms is the only way to actually see it.
+  do
+    local default_spans = bench.capture(function()
+      profile.start()("total:block-fallback")
+      vim.defer_fn(function()
+        profile.start()("total:expand")
+      end, 600)
+    end, 1000)
+    check("capture: default settle_cap_ms does NOT catch a phase deferred ~600ms out",
+      #default_spans == 1 and bench.count(default_spans, "^total:expand") == 0, bench.names(default_spans))
+
+    -- Drain the straggler total:expand that the previous capture's clear()
+    -- did not wait for, so it cannot leak into the next capture below.
+    vim.wait(700, function()
+      return false
+    end, 50)
+    profile.clear()
+
+    local capped_spans = bench.capture(function()
+      profile.start()("total:block-fallback")
+      vim.defer_fn(function()
+        profile.start()("total:expand")
+      end, 600)
+    end, 2000, { settle_cap_ms = 3000 })
+    check("capture: settle_cap_ms = 3000 catches a phase deferred ~600ms out",
+      #capped_spans == 2 and bench.count(capped_spans, "^total:expand") == 1, bench.names(capped_spans))
+    check("capture: with the larger cap, the action reports complete",
+      capped_spans[#capped_spans] and capped_spans[#capped_spans].name:find("^total:") ~= nil, bench.names(capped_spans))
+  end
 
   profile.enabled = false
   profile.clear()
