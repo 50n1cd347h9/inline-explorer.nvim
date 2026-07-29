@@ -6,7 +6,9 @@
 --
 --   nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!"
 --
--- Env: IE_BENCH_CLANGD (clangd path), IE_BENCH_REPS, IE_BENCH_WARMUP
+-- Env: IE_BENCH_CLANGD (clangd path), IE_BENCH_REPS, IE_BENCH_WARMUP,
+--      IE_BENCH_TIMING_GATE (default 1; 0 downgrades vs-baseline timing
+--      failures to warnings -- see TIMING_GATE below)
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(here, ":h:h")
 vim.opt.rtp:append(root)
@@ -28,6 +30,17 @@ end
 
 local REPS = tonumber(os.getenv("IE_BENCH_REPS") or "") or 15
 local WARMUP = tonumber(os.getenv("IE_BENCH_WARMUP") or "") or 3
+
+-- A steadily-loaded runner (CI, unlike a benchmarking machine, is never
+-- idle) inflates every scenario's latency together, so the noise floor --
+-- measured from two populations of the SAME run -- stays small while both
+-- populations are slower than the baseline. That defeats the `noisy`
+-- detector below, which only catches noise WITHIN a run, not a whole run
+-- running hot relative to the baseline's machine. Set IE_BENCH_TIMING_GATE=0
+-- (the CI job does) to downgrade vs-baseline timing failures to warnings
+-- unconditionally; structural invariants never depend on the clock and are
+-- never affected by this flag.
+local TIMING_GATE = (os.getenv("IE_BENCH_TIMING_GATE") or "1") ~= "0"
 
 local fails = 0
 local function check(l, ok, d)
@@ -433,6 +446,11 @@ elseif vim.fn.filereadable(baseline_path) == 1 then
   print(("=== vs baseline recorded %s (commit %s, nvim %s) ===")
     :format(tostring(base.recorded), tostring(base.commit or "?"), tostring(base.nvim or "?")))
 
+  if not TIMING_GATE then
+    print("WARN  IE_BENCH_TIMING_GATE=0: vs-baseline timing comparisons below cannot fail the run"
+      .. " regardless of noise; only the structural invariants above gate it.")
+  end
+
   local recorded_noise = base.noise_floor_ms or 0
   -- `noisy` covers two ways this run's clock cannot be trusted: it could not
   -- be measured at all (non-finite noise), or it measured four times noisier
@@ -510,7 +528,7 @@ elseif vim.fn.filereadable(baseline_path) == 1 then
         local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s], n=%d)")
           :format(name, b.p50, s.p50, delta, tolerance, provenance, s.n)
         if delta > tolerance then
-          if noisy then
+          if noisy or not TIMING_GATE then
             print("WARN  " .. line)
           else
             fails = fails + 1

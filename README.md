@@ -343,6 +343,31 @@ and the log between experiments).
 Enable it permanently with `setup({ profile = true })`; set
 `require("inline-explorer.profile").logfile = false` to keep it in memory only.
 
+### Regression testing
+
+Latency is not left to whoever happens to notice. `tests/bench_spec.lua`
+drives the real actions against a real clangd on a generated fixture and
+asserts the properties that hold regardless of machine speed — an expansion
+costs exactly one lookup and one extraction, a second symbol from an
+already-open header is warm, a block-paste fallback does not re-resolve, a
+definition in the current file opens nothing, and a macro resolves through the
+tweak rather than the hover scrape. Those are the pass/fail gate.
+
+Timings are reported alongside as percentiles (p50/p90/MAD over 15 reps with 3
+discarded, cold and warm kept as separate populations) and compared against
+`tests/bench_baseline.json`. The tolerance is derived from a noise floor the
+harness measures on the spot — the median gap between two independent runs of
+the same scenario — so a slow CI runner widens the band rather than failing,
+and a run noisier than the baseline's says so instead of pretending.
+
+```sh
+IE_BENCH_CLANGD=/path/to/clangd \
+  nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!"
+```
+
+`IE_BENCH_REPS` / `IE_BENCH_WARMUP` adjust the sample size;
+`IE_BENCH_WRITE_BASELINE=1` records a new baseline.
+
 ## Buildroot / cross-compiled kernel
 
 The plugin itself does not change — the work is getting clangd happy against a
