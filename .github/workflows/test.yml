@@ -17,7 +17,7 @@ jobs:
       - name: Run fast suites
         run: |
           set -e
-          for s in gen_spec properties_spec pbt_spec ir_spec substitute_spec macro_spec resolver_spec expander_spec; do
+          for s in gen_spec properties_spec pbt_spec ir_spec substitute_spec macro_spec resolver_spec expander_spec bench_lib_spec; do
             echo "==== tests/$s.lua"
             out=$(nvim --headless --clean -u NONE -c "luafile tests/$s.lua" -c "qa!" 2>&1 | tr '\r' '\n')
             echo "$out"
@@ -39,4 +39,38 @@ jobs:
           out=$(nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
           echo "$out"
           echo "$out" | grep -Eq "ALL ACCEPTED TRANSFORMS COMPILE \+ PASS|SKIP:" || { echo "FAILED: real_cjson_spec"; exit 1; }
+          if echo "$out" | grep -q "FAILURE"; then echo "FAILED"; exit 1; fi
+
+  perf-regression:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Neovim
+        run: |
+          curl -sL https://github.com/neovim/neovim/releases/download/v0.11.3/nvim-linux-x86_64.tar.gz | tar xz
+          echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Install clangd
+        run: |
+          curl -sL -o clangd.zip https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip
+          unzip -q clangd.zip
+          echo "IE_BENCH_CLANGD=$PWD/clangd_18.1.3/bin/clangd" >> "$GITHUB_ENV"
+      - name: Benchmark support unit tests
+        run: |
+          out=$(nvim --headless --clean -u NONE -c "luafile tests/bench_lib_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+          echo "$out"
+          echo "$out" | grep -q "ALL BENCH LIB TESTS PASSED" || { echo "FAILED"; exit 1; }
+      - name: Performance regression harness
+        run: |
+          # IE_BENCH_TIMING_GATE=0: a contended CI runner cannot be told apart
+          # from a genuine slowdown (both noise-floor populations inflate
+          # together, so the noise floor stays small and a steady slowdown
+          # would false-FAIL). The structural invariants above are the gate
+          # for this job; a timing regression is something a human reads out
+          # of this log, not something that turns the job red on its own.
+          out=$(IE_BENCH_TIMING_GATE=0 nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+          echo "$out"
+          # clangd was just installed above, so a SKIP: here means the harness
+          # itself broke, not that clangd is absent -- do not let that pass green.
+          echo "$out" | grep -q "ALL BENCH TESTS PASSED" || { echo "FAILED"; exit 1; }
           if echo "$out" | grep -q "FAILURE"; then echo "FAILED"; exit 1; fi

@@ -30,7 +30,11 @@ end
 -- symbol hand the result over instead of making us repeat the round trip --
 -- the inliner does this when it falls back to block-pasting. Anything without
 -- a `body` is ignored, so the plain command/keymap callbacks (which are
--- invoked with their own argument tables) behave exactly as before.
+-- invoked with their own argument tables) behave exactly as before. The
+-- prefetched path is instrumented like the fetching one: it still records its
+-- own `total:expand` span around the splice, so every completed expansion --
+-- prefetched or not -- ends with a terminal `total:` span for the harness to
+-- wait on.
 function M.expand(prefetched)
   local st = view.current()
   if not st then
@@ -50,7 +54,10 @@ function M.expand(prefetched)
   end
 
   if pre then
-    return M._insert(st, bufnr, lnum, name, pre.body, pre.label)
+    local pre_span = require("inline-explorer.profile").start()
+    M._insert(st, bufnr, lnum, name, pre.body, pre.label)
+    pre_span("total:expand")
+    return
   end
 
   if not view.begin_fetch(st) then

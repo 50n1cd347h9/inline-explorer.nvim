@@ -12,7 +12,14 @@
 
 ## Global Constraints
 
-- **プロダクションコード（`lua/`）は変更しない。** 本計画はテストハーネスのみ。既存の `profile.lua` のスパン名に依存する
+- **プロダクションコード（`lua/`）は変更しない。** 本計画はテストハーネスのみ。既存の `profile.lua` のスパン名に依存する。
+  **例外が一つだけ、意図的かつ恒久的に存在する**: コミット 558779e で
+  `lua/inline-explorer/expander.lua` を変更した。プリフェッチされたスプライス経路
+  （ブロックフォールバックが body を渡す場合）はスパンを一切記録しておらず、
+  fallback の end-to-end 計測がそこで打ち切られ、ハーネスが待つべき終端スパンが
+  存在しなかった。この経路にも他の完了パスと同じ `total:expand` を記録させる
+  以外に直しようがなく、Task 5 で一時的に revert する三つの退化注入とは違って
+  元に戻していない。
 - 依存するスパン名（現行の実装が出すもの、変更禁止）:
   `locate:ok` / `locate:miss` / `extract:cold` / `extract:warm` / `extract:no-lsp` / `extract:no-capability` / `macro:tweak` / `macro:tweak-miss` / `macro:hover` / `macro:hover-miss` / `substitute:ok` / `substitute:rejected-*` / `rewrite` / `total:expand` / `total:inline-function` / `total:inline-macro` / `total:block-fallback` / `total:expand-failed` / `total:macro-splice-failed`
 - 統計は平均を使わない。p50 / p90 / MAD のみ
@@ -50,8 +57,19 @@ git checkout main && git pull && git checkout -b perf-regression-harness
   - `bench.stats(samples) -> { n, min, max, p50, p90, mad }`（空なら `{ n = 0 }`）
   - `bench.run(action, opts) -> samples` — `action(i)` は経過 ms か nil。`opts.warmup`(既定3) 個を破棄、`opts.reps`(既定15) 個を返す
   - `bench.noise_floor(action, opts) -> ms, stats_a, stats_b` — 同一 action の独立2母集団の p50 差
-  - `bench.capture(fn, timeout) -> spans` — `fn()` 実行後 `total:` で始まるスパンが出るまで待ち、その回に増えたスパン列を返す
+  - `bench.capture(fn, timeout) -> spans, complete` — `fn()` 実行後 `total:` で始まるスパンが出るまで待ち、静止を確認してからその回のスパン列を返す。`complete` は「捕捉した列の最後のスパンが `total:` で始まる」= そのアクションが timeout 内に自分の終端まで走り切ったか
+  - `bench.assert_complete(spans) -> complete, reason`
   - `bench.count(spans, pattern) -> n` / `bench.total_ms(spans) -> ms|nil` / `bench.names(spans) -> string`
+
+**注記（実装後に判明し、Task 3/4 の前提となる契約）**: `profile.events` は
+先頭から evict するリングなので、`capture` は添字で切り出さず**リングを所有する**
+（実行前に `profile.clear()` し、残ったものすべてをそのアクションのものとする）。
+また、現行の計装では、あるアクションの最後の `total:` スパンより後には何も
+記録されない（inliner はリライト後に、expander はスプライス後に total を記録し、
+resolver/macro のタイムアウトガードは遅延応答をスパンを残さず捨てる）ため、
+時間窓によるスパンの帰属は今のところ厳密に正しい。**Task 3/4 は `complete` が
+false の捕捉を、完了した 1 アクションとして扱ってはならない**（構造アサーションでは
+FAIL、時間計測では nil を返してその反復を捨てる）。
 
 - [ ] **Step 1: `tests/bench_lib_spec.lua` を作成する（red 先行）**
 
@@ -639,13 +657,16 @@ end
 
 -- Run one action on `pat` and hand back its spans, leaving the view as it was
 -- (every action mutates the buffer; undo keeps reps independent).
+-- Returns (spans, complete). `complete` is false when the action never
+-- reached its own final total: span within the timeout. Callers must not
+-- read counts off an incomplete capture.
 local function act(pat, fn)
   if not goto_pattern(pat) then
-    return nil
+    return nil, false
   end
-  local spans = bench.capture(fn, 30000)
+  local spans, complete = bench.capture(fn, 30000)
   history.undo()
-  return spans
+  return spans, complete
 end
 
 local function expand_on(pat)
@@ -662,49 +683,51 @@ print("=== structural invariants ===")
 
 -- 1. One expansion costs exactly one locate and one extract.
 do
-  local spans = expand_on(meta.cold[1] .. "%(")
+  local spans, complete = expand_on(meta.cold[1] .. "%(")
+  check("capture completed within the timeout", complete == true,
+    spans and (bench.names(spans) .. " -- " .. tostring(select(2, bench.assert_complete(spans)))))
   check("one expand = one locate + one extract",
-    spans ~= nil and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
+    complete and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
     spans and bench.names(spans))
 end
 
 -- 2. A second symbol from an already-attached header is warm, not cold.
 do
-  local first = expand_on(meta.warm[1] .. "%(")
-  local second = expand_on(meta.warm[2] .. "%(")
+  local first, first_complete = expand_on(meta.warm[1] .. "%(")
+  local second, second_complete = expand_on(meta.warm[2] .. "%(")
   check("first touch of a header is cold",
-    first ~= nil and bench.count(first, "^extract:cold") == 1, first and bench.names(first))
+    first_complete and bench.count(first, "^extract:cold") == 1, first and bench.names(first))
   check("second symbol from the same header is warm",
-    second ~= nil and bench.count(second, "^extract:warm") == 1, second and bench.names(second))
+    second_complete and bench.count(second, "^extract:warm") == 1, second and bench.names(second))
 end
 
 -- 3. Falling back to block-paste must not re-resolve: the inliner already has
 --    the body and hands it over.
 do
-  local spans = inline_on("struct " .. meta.struct_name)
+  local spans, complete = inline_on("struct " .. meta.struct_name)
   check("block fallback happened",
-    spans ~= nil and bench.count(spans, "^total:block%-fallback") == 1, spans and bench.names(spans))
+    complete and bench.count(spans, "^total:block%-fallback") == 1, spans and bench.names(spans))
   check("block fallback costs no second lookup",
-    spans ~= nil and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
+    complete and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
     spans and bench.names(spans))
 end
 
 -- 4. A definition in the file being edited opens nothing new.
 do
-  local spans = expand_on(meta.same_file .. "%(3%)")
+  local spans, complete = expand_on(meta.same_file .. "%(3%)")
   check("same-file definition is never a cold extraction",
-    spans ~= nil and bench.count(spans, "^extract:cold") == 0 and bench.count(spans, "^extract:") == 1,
+    complete and bench.count(spans, "^extract:cold") == 0 and bench.count(spans, "^extract:") == 1,
     spans and bench.names(spans))
 end
 
 -- 5. A macro resolves through the tweak; the hover scrape is a fallback for
 --    servers that cannot do better, and must not be reached here.
 do
-  local spans = inline_on(meta.macro_call .. "%(")
+  local spans, complete = inline_on(meta.macro_call .. "%(")
   check("macro uses the ExpandMacro tweak",
-    spans ~= nil and bench.count(spans, "^macro:tweak$") == 1, spans and bench.names(spans))
+    complete and bench.count(spans, "^macro:tweak$") == 1, spans and bench.names(spans))
   check("macro does not fall back to hover scraping",
-    spans ~= nil and bench.count(spans, "^macro:hover") == 0, spans and bench.names(spans))
+    complete and bench.count(spans, "^macro:hover") == 0, spans and bench.names(spans))
 end
 
 print("")
@@ -747,7 +770,79 @@ reported but rarely fail (CI wall-clock varies 2-3x)."
 
 **Interfaces:**
 - Consumes: Task 1 の `bench.run` / `bench.stats` / `bench.noise_floor`
-- Produces: なし
+- Produces: `bench.elapsed_ms(spans)`（新規）、`capture` の `opts.until_span`（新規）
+
+**Task 3 レビューからの持ち越し（このタスクで先に潰す）:**
+
+1. **`total_ms` は時間レポートの根拠に使えない。** 最後の `total:` スパンを返す仕様のため、
+   ブロックフォールバック経路では splice だけを包む `total:expand`（実測 0.077ms）を返し、
+   実際に 2ms 掛かったアクションを 25 倍過小報告する。resolve が 10 倍遅くなっても
+   この数字は動かない。**captured spans から end-to-end を導出する** `bench.elapsed_ms(spans)`
+   を追加し、Task 4 のレイテンシ源はこちらにする（`total_ms` は残すが、単一フェーズの
+   便宜関数であることをコメントに明記）:
+
+```lua
+-- End-to-end latency of one captured action: the SUM of its `total:` spans'
+-- own `ms` values. Each `total:` span already covers one whole phase of the
+-- action end to end, and a multi-phase action's phases run one after another
+-- and never overlap, so summing them covers the whole action while never
+-- double-counting the locate:/extract:/substitute:/macro: spans nested
+-- inside a total: span.
+function M.elapsed_ms(spans)
+  local sum, seen = 0, false
+  for _, s in ipairs(spans) do
+    if s.name:find("^total:") then
+      sum = sum + s.ms
+      seen = true
+    end
+  end
+  return seen and sum or nil
+end
+```
+
+**この設計は一度失敗している。実装時は先に別の式を試し、それが壊れていることを
+実測で確認してから上の式に置き換えた。** 最初に書いたのは各スパンの `at`
+タイムスタンプから引き算する版だった:
+
+```lua
+-- DISPROVEN -- do not use. Kept here only as the record of what was tried
+-- and why it broke.
+function M.elapsed_ms(spans)
+  if #spans == 0 then
+    return nil
+  end
+  local first, last = spans[1], spans[#spans]
+  return last.at - (first.at - first.ms)
+end
+```
+
+`at` は `vim.uv.now()` — libuv の**イベントループ 1 tick につき一度だけ更新される
+キャッシュ済みループ時刻**であり、ミリ秒に量子化されている。同一 tick 内で複数回
+`uv.now()` を呼んでも同じ値が返るため、`at` の差分は「経過時間」ではなく「何回の
+tick 境界をまたいだか」を測ってしまう。この式のまま harness に 10ms の退化を
+注入したところ、5 シナリオ中 4 つで tick 境界をまたがずに退化が消え、green のまま
+通った（監査で実証済み）。上の `total:` スパンの `ms`（`vim.uv.hrtime()` 由来、
+ナノ秒分解能）を合算する版に置き換えてから、同じ注入がすべてのシナリオで検出される
+ようになった。**設計記録が直っていない実装を推奨し続けるのは、記録が無いより悪い**
+——このファイルはその教訓の記録でもある。
+
+2. **無条件 settle は健全だが広すぎる。** 単一フェーズのシナリオまで毎回 300ms 眠るため
+   bench_spec が 1.4s → 5.15s、Task 4 は ~126 capture で +38s。レビュアーが検証した
+   解法は **呼び出し側が終端スパンを宣言する** `opts.until_span`（bench.lua 側の
+   ハードコード名リストは、将来ハンドオフが増えた日に黙って壊れるので採らない）。
+   実測: 5.15s → 2.29s、M3slow mutant の検出は維持。
+
+```lua
+-- `opts.until_span` (a Lua pattern) lets the CALLER declare what its own
+-- action's terminal span looks like, so the settle can exit as soon as one
+-- appears (and >=120ms has passed) instead of always waiting out
+-- settle_cap_ms. It is caller-declared on purpose: a list of handoff names
+-- kept here would silently stop working the day another handoff span is
+-- added, and nothing would catch it.
+```
+
+   `bench_spec` の不変量3の呼び出しは
+   `{ settle_cap_ms = 3000, until_span = "^total:expand" }` とする。
 
 - [ ] **Step 1: `tests/bench_spec.lua` の最終 print の直前にレポート部を追加する**
 
@@ -766,9 +861,9 @@ local scenarios = {
     name = "expand:cold",
     action = function(i)
       local sym = meta.cold[((i - 1) % #meta.cold) + 1]
-      local spans = expand_on(sym .. "%(")
-      if spans and bench.count(spans, "^extract:cold") == 1 then
-        return bench.total_ms(spans)
+      local spans, complete = expand_on(sym .. "%(")
+      if complete and bench.count(spans, "^extract:cold") == 1 then
+        return bench.elapsed_ms(spans)
       end
       return nil -- not actually cold: do not pollute the population
     end,
@@ -777,9 +872,9 @@ local scenarios = {
     name = "expand:warm",
     action = function(i)
       local sym = meta.warm[((i - 1) % #meta.warm) + 1]
-      local spans = expand_on(sym .. "%(")
-      if spans and bench.count(spans, "^extract:warm") == 1 then
-        return bench.total_ms(spans)
+      local spans, complete = expand_on(sym .. "%(")
+      if complete and bench.count(spans, "^extract:warm") == 1 then
+        return bench.elapsed_ms(spans)
       end
       return nil
     end,
@@ -787,22 +882,22 @@ local scenarios = {
   {
     name = "inline:function",
     action = function()
-      local spans = inline_on(meta.fn_call .. "%(")
-      return spans and bench.count(spans, "^total:inline%-function") == 1 and bench.total_ms(spans) or nil
+      local spans, complete = inline_on(meta.fn_call .. "%(")
+      return complete and bench.count(spans, "^total:inline%-function") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
   {
     name = "inline:macro",
     action = function()
-      local spans = inline_on(meta.macro_call .. "%(")
-      return spans and bench.count(spans, "^total:inline%-macro") == 1 and bench.total_ms(spans) or nil
+      local spans, complete = inline_on(meta.macro_call .. "%(")
+      return complete and bench.count(spans, "^total:inline%-macro") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
   {
     name = "expand:same-file",
     action = function()
-      local spans = expand_on(meta.same_file .. "%(3%)")
-      return spans and bench.total_ms(spans) or nil
+      local spans, complete = expand_on(meta.same_file .. "%(3%)")
+      return complete and bench.elapsed_ms(spans) or nil
     end,
   },
 }
@@ -948,6 +1043,16 @@ Expected: 出力なし
 Run: `IE_BENCH_CLANGD=<clangd path> nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tail -3`
 Expected: `ALL BENCH TESTS PASSED`
 
+**Task 4 レビューからの持ち越し（CI 配線の前提）**: 時間ゲートは負荷のかかった
+ランナーで偽 FAIL を出しうる。ハーネスは自分がノイジーだと検出できたときは
+時間ゲートを自ら停止するが、**定常的な負荷**では両母集団が揃って遅くなるため
+ノイズフロアが小さいまま検出が発火せず、`expand:cold` のような大きいシナリオが
+偽って赤になる（監査で +82ms を実測）。CI ランナーはまさに定常負荷の環境なので、
+**CI では構造不変量のみをゲートとし、時間は報告に留める**。そのために
+`IE_BENCH_TIMING_GATE=0` を導入する（既定 1。0 のとき vs-baseline の差分は
+`warn` として印字され `fails` を増やさない。構造不変量は常にゲート）。
+`tests/bench_spec.lua` にこの環境変数を実装してから CI ジョブを書くこと。
+
 - [ ] **Step 4: CI にベンチジョブを追加する**
 
 `.github/workflows/test.yml` の末尾に追記する（既存の 2 ジョブは変更しない）:
@@ -974,7 +1079,7 @@ Expected: `ALL BENCH TESTS PASSED`
           echo "$out" | grep -q "ALL BENCH LIB TESTS PASSED" || { echo "FAILED"; exit 1; }
       - name: Performance regression harness
         run: |
-          out=$(nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+          out=$(IE_BENCH_TIMING_GATE=0 nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
           echo "$out"
           echo "$out" | grep -Eq "ALL BENCH TESTS PASSED|SKIP:" || { echo "FAILED"; exit 1; }
           if echo "$out" | grep -q "FAILURE"; then echo "FAILED"; exit 1; fi
@@ -1041,5 +1146,8 @@ invariant red (see the detection report)."
 - Spec の受け入れ条件 4 点すべてに対応: 構造不変量 5 つ = Task 3、修正前コードで赤になることの実証 = Task 5 Step 1-2、p50/p90/MAD + ノイズフロア = Task 4、CI ジョブ = Task 5 Step 4
 - 型整合: `bench.*` の API は Task 1（実装 + spec）と Task 3/4（消費側）で同一。`fixture.generate` の返す `meta` のキーは Task 2 と Task 3/4 で同一
 - 統計の規約違反がないこと: `mean` はどこにも登場しない。単発測定は Task 3 の構造アサーション（時間を測っていない）のみ
-- `lua/` を変更しないという制約は Task 5 Step 1 の一時的な revert のみ例外とし、Step 3 で元に戻ったことを確認する
+- `lua/` を変更しないという制約には二種類の例外がある: Task 5 Step 1 の三つの一時的な
+  revert（Step 3 で元に戻ったことを確認する）と、コミット 558779e による
+  `expander.lua` への恒久的な変更（プリフェッチされたスプライス経路に終端スパンが
+  無く、ハーネスが待てなかったため。Global Constraints 参照）
 - プレースホルダなし。全ステップに実コード・実コマンド・期待出力あり
