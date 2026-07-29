@@ -1008,6 +1008,16 @@ Expected: 出力なし
 Run: `IE_BENCH_CLANGD=<clangd path> nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tail -3`
 Expected: `ALL BENCH TESTS PASSED`
 
+**Task 4 レビューからの持ち越し（CI 配線の前提）**: 時間ゲートは負荷のかかった
+ランナーで偽 FAIL を出しうる。ハーネスは自分がノイジーだと検出できたときは
+時間ゲートを自ら停止するが、**定常的な負荷**では両母集団が揃って遅くなるため
+ノイズフロアが小さいまま検出が発火せず、`expand:cold` のような大きいシナリオが
+偽って赤になる（監査で +82ms を実測）。CI ランナーはまさに定常負荷の環境なので、
+**CI では構造不変量のみをゲートとし、時間は報告に留める**。そのために
+`IE_BENCH_TIMING_GATE=0` を導入する（既定 1。0 のとき vs-baseline の差分は
+`warn` として印字され `fails` を増やさない。構造不変量は常にゲート）。
+`tests/bench_spec.lua` にこの環境変数を実装してから CI ジョブを書くこと。
+
 - [ ] **Step 4: CI にベンチジョブを追加する**
 
 `.github/workflows/test.yml` の末尾に追記する（既存の 2 ジョブは変更しない）:
@@ -1034,7 +1044,7 @@ Expected: `ALL BENCH TESTS PASSED`
           echo "$out" | grep -q "ALL BENCH LIB TESTS PASSED" || { echo "FAILED"; exit 1; }
       - name: Performance regression harness
         run: |
-          out=$(nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+          out=$(IE_BENCH_TIMING_GATE=0 nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
           echo "$out"
           echo "$out" | grep -Eq "ALL BENCH TESTS PASSED|SKIP:" || { echo "FAILED"; exit 1; }
           if echo "$out" | grep -q "FAILURE"; then echo "FAILED"; exit 1; fi
