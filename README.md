@@ -214,6 +214,11 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
   wrapped as `(f()) & k` parses as a cast in tree-sitter-c (no semantic type
   info), so the engine's rejection of that shape is expected and exempted by
   the property layers.
+- `tests/bench_spec.lua` and `tests/bench_lib_spec.lua` cover performance
+  rather than correctness: structural invariants (one lookup and one
+  extraction per expansion, a warm/cold attach cache, no double-resolve on a
+  block-paste fallback) against a real clangd, and the percentile/noise-floor
+  statistics layer they're built on. See [Regression testing](#regression-testing).
 
 ```sh
 nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!"
@@ -355,10 +360,18 @@ tweak rather than the hover scrape. Those are the pass/fail gate.
 
 Timings are reported alongside as percentiles (p50/p90/MAD over 15 reps with 3
 discarded, cold and warm kept as separate populations) and compared against
-`tests/bench_baseline.json`. The tolerance is derived from a noise floor the
-harness measures on the spot — the median gap between two independent runs of
-the same scenario — so a slow CI runner widens the band rather than failing,
-and a run noisier than the baseline's says so instead of pretending.
+`tests/bench_baseline.json`, with the tolerance the larger of a measured noise
+floor, 20% of the baseline, and a small absolute floor. But the structural
+invariants above are the gate everywhere, on your machine and in CI, because
+they do not depend on the clock. The timing comparison can fail on an idle
+local machine and that is meaningful there. In CI it cannot be trusted the
+same way: a contended runner slows both halves of the noise-floor measurement
+together, so the floor stays small while the whole run is actually running
+hot, and a steady slowdown is indistinguishable from a real regression — so CI
+sets `IE_BENCH_TIMING_GATE=0`, which reports the timing comparison as a
+warning instead of a failure. A pure slowdown with no structural change is
+something a human reads out of the CI log, not something CI turns red for on
+its own.
 
 ```sh
 IE_BENCH_CLANGD=/path/to/clangd \
@@ -366,7 +379,9 @@ IE_BENCH_CLANGD=/path/to/clangd \
 ```
 
 `IE_BENCH_REPS` / `IE_BENCH_WARMUP` adjust the sample size;
-`IE_BENCH_WRITE_BASELINE=1` records a new baseline.
+`IE_BENCH_WRITE_BASELINE=1` records a new baseline;
+`IE_BENCH_TIMING_GATE=0` downgrades vs-baseline timing failures to warnings
+(what CI sets; structural invariants are unaffected).
 
 ## Buildroot / cross-compiled kernel
 

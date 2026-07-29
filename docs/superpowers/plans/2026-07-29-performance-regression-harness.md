@@ -12,7 +12,14 @@
 
 ## Global Constraints
 
-- **プロダクションコード（`lua/`）は変更しない。** 本計画はテストハーネスのみ。既存の `profile.lua` のスパン名に依存する
+- **プロダクションコード（`lua/`）は変更しない。** 本計画はテストハーネスのみ。既存の `profile.lua` のスパン名に依存する。
+  **例外が一つだけ、意図的かつ恒久的に存在する**: コミット 558779e で
+  `lua/inline-explorer/expander.lua` を変更した。プリフェッチされたスプライス経路
+  （ブロックフォールバックが body を渡す場合）はスパンを一切記録しておらず、
+  fallback の end-to-end 計測がそこで打ち切られ、ハーネスが待つべき終端スパンが
+  存在しなかった。この経路にも他の完了パスと同じ `total:expand` を記録させる
+  以外に直しようがなく、Task 5 で一時的に revert する三つの退化注入とは違って
+  元に戻していない。
 - 依存するスパン名（現行の実装が出すもの、変更禁止）:
   `locate:ok` / `locate:miss` / `extract:cold` / `extract:warm` / `extract:no-lsp` / `extract:no-capability` / `macro:tweak` / `macro:tweak-miss` / `macro:hover` / `macro:hover-miss` / `substitute:ok` / `substitute:rejected-*` / `rewrite` / `total:expand` / `total:inline-function` / `total:inline-macro` / `total:block-fallback` / `total:expand-failed` / `total:macro-splice-failed`
 - 統計は平均を使わない。p50 / p90 / MAD のみ
@@ -770,18 +777,36 @@ reported but rarely fail (CI wall-clock varies 2-3x)."
 1. **`total_ms` は時間レポートの根拠に使えない。** 最後の `total:` スパンを返す仕様のため、
    ブロックフォールバック経路では splice だけを包む `total:expand`（実測 0.077ms）を返し、
    実際に 2ms 掛かったアクションを 25 倍過小報告する。resolve が 10 倍遅くなっても
-   この数字は動かない。**スパンの時刻から end-to-end を導出する** `bench.elapsed_ms(spans)`
+   この数字は動かない。**captured spans から end-to-end を導出する** `bench.elapsed_ms(spans)`
    を追加し、Task 4 のレイテンシ源はこちらにする（`total_ms` は残すが、単一フェーズの
    便宜関数であることをコメントに明記）:
 
 ```lua
--- End-to-end latency of one captured action, derived from the span
--- timestamps rather than from any single span. A multi-phase action's last
--- total: span covers only its last phase -- for a block-paste fallback that
--- is the splice alone, which does not move at all when the resolve it
--- followed gets slower -- so reading one span's duration is not end to end.
--- Each event carries `at` (when it stopped) and `ms` (how long it took), so
--- the action began at `first.at - first.ms` and ended at `last.at`.
+-- End-to-end latency of one captured action: the SUM of its `total:` spans'
+-- own `ms` values. Each `total:` span already covers one whole phase of the
+-- action end to end, and a multi-phase action's phases run one after another
+-- and never overlap, so summing them covers the whole action while never
+-- double-counting the locate:/extract:/substitute:/macro: spans nested
+-- inside a total: span.
+function M.elapsed_ms(spans)
+  local sum, seen = 0, false
+  for _, s in ipairs(spans) do
+    if s.name:find("^total:") then
+      sum = sum + s.ms
+      seen = true
+    end
+  end
+  return seen and sum or nil
+end
+```
+
+**この設計は一度失敗している。実装時は先に別の式を試し、それが壊れていることを
+実測で確認してから上の式に置き換えた。** 最初に書いたのは各スパンの `at`
+タイムスタンプから引き算する版だった:
+
+```lua
+-- DISPROVEN -- do not use. Kept here only as the record of what was tried
+-- and why it broke.
 function M.elapsed_ms(spans)
   if #spans == 0 then
     return nil
@@ -790,6 +815,16 @@ function M.elapsed_ms(spans)
   return last.at - (first.at - first.ms)
 end
 ```
+
+`at` は `vim.uv.now()` — libuv の**イベントループ 1 tick につき一度だけ更新される
+キャッシュ済みループ時刻**であり、ミリ秒に量子化されている。同一 tick 内で複数回
+`uv.now()` を呼んでも同じ値が返るため、`at` の差分は「経過時間」ではなく「何回の
+tick 境界をまたいだか」を測ってしまう。この式のまま harness に 10ms の退化を
+注入したところ、5 シナリオ中 4 つで tick 境界をまたがずに退化が消え、green のまま
+通った（監査で実証済み）。上の `total:` スパンの `ms`（`vim.uv.hrtime()` 由来、
+ナノ秒分解能）を合算する版に置き換えてから、同じ注入がすべてのシナリオで検出される
+ようになった。**設計記録が直っていない実装を推奨し続けるのは、記録が無いより悪い**
+——このファイルはその教訓の記録でもある。
 
 2. **無条件 settle は健全だが広すぎる。** 単一フェーズのシナリオまで毎回 300ms 眠るため
    bench_spec が 1.4s → 5.15s、Task 4 は ~126 capture で +38s。レビュアーが検証した
@@ -1111,5 +1146,8 @@ invariant red (see the detection report)."
 - Spec の受け入れ条件 4 点すべてに対応: 構造不変量 5 つ = Task 3、修正前コードで赤になることの実証 = Task 5 Step 1-2、p50/p90/MAD + ノイズフロア = Task 4、CI ジョブ = Task 5 Step 4
 - 型整合: `bench.*` の API は Task 1（実装 + spec）と Task 3/4（消費側）で同一。`fixture.generate` の返す `meta` のキーは Task 2 と Task 3/4 で同一
 - 統計の規約違反がないこと: `mean` はどこにも登場しない。単発測定は Task 3 の構造アサーション（時間を測っていない）のみ
-- `lua/` を変更しないという制約は Task 5 Step 1 の一時的な revert のみ例外とし、Step 3 で元に戻ったことを確認する
+- `lua/` を変更しないという制約には二種類の例外がある: Task 5 Step 1 の三つの一時的な
+  revert（Step 3 で元に戻ったことを確認する）と、コミット 558779e による
+  `expander.lua` への恒久的な変更（プリフェッチされたスプライス経路に終端スパンが
+  無く、ハーネスが待てなかったため。Global Constraints 参照）
 - プレースホルダなし。全ステップに実コード・実コマンド・期待出力あり

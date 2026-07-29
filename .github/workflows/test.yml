@@ -62,7 +62,15 @@ jobs:
           echo "$out" | grep -q "ALL BENCH LIB TESTS PASSED" || { echo "FAILED"; exit 1; }
       - name: Performance regression harness
         run: |
+          # IE_BENCH_TIMING_GATE=0: a contended CI runner cannot be told apart
+          # from a genuine slowdown (both noise-floor populations inflate
+          # together, so the noise floor stays small and a steady slowdown
+          # would false-FAIL). The structural invariants above are the gate
+          # for this job; a timing regression is something a human reads out
+          # of this log, not something that turns the job red on its own.
           out=$(IE_BENCH_TIMING_GATE=0 nvim --headless --clean -u NONE -c "luafile tests/bench_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
           echo "$out"
-          echo "$out" | grep -Eq "ALL BENCH TESTS PASSED|SKIP:" || { echo "FAILED"; exit 1; }
+          # clangd was just installed above, so a SKIP: here means the harness
+          # itself broke, not that clangd is absent -- do not let that pass green.
+          echo "$out" | grep -q "ALL BENCH TESTS PASSED" || { echo "FAILED"; exit 1; }
           if echo "$out" | grep -q "FAILURE"; then echo "FAILED"; exit 1; fi
