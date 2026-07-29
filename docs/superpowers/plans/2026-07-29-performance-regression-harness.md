@@ -50,8 +50,18 @@ git checkout main && git pull && git checkout -b perf-regression-harness
   - `bench.stats(samples) -> { n, min, max, p50, p90, mad }`（空なら `{ n = 0 }`）
   - `bench.run(action, opts) -> samples` — `action(i)` は経過 ms か nil。`opts.warmup`(既定3) 個を破棄、`opts.reps`(既定15) 個を返す
   - `bench.noise_floor(action, opts) -> ms, stats_a, stats_b` — 同一 action の独立2母集団の p50 差
-  - `bench.capture(fn, timeout) -> spans` — `fn()` 実行後 `total:` で始まるスパンが出るまで待ち、その回に増えたスパン列を返す
+  - `bench.capture(fn, timeout) -> spans, clean` — `fn()` 実行後 `total:` で始まるスパンが出るまで待ち、静止を確認してからその回のスパン列を返す。`clean` は「`total:` がちょうど 1 個」= 一つのアクションとして信頼できるか
+  - `bench.assert_one_action(spans) -> clean, reason`
   - `bench.count(spans, pattern) -> n` / `bench.total_ms(spans) -> ms|nil` / `bench.names(spans) -> string`
+
+**注記（実装後に判明し、Task 3/4 の前提となる契約）**: `profile.events` は
+先頭から evict するリングなので、`capture` は添字で切り出さず**リングを所有する**
+（実行前に `profile.clear()` し、残ったものすべてをそのアクションのものとする）。
+また、計装されたアクションは必ず `total:` スパンを最後に一つだけ出すため、
+0 個は「アクションが完了しなかった」、2 個以上は「前の capture の遅延スパンが
+混入した」を意味する。**Task 3/4 は `clean` が false の捕捉を、正しい 1 アクション
+として扱ってはならない**（構造アサーションでは FAIL、時間計測では nil を返して
+その反復を捨てる）。
 
 - [ ] **Step 1: `tests/bench_lib_spec.lua` を作成する（red 先行）**
 
@@ -639,13 +649,17 @@ end
 
 -- Run one action on `pat` and hand back its spans, leaving the view as it was
 -- (every action mutates the buffer; undo keeps reps independent).
+-- Returns (spans, clean). `clean` is false when the capture does not hold
+-- exactly one action's worth of spans -- the action never finished, or a
+-- straggler from an earlier capture bled in. Callers must not read counts
+-- off an unclean capture.
 local function act(pat, fn)
   if not goto_pattern(pat) then
-    return nil
+    return nil, false
   end
-  local spans = bench.capture(fn, 30000)
+  local spans, clean = bench.capture(fn, 30000)
   history.undo()
-  return spans
+  return spans, clean
 end
 
 local function expand_on(pat)
@@ -662,49 +676,51 @@ print("=== structural invariants ===")
 
 -- 1. One expansion costs exactly one locate and one extract.
 do
-  local spans = expand_on(meta.cold[1] .. "%(")
+  local spans, clean = expand_on(meta.cold[1] .. "%(")
+  check("capture holds exactly one action", clean == true,
+    spans and (bench.names(spans) .. " -- " .. tostring(select(2, bench.assert_one_action(spans)))))
   check("one expand = one locate + one extract",
-    spans ~= nil and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
+    clean and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
     spans and bench.names(spans))
 end
 
 -- 2. A second symbol from an already-attached header is warm, not cold.
 do
-  local first = expand_on(meta.warm[1] .. "%(")
-  local second = expand_on(meta.warm[2] .. "%(")
+  local first, first_clean = expand_on(meta.warm[1] .. "%(")
+  local second, second_clean = expand_on(meta.warm[2] .. "%(")
   check("first touch of a header is cold",
-    first ~= nil and bench.count(first, "^extract:cold") == 1, first and bench.names(first))
+    first_clean and bench.count(first, "^extract:cold") == 1, first and bench.names(first))
   check("second symbol from the same header is warm",
-    second ~= nil and bench.count(second, "^extract:warm") == 1, second and bench.names(second))
+    second_clean and bench.count(second, "^extract:warm") == 1, second and bench.names(second))
 end
 
 -- 3. Falling back to block-paste must not re-resolve: the inliner already has
 --    the body and hands it over.
 do
-  local spans = inline_on("struct " .. meta.struct_name)
+  local spans, clean = inline_on("struct " .. meta.struct_name)
   check("block fallback happened",
-    spans ~= nil and bench.count(spans, "^total:block%-fallback") == 1, spans and bench.names(spans))
+    clean and bench.count(spans, "^total:block%-fallback") == 1, spans and bench.names(spans))
   check("block fallback costs no second lookup",
-    spans ~= nil and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
+    clean and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
     spans and bench.names(spans))
 end
 
 -- 4. A definition in the file being edited opens nothing new.
 do
-  local spans = expand_on(meta.same_file .. "%(3%)")
+  local spans, clean = expand_on(meta.same_file .. "%(3%)")
   check("same-file definition is never a cold extraction",
-    spans ~= nil and bench.count(spans, "^extract:cold") == 0 and bench.count(spans, "^extract:") == 1,
+    clean and bench.count(spans, "^extract:cold") == 0 and bench.count(spans, "^extract:") == 1,
     spans and bench.names(spans))
 end
 
 -- 5. A macro resolves through the tweak; the hover scrape is a fallback for
 --    servers that cannot do better, and must not be reached here.
 do
-  local spans = inline_on(meta.macro_call .. "%(")
+  local spans, clean = inline_on(meta.macro_call .. "%(")
   check("macro uses the ExpandMacro tweak",
-    spans ~= nil and bench.count(spans, "^macro:tweak$") == 1, spans and bench.names(spans))
+    clean and bench.count(spans, "^macro:tweak$") == 1, spans and bench.names(spans))
   check("macro does not fall back to hover scraping",
-    spans ~= nil and bench.count(spans, "^macro:hover") == 0, spans and bench.names(spans))
+    clean and bench.count(spans, "^macro:hover") == 0, spans and bench.names(spans))
 end
 
 print("")
@@ -766,8 +782,8 @@ local scenarios = {
     name = "expand:cold",
     action = function(i)
       local sym = meta.cold[((i - 1) % #meta.cold) + 1]
-      local spans = expand_on(sym .. "%(")
-      if spans and bench.count(spans, "^extract:cold") == 1 then
+      local spans, clean = expand_on(sym .. "%(")
+      if clean and bench.count(spans, "^extract:cold") == 1 then
         return bench.total_ms(spans)
       end
       return nil -- not actually cold: do not pollute the population
@@ -777,8 +793,8 @@ local scenarios = {
     name = "expand:warm",
     action = function(i)
       local sym = meta.warm[((i - 1) % #meta.warm) + 1]
-      local spans = expand_on(sym .. "%(")
-      if spans and bench.count(spans, "^extract:warm") == 1 then
+      local spans, clean = expand_on(sym .. "%(")
+      if clean and bench.count(spans, "^extract:warm") == 1 then
         return bench.total_ms(spans)
       end
       return nil
@@ -787,22 +803,22 @@ local scenarios = {
   {
     name = "inline:function",
     action = function()
-      local spans = inline_on(meta.fn_call .. "%(")
-      return spans and bench.count(spans, "^total:inline%-function") == 1 and bench.total_ms(spans) or nil
+      local spans, clean = inline_on(meta.fn_call .. "%(")
+      return clean and bench.count(spans, "^total:inline%-function") == 1 and bench.total_ms(spans) or nil
     end,
   },
   {
     name = "inline:macro",
     action = function()
-      local spans = inline_on(meta.macro_call .. "%(")
-      return spans and bench.count(spans, "^total:inline%-macro") == 1 and bench.total_ms(spans) or nil
+      local spans, clean = inline_on(meta.macro_call .. "%(")
+      return clean and bench.count(spans, "^total:inline%-macro") == 1 and bench.total_ms(spans) or nil
     end,
   },
   {
     name = "expand:same-file",
     action = function()
-      local spans = expand_on(meta.same_file .. "%(3%)")
-      return spans and bench.total_ms(spans) or nil
+      local spans, clean = expand_on(meta.same_file .. "%(3%)")
+      return clean and bench.total_ms(spans) or nil
     end,
   },
 }
