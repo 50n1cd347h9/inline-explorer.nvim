@@ -89,6 +89,44 @@ do
   end, 300)
   check("capture: returns partial spans when no total: arrives", #partial == 1, bench.names(partial))
 
+  -- Ring pressure: profile.events evicts from the front once full, so an
+  -- index-based slice loses spans as soon as the ring is full. capture
+  -- clears the ring before running the action instead, so what was already
+  -- in it (however full) cannot leak into or crowd out this capture.
+  profile.max_events = 8
+  for _ = 1, 8 do
+    profile.start()("filler")
+  end
+  local ring_spans = bench.capture(function()
+    profile.start()("locate:ok")
+    profile.start()("extract:warm")
+    profile.start()("total:expand")
+  end, 1000)
+  check("capture: exactly this call's spans even with a full ring", #ring_spans == 3, bench.names(ring_spans))
+  check("capture: extract count survives a full ring", bench.count(ring_spans, "^extract:") == 1, bench.names(ring_spans))
+  local has_filler = false
+  for _, s in ipairs(ring_spans) do
+    if s.name == "filler" then
+      has_filler = true
+    end
+  end
+  check("capture: no filler span leaks into the capture", not has_filler, bench.names(ring_spans))
+  profile.max_events = 200
+
+  -- Quiescence: the trailing wait polls for the span count to go quiet
+  -- rather than sleeping a fixed delay, so a straggler span landing shortly
+  -- after total: (e.g. scheduled via vim.defer_fn) must still be captured.
+  local q_spans = bench.capture(function()
+    profile.start()("locate:ok")
+    profile.start()("extract:warm")
+    profile.start()("total:expand")
+    vim.defer_fn(function()
+      profile.start()("extract:late")
+    end, 40)
+  end, 1000)
+  check("capture: waits out a straggler span scheduled past total:", #q_spans == 4, bench.names(q_spans))
+  check("capture: the straggler span itself is present", bench.count(q_spans, "^extract:late") == 1, bench.names(q_spans))
+
   profile.enabled = false
   profile.clear()
 end

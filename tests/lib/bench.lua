@@ -71,21 +71,57 @@ end
 -- Spans produced by one user action. Every instrumented action ends with a
 -- `total:` span, so that is the settle signal; without one we return whatever
 -- was recorded before the timeout (the caller can then see it is incomplete).
+--
+-- `profile.events` is a ring buffer (`profile.max_events`, default 200) that
+-- evicts from the FRONT via `table.remove(events, 1)` once full. An
+-- index-based slice (snapshot the length before, take everything after)
+-- silently loses spans as soon as the ring has filled and started evicting,
+-- because every push after that shifts surviving indices down -- a captured
+-- three-span action can come back as one, with no error and a total_ms that
+-- still resolves, so the result looks plausible instead of obviously broken.
+-- To avoid that, capture takes ownership of the ring instead: it clears it
+-- before running `fn`, so every span present afterwards belongs to this
+-- action (a single action produces well under `max_events` spans, so no
+-- eviction can happen within one capture). `profile.clear()` with no
+-- argument only resets the in-memory ring and leaves the log file alone,
+-- which is what we want. Callers must not expect the profile report to
+-- survive a capture -- it owns the ring for the duration of the call.
 function M.capture(fn, timeout)
-  local n0 = #profile.events
+  profile.clear()
   fn()
   vim.wait(timeout or 20000, function()
-    for i = n0 + 1, #profile.events do
+    for i = 1, #profile.events do
       if profile.events[i].name:find("^total:") then
         return true
       end
     end
     return false
   end, 5)
-  vim.wait(120) -- let a trailing span scheduled alongside the total: one land
+  -- Quiescence wait: poll for the span count to stop changing instead of
+  -- guessing a fixed trailing delay. This answers "did every span for this
+  -- action land?" directly, and keeps the window in which a straggler from
+  -- this action could still be in flight (and bleed into the next capture)
+  -- as short as possible.
+  do
+    local stable = 0
+    local last = #profile.events
+    for _ = 1, 15 do
+      vim.wait(20)
+      local n = #profile.events
+      if n == last then
+        stable = stable + 1
+        if stable >= 3 then
+          break
+        end
+      else
+        stable = 0
+        last = n
+      end
+    end
+  end
   local out = {}
-  for i = n0 + 1, #profile.events do
-    out[#out + 1] = profile.events[i]
+  for i = 1, #profile.events do
+    out[i] = profile.events[i]
   end
   return out
 end
