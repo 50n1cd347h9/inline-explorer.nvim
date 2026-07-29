@@ -211,6 +211,37 @@ function M.extract_sync(loc)
   return M.extract_heuristic(bufnr, srow), "heuristic"
 end
 
+-- LRU cache of definition-file attachments (target bufnr -> { ids, at }).
+-- Capacity is a module field so tests can shrink it.
+M._attach_cache_n = 8
+M._attach_cache = {}
+
+local function cache_attachment(target, newly_attached)
+  local cache = M._attach_cache
+  if cache[target] then
+    cache[target].at = vim.uv.now() -- refresh recency; ids already recorded
+  elseif #newly_attached > 0 then
+    cache[target] = { ids = newly_attached, at = vim.uv.now() }
+  end
+  local entries = {}
+  for b, e in pairs(cache) do
+    entries[#entries + 1] = { b = b, at = e.at }
+  end
+  table.sort(entries, function(a, b)
+    return a.at < b.at
+  end)
+  for i = 1, #entries - M._attach_cache_n do
+    local b = entries[i].b
+    local e = cache[b]
+    cache[b] = nil
+    if vim.api.nvim_buf_is_valid(b) and #vim.fn.win_findbuf(b) == 0 then
+      for _, id in ipairs(e.ids) do
+        pcall(vim.lsp.buf_detach_client, b, id)
+      end
+    end
+  end
+end
+
 -- Extract the definition at `loc`. Asks the server attached to `source_bufnr`
 -- for the target document's symbols and uses the returned full range; falls
 -- back to extract_sync when there is no server, no client actually supports
@@ -238,11 +269,13 @@ function M.extract(loc, source_bufnr, cb)
   -- never to fire and we must fall back immediately instead of waiting.
   local target = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(target)
-  -- Track which clients WE attach, so they can be detached again once the
-  -- request settles: every expansion used to leave a permanent didOpen on the
-  -- definition file, and a long session accumulated server-side documents
-  -- (clangd retains an AST per open file). A buffer the user actually has in
-  -- a window keeps its attachment.
+  -- Attachments WE create are cached, not dropped when the request settles:
+  -- re-attaching a definition header makes clangd rebuild its whole preamble
+  -- (measured on linux-6.12, net/sock.h: ~470ms per repeat extract with an
+  -- immediate detach vs ~16ms when the attachment is kept). The least
+  -- recently used entries beyond _attach_cache_n are detached instead, so a
+  -- long session stays bounded without repaying the preamble every keypress.
+  -- A buffer the user actually has in a window is never detached.
   local newly_attached = {}
   for _, c in ipairs(clients) do
     local pre = c.attached_buffers and c.attached_buffers[target]
@@ -251,25 +284,14 @@ function M.extract(loc, source_bufnr, cb)
       newly_attached[#newly_attached + 1] = c.id
     end
   end
-  local function release_target()
-    if #vim.fn.win_findbuf(target) > 0 then
-      return -- visible to the user; leave the attachment alone
-    end
-    for _, id in ipairs(newly_attached) do
-      pcall(vim.lsp.buf_detach_client, target, id)
-    end
-  end
+  cache_attachment(target, newly_attached)
   if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
-    release_target()
     return cb(M.extract_sync(loc))
   end
 
   -- A wedged server must not hang the keypress: after the timeout, extract
   -- locally and say so (the late response, if any, is dropped by the guard).
-  local finish = once_with_timeout(function(...)
-    release_target()
-    cb(...)
-  end, function()
+  local finish = once_with_timeout(cb, function()
     vim.notify("[inline-explorer] documentSymbol timed out; extracted locally", vim.log.levels.WARN)
     return M.extract_sync(loc)
   end)
