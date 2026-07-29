@@ -11,6 +11,8 @@
 -- tables. tree-sitter (a generic outermost-in-window ancestor walk that skips
 -- a small set of transparent container nodes) and a brace counter remain as
 -- fallbacks when no server range is available.
+local profile = require("inline-explorer.profile")
+
 local M = {}
 
 -- How long an LSP round trip may take before we stop waiting: extraction
@@ -31,7 +33,11 @@ function M.locate(name, source_bufnr, cb)
     return cb(nil, "no language server attached to the source buffer")
   end
 
-  local finish = once_with_timeout(cb, function()
+  local span = profile.start()
+  local finish = once_with_timeout(function(loc, err)
+    span(loc and "locate" or "locate:miss")
+    cb(loc, err)
+  end, function()
     return nil, "workspace/symbol timed out (server busy or stuck?)"
   end)
   vim.lsp.buf_request_all(bufnr, "workspace/symbol", { query = name }, function(results)
@@ -249,10 +255,13 @@ end
 -- errors, or there is no usable range. cb(lines, label) is called exactly
 -- once on every path -- possibly synchronously (fallback path).
 function M.extract(loc, source_bufnr, cb)
+  local span = profile.start()
   local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
   local clients = vim.lsp.get_clients({ bufnr = bufnr })
   if #clients == 0 then
-    return cb(M.extract_sync(loc))
+    local lines, label = M.extract_sync(loc)
+    span("extract:no-lsp")
+    return cb(lines, label)
   end
 
   -- The definition file may not be open anywhere; load it and attach the
@@ -268,6 +277,9 @@ function M.extract(loc, source_bufnr, cb)
   -- bookkeeping: if it reports zero, buf_request_all's handler is guaranteed
   -- never to fire and we must fall back immediately instead of waiting.
   local target = vim.uri_to_bufnr(loc.uri)
+  -- Whether this definition file is already attached decides the dominant
+  -- cost (server preamble rebuild vs not), so the span says which it was.
+  local was_cached = M._attach_cache[target] ~= nil
   vim.fn.bufload(target)
   -- Attachments WE create are cached, not dropped when the request settles:
   -- re-attaching a definition header makes clangd rebuild its whole preamble
@@ -286,12 +298,17 @@ function M.extract(loc, source_bufnr, cb)
   end
   cache_attachment(target, newly_attached)
   if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
-    return cb(M.extract_sync(loc))
+    local lines, label = M.extract_sync(loc)
+    span("extract:no-capability")
+    return cb(lines, label)
   end
 
   -- A wedged server must not hang the keypress: after the timeout, extract
   -- locally and say so (the late response, if any, is dropped by the guard).
-  local finish = once_with_timeout(cb, function()
+  local finish = once_with_timeout(function(lines, label)
+    span(was_cached and "extract:cached" or "extract:cold")
+    cb(lines, label)
+  end, function()
     vim.notify("[inline-explorer] documentSymbol timed out; extracted locally", vim.log.levels.WARN)
     return M.extract_sync(loc)
   end)

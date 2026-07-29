@@ -44,8 +44,12 @@ function M.smart()
     return vim.notify("[inline-explorer] a lookup is already in flight", vim.log.levels.INFO)
   end
 
+  local profile = require("inline-explorer.profile")
+  local total = profile.start()
+
   -- The guard is released before delegating: expander.expand acquires its own.
   local function block_fallback()
+    total("inline:fallback-to-block")
     view.end_fetch(st)
     vim.schedule(expander.expand)
   end
@@ -58,12 +62,15 @@ function M.smart()
     do
       if fname and label == "function_definition" then
         local N = (st.subst_n or 0) + 1
+        local sspan = profile.start()
         local ok, new = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
+        sspan(ok and new and "substitute (cpu)" or "substitute:rejected")
         if ok and new then
           return vim.schedule(function()
             view.end_fetch(st)
             st.subst_n = N
             view.rewrite(st, bufnr, new, row)
+            total("inline (total, function)")
           end)
         end
         return block_fallback() -- e.g. variadic function
@@ -84,7 +91,9 @@ function M.smart()
           if ok and new then
             view.end_fetch(st)
             view.rewrite(st, bufnr, new, row)
+            total("inline (total, macro)")
           else
+            total("inline:macro-splice-failed")
             view.end_fetch(st)
             expander.expand()
           end

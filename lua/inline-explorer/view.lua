@@ -148,6 +148,7 @@ end
 -- endpoints both survive are re-anchored with their folds re-created instead
 -- of being dropped wholesale.
 function M.rewrite(st, bufnr, new_src, row)
+  local span = require("inline-explorer.profile").start()
   require("inline-explorer.history").snapshot(st, bufnr)
 
   local old_src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
@@ -194,6 +195,7 @@ function M.rewrite(st, bufnr, new_src, row)
   end
 
   pcall(vim.api.nvim_win_set_cursor, 0, { math.min((row or 0) + 1, n), 0 })
+  span("view.rewrite")
 end
 
 return M

@@ -184,5 +184,53 @@ do
   check("stale guard self-heals after FETCH_GUARD_MS", not refused_again, table.concat(notes, " | "))
 end
 
+-- Profiling: off by default records nothing; on, the real expand path
+-- contributes a span that shows up in the report.
+do
+  local profile = require("inline-explorer.profile")
+  resolver.locate = function(name, _, cb)
+    cb({
+      uri = "file:///fake.c",
+      range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 6 } },
+      kind = 12,
+      name = name,
+    })
+  end
+  resolver.extract = function(_, _, cb)
+    cb({ "static int helper(int x)", "{", "    return x + 1;", "}" }, "function_definition")
+  end
+
+  local function run_expand()
+    local n = vim.api.nvim_buf_line_count(vbuf)
+    vim.api.nvim_win_set_cursor(0, { 3, ("    int r = helper(1);"):find("helper") - 1 })
+    expander.expand()
+    vim.wait(1000, function()
+      return vim.api.nvim_buf_line_count(vbuf) > n
+    end, 10)
+  end
+
+  profile.enabled = false
+  profile.clear()
+  run_expand()
+  check("profile off records nothing", #profile.events == 0, #profile.events)
+  check("report says profiling is off", profile.report():find("off", 1, true) ~= nil, profile.report())
+
+  profile.enabled = true
+  profile.clear()
+  run_expand()
+  check("profile on records the expand span", #profile.events > 0, #profile.events)
+  check("report names the span", profile.report():find("expand (total)", 1, true) ~= nil, profile.report())
+
+  -- Ring buffer stays bounded.
+  profile.max_events = 3
+  for _ = 1, 10 do
+    profile.start()("synthetic")
+  end
+  check("event ring is bounded by max_events", #profile.events == 3, #profile.events)
+  profile.max_events = 200
+  profile.enabled = false
+  profile.clear()
+end
+
 print("")
 print(fails == 0 and "ALL EXPANDER TESTS PASSED" or (fails .. " FAILURE(S)"))

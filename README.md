@@ -284,6 +284,36 @@ Note that once you expand a body mid-file the buffer is no longer valid C as a
 whole; tree-sitter is error-tolerant and still highlights recognizable tokens,
 but expect the odd imperfectly-colored region deep in a nesting.
 
+## Measuring latency
+
+If an expansion feels slow, let the plugin tell you where the time goes rather
+than guessing:
+
+```vim
+:InlineExplorerProfile on     " start recording (off by default, free when off)
+" ... use <leader>ee / <leader>ei a few times ...
+:InlineExplorerProfile        " report
+```
+
+```
+span                       n     total     mean      max     last
+----------------------------------------------------------------
+extract:cold               2      768ms     384ms     568ms     200ms
+expand (total)             1      575ms     575ms     575ms     575ms
+inline (total, macro)      1      320ms     320ms     320ms     320ms
+macro:tweak                1      108ms     108ms     108ms     108ms
+locate                     2       10ms       5ms       7ms       3ms
+view.rewrite               1        2ms       2ms       2ms       2ms
+```
+
+`extract:cold` is the server building the definition header's preamble the
+first time that header is touched — on the Linux kernel that is ~0.5s for a
+big header like `net/sock.h`, while `extract:cached` for a later symbol in the
+same header is ~20ms. The plugin keeps the last few definition files attached
+for exactly that reason (`:InlineExplorerProfile clear` between experiments).
+
+Enable it permanently with `setup({ profile = true })`.
+
 ## Buildroot / cross-compiled kernel
 
 The plugin itself does not change — the work is getting clangd happy against a

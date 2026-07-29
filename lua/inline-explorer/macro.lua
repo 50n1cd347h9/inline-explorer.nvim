@@ -475,11 +475,19 @@ function M.fetch_expansion(st, row, col, cb)
   if row == nil then
     return cb(nil)
   end
+  local profile = require("inline-explorer.profile")
+  local span = profile.start()
   fetch_via_tweak(st, row, col, function(lines)
     if lines and #lines > 0 then
+      span("macro:tweak")
       return cb(lines)
     end
-    fetch_via_hover(st, row, col, cb)
+    span("macro:tweak-miss")
+    local hspan = profile.start()
+    fetch_via_hover(st, row, col, function(hlines)
+      hspan(hlines and #hlines > 0 and "macro:hover" or "macro:hover-miss")
+      cb(hlines)
+    end)
   end)
 end
 

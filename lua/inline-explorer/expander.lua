@@ -45,13 +45,16 @@ function M.expand()
     return notify("a lookup is already in flight", vim.log.levels.INFO)
   end
 
+  local span = require("inline-explorer.profile").start()
   resolver.fetch(name, st.source_bufnr, function(body, label, err)
     vim.schedule(function()
       view.end_fetch(st)
       if not body or #body == 0 then
+        span("expand:failed")
         return notify(err or ("could not extract a body for '" .. name .. "'"))
       end
       M._insert(st, bufnr, lnum, name, body, label)
+      span("expand (total)")
     end)
   end)
 end

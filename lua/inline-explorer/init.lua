@@ -16,6 +16,28 @@ function M.setup(opts)
     config.options.mode = (config.options.mode == "correct") and "readable" or "correct"
     vim.notify("[inline-explorer] substitution mode = " .. config.options.mode)
   end, { desc = "Toggle inline-substitution output between correct and readable" })
+  local profile = require("inline-explorer.profile")
+  profile.enabled = o.profile and true or false
+  vim.api.nvim_create_user_command("InlineExplorerProfile", function(a)
+    local arg = a.args ~= "" and a.args or "report"
+    if arg == "on" or arg == "off" then
+      profile.enabled = arg == "on"
+      profile.clear()
+      vim.notify("[inline-explorer] profiling " .. arg)
+    elseif arg == "clear" then
+      profile.clear()
+      vim.notify("[inline-explorer] profile cleared")
+    else
+      vim.api.nvim_echo({ { profile.report() } }, true, {})
+    end
+  end, {
+    nargs = "?",
+    complete = function()
+      return { "on", "off", "clear", "report" }
+    end,
+    desc = "Latency profile: on | off | clear | report (default)",
+  })
+
   local nav = require("inline-explorer.nav")
   vim.api.nvim_create_user_command("InlineExplorerNext", nav.next, { desc = "Jump to the next expansion block" })
   vim.api.nvim_create_user_command("InlineExplorerPrev", nav.prev, { desc = "Jump to the previous expansion block" })

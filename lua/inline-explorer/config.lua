@@ -19,6 +19,9 @@ M.defaults = {
   -- block wrapping where needed); "readable" favours clean output (no ({...})/goto)
   -- and may not compile in edge cases (early returns, labels, short-circuits).
   mode = "correct",
+  -- Record per-stage latencies; see :InlineExplorerProfile. Off by default
+  -- (instrumented call sites cost a table lookup and a no-op call when off).
+  profile = false,
 }
 
 M.options = vim.deepcopy(M.defaults)
@@ -27,7 +30,7 @@ M.options = vim.deepcopy(M.defaults)
 -- and 0.11): wrong types error loudly, unknown keys warn instead of being
 -- silently ignored.
 local function check(opts)
-  local types = { keymaps = "table", indent = "string", header = "boolean", mode = "string" }
+  local types = { keymaps = "table", indent = "string", header = "boolean", mode = "string", profile = "boolean" }
   for name, expected in pairs(types) do
     if opts[name] ~= nil and type(opts[name]) ~= expected then
       error(("inline-explorer: option '%s' must be a %s"):format(name, expected), 0)
