@@ -779,6 +779,27 @@ function M._chase_definition(loc, cb)
   if #clients == 0 then
     return cb(nil)
   end
+  -- The request must land ON the identifier. workspace/symbol's range can
+  -- cover the whole declaration, putting range.start on `void` -- and a
+  -- definition request positioned on a keyword returns nothing. A real
+  -- session showed exactly that: locate:chase-miss 217.3ms for kfree @
+  -- slab.h on a server whose index knew the definition perfectly well.
+  -- Find the name, word-bounded, in the declaration's first lines and aim
+  -- there; range.start stays as the fallback when the name is not textual
+  -- on those lines (unlikely, but a miss then is honest).
+  local pos = loc.range.start
+  if loc.name then
+    local from = loc.range.start.line
+    local lines = vim.api.nvim_buf_get_lines(target, from, from + 4, false)
+    for i, l in ipairs(lines) do
+      local s0 = l:find("%f[%w_]" .. vim.pesc(loc.name) .. "%f[^%w_]")
+      if s0 then
+        pos = { line = from + i - 1, character = s0 - 1 }
+        break
+      end
+    end
+  end
+
   local span = profile.start()
   local answered = false
   local function finish(dloc)
@@ -795,7 +816,7 @@ function M._chase_definition(loc, cb)
   end, M._timeout_ms)
   clients[1]:request("textDocument/definition", {
     textDocument = { uri = loc.uri },
-    position = loc.range.start,
+    position = pos,
   }, function(err, result)
     if err or not result then
       return finish(nil)
@@ -814,7 +835,7 @@ function M._chase_definition(loc, cb)
       return finish(nil)
     end
     -- The definition being the declaration itself is a miss, not progress.
-    if uri == loc.uri and range.start.line == loc.range.start.line then
+    if uri == loc.uri and range.start.line == pos.line then
       return finish(nil)
     end
     finish({ uri = uri, range = range, kind = loc.kind, name = loc.name })

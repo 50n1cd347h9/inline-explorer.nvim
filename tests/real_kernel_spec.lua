@@ -279,6 +279,41 @@ local function pct(t, p)
   table.sort(s)
   return s[math.max(1, math.ceil(#s * p / 100))]
 end
+-- The declaration chase against REAL clangd. The fake-server unit tests
+-- for this feature were twice more forgiving than the real server -- they
+-- answered definition requests positioned on a keyword that clangd answers
+-- with nothing -- so the field kept seeing prototypes after the tests went
+-- green. This asserts the OUTCOME on the real thing: resched_curr is
+-- declared in kernel/sched/sched.h and defined in this very file, so
+-- fetching it by name must produce a BODY, whichever location
+-- workspace/symbol chooses to answer with and whether or not the chase has
+-- to fire to get there.
+do
+  resolver.clear_caches()
+  local done, lines, label = false, nil, nil
+  profile.clear()
+  resolver.fetch("resched_curr", buf, function(l, lb)
+    lines, label = l, lb
+    done = true
+  end)
+  vim.wait(60000, function() return done end, 10)
+  local via = "direct"
+  for _, e in ipairs(profile.events) do
+    if e.name == "locate:definition-chase" then
+      via = "chase"
+    elseif e.name == "locate:chase-miss" then
+      via = "chase-miss"
+    end
+  end
+  check("kernel chase: a cross-file name yields a BODY, not a prototype",
+    done and label == "function_definition" and lines ~= nil and #lines > 1
+      and table.concat(lines, "\n"):find("{", 1, true) ~= nil,
+    ("label=%s n=%s via=%s"):format(tostring(label), lines and #lines, via))
+  check("kernel chase: never a bare declaration",
+    done and (lines == nil or table.concat(lines, "\n"):match("^[^{]*;%s*$") == nil),
+    lines and table.concat(lines, "\n"))
+end
+
 -- Navigation on the real workload: callHierarchy against real clangd, and
 -- the trail preserving a view across a switch. Span/count gates only.
 do

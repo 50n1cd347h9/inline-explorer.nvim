@@ -667,20 +667,33 @@ do
     cmd = function(dispatchers)
       local closing, next_id = false, 0
       return {
-        request = function(method, _, callback)
+        request = function(method, params, callback)
           next_id = next_id + 1
           if method == "initialize" then
             callback(nil, { capabilities = {
               workspaceSymbolProvider = true, definitionProvider = true } })
           elseif method == "workspace/symbol" then
-            -- the canonical DECLARATION, as clangd answers for kfree
+            -- the canonical DECLARATION -- and the range covers the WHOLE
+            -- declaration starting at column 0, on `void`, as real clangd
+            -- can answer. A chase that sends range.start verbatim asks for
+            -- the definition of a keyword.
             callback(nil, { { name = "kfree_like", kind = 12,
               location = { uri = huri, range = {
-                start = { line = 0, character = 5 }, ["end"] = { line = 0, character = 15 } } } } })
+                start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 34 } } } } })
           elseif method == "textDocument/definition" then
             def_requests = def_requests + 1
-            callback(nil, { { uri = curi, range = {
-              start = { line = 0, character = 5 }, ["end"] = { line = 0, character = 15 } } } })
+            -- Real clangd answers only when the position is ON the
+            -- identifier; the first fake answered regardless of position,
+            -- which made it more forgiving than the real server and let a
+            -- keyword-positioned chase pass here while missing in the
+            -- field (locate:chase-miss 217.3ms on real kfree @ slab.h).
+            local ch = params.position and params.position.character or -1
+            if params.position and params.position.line == 0 and ch >= 5 and ch <= 14 then
+              callback(nil, { { uri = curi, range = {
+                start = { line = 0, character = 5 }, ["end"] = { line = 0, character = 15 } } } })
+            else
+              callback(nil, {})
+            end
           else
             callback(nil, nil)
           end
