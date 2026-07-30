@@ -305,6 +305,35 @@ do
       end
       check("extract: a timeout is labelled as one, not as a cold extract",
         saw_timeout and not saw_cold, table.concat(names, ","))
+
+      -- The first touch of a definition file must use the SHORT budget, not
+      -- the general one. One number cannot serve both: an already-attached
+      -- file answers in single-digit ms, while a first touch has to wait for
+      -- a preamble -- and when that goes pathological the old single 4000ms
+      -- budget bought nothing except four seconds of waiting before the same
+      -- tree-sitter fallback the short budget reaches immediately.
+      -- A SECOND header, never touched before: reusing the first one would
+      -- measure the warm path, because extract attached it a moment ago.
+      local hpath2 = vim.fn.tempname() .. ".h"
+      local f2 = assert(io.open(hpath2, "w"))
+      f2:write("static int wedge_fn2(void)\n{\n    return 8;\n}\n")
+      f2:close()
+
+      local saved_cold = resolver._cold_timeout_ms
+      resolver._cold_timeout_ms = 120
+      resolver._timeout_ms = 8000 -- must NOT be the one that governs here
+      profile.clear()
+      local done3, t3 = false, vim.uv.hrtime()
+      resolver.extract({ uri = vim.uri_from_fname(hpath2),
+        range = { start = { line = 0, character = 11 }, ["end"] = { line = 0, character = 20 } },
+        kind = 12, name = "wedge_fn2" }, src_buf, function() done3 = true end)
+      vim.wait(6000, function() return done3 end, 5)
+      local waited = (vim.uv.hrtime() - t3) / 1e6
+      check("extract: a first touch uses the cold budget, not the general one",
+        done3 and waited < 2000, ("waited %.0fms (cold=%d general=%d)"):format(
+          waited, resolver._cold_timeout_ms, resolver._timeout_ms))
+      resolver._cold_timeout_ms = saved_cold
+      resolver._timeout_ms = 300
       profile.enabled, profile.logfile = was, wasfile
       profile.clear()
     end

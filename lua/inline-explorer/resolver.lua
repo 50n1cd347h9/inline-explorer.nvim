@@ -21,6 +21,26 @@ local M = {}
 -- forever. Exposed as a module field so tests can shorten it.
 M._timeout_ms = 4000
 
+-- A separate, SHORTER budget for the first touch of a definition file, where
+-- the server has to build that file's preamble before it can answer.
+--
+-- One number cannot serve both cases. Measured in a real kernel session:
+-- an already-attached file answers in 6.6ms, and a first touch usually costs
+-- 380-650ms (mm_types.h 379.9, mm.h 635.5) -- but occasionally a small
+-- header blows past everything (err.h, 127 lines, and list.h both exceeded
+-- 4000ms). Against that distribution a 4000ms budget is far longer than any
+-- healthy answer needs, and its only effect on the pathological ones was to
+-- make the user wait four seconds and THEN get the tree-sitter fallback.
+--
+-- Cutting it is safe because of two properties this code already has: the
+-- attachment survives a timeout, and a timed-out result is deliberately not
+-- cached. So the next touch of that file asks the server again, against a
+-- preamble it has meanwhile finished building -- measured at 1.3ms and then
+-- 0.5ms after a forced timeout on the first. The user gets an instant
+-- fallback now and the server's own answer on the next look, instead of a
+-- four-second wait for the same fallback.
+M._cold_timeout_ms = 1200
+
 local function once_with_timeout(cb, on_timeout)
   return require("inline-explorer.async").once_with_timeout(cb, on_timeout, M._timeout_ms)
 end
@@ -517,7 +537,8 @@ function M.extract(loc, source_bufnr, cb)
   -- be cached and then served for the rest of the session. The flag is set
   -- before on_timeout's value reaches the callback.
   local timed_out = false
-  local finish = once_with_timeout(function(lines, label)
+  local budget = #newly_attached > 0 and M._cold_timeout_ms or M._timeout_ms
+  local finish = require("inline-explorer.async").once_with_timeout(function(lines, label)
     -- A timeout is not a measurement of the server. once_with_timeout routes
     -- its own result through this same callback, so labelling by `stage`
     -- recorded a wedged request as a successful `extract:cold` whose
@@ -536,9 +557,14 @@ function M.extract(loc, source_bufnr, cb)
     cb(lines, label)
   end, function()
     timed_out = true
-    vim.notify("[inline-explorer] documentSymbol timed out; extracted locally", vim.log.levels.WARN)
+    -- Name the file and say what happens next. "timed out" alone left the
+    -- user with no way to tell a server that is wedged from one that is
+    -- merely building a preamble for a file it has not seen -- and no
+    -- reason to believe a second attempt would behave differently.
+    vim.notify(("[inline-explorer] %s: no answer within %dms for %s; extracted locally. Looking again will use the server."):format(
+      loc.name or "?", budget, vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")), vim.log.levels.WARN)
     return M.extract_sync(loc)
-  end)
+  end, budget)
 
   local params = { textDocument = { uri = loc.uri } }
   vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)

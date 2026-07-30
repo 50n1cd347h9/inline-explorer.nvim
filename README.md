@@ -533,6 +533,19 @@ the point of the labels:
 - `extract:cached` — the plugin had already resolved this symbol and did not
   ask the server at all. On the same kernel source, p50 0.1ms.
 
+The first case gets a shorter budget than the rest of the plugin's LSP calls
+(`resolver._cold_timeout_ms`, 1200ms, against `_timeout_ms`'s 4000ms), which
+is the opposite of what it looks like it should be. A first touch normally
+answers in 380–650ms, but occasionally a small header does not answer at all
+within seconds — and the only thing a long budget bought there was four
+seconds of waiting before the same tree-sitter fallback a short one reaches
+at once. Cutting it is safe because the attachment survives the timeout and a
+timed-out result is never cached, so looking at the same symbol again asks
+the server against a preamble it has meanwhile finished building (measured at
+1.3ms, then 0.5ms, after a forced timeout on the first). You get an instant
+answer now and the server's own answer next time, instead of waiting for the
+instant answer.
+
 The plugin keeps the last few definition files attached to stay out of the
 first case, and caches resolution results to stay out of the second
 (`:InlineExplorerProfile clear` wipes both the report and the log between
