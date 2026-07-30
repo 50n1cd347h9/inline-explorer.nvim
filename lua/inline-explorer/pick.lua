@@ -1,9 +1,13 @@
 -- Picker glue: callers.get / resolver.locate on one side,
--- trail.goto_location on the other, vim.ui.select in the middle. Kept
--- deliberately thin -- a dressing.nvim / telescope override of
--- vim.ui.select upgrades this UI without this module knowing.
+-- trail.goto_location on the other, the plugin's own floating list
+-- (select.lua) in the middle -- j/k move because it is a real window,
+-- not because anything implements them. vim.ui.select was the first
+-- middle and was dropped: stock nvim resolves it to inputlist(), a
+-- type-a-number prompt, and whether j/k exist must not depend on which
+-- UI plugin happens to be installed.
 local callers = require("inline-explorer.callers")
 local trail = require("inline-explorer.trail")
+local select_ui = require("inline-explorer.select")
 
 local M = {}
 
@@ -43,7 +47,7 @@ function M.callers(done_cb, opts_name)
     end
     local title = ("callers of %s — %d [%s]%s"):format(name, #items, source,
       err and (" (" .. err .. ")") or "")
-    vim.ui.select(items, {
+    select_ui.open(items, {
       prompt = title,
       format_item = function(it)
         return ("%s  %s:%d  │ %s"):format(it.name,

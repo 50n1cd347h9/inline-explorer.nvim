@@ -155,6 +155,13 @@ caller. Both push the view you left onto a trail; `<C-o>`/`<C-i>` walk it,
 and every view on the trail stays alive, so going back restores your
 expansions exactly as you left them.
 
+The caller list is a small floating window over a real buffer, so the
+motions are just vim: `j`/`k` (and `gg`, `G`, `/`, counts) move, `<CR>`
+chooses, `<Esc>` or `q` cancels. It deliberately does not go through
+`vim.ui.select` — stock Neovim resolves that to a type-a-number prompt,
+and whether `j`/`k` exist should not depend on which UI plugin happens to
+be installed.
+
 Caller lists are labelled with their source: `[lsp]` is the server's index
 (resolves identity, but silently incomplete while indexing), `[grep]` is a
 text search confirmed by tree-sitter (sees calls through macros, but cannot
