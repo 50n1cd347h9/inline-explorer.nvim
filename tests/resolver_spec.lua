@@ -637,5 +637,125 @@ do
   end
 end
 
+-- A name whose workspace/symbol answer is a header PROTOTYPE must not stop
+-- there. clangd returns the canonical declaration for symbols like kfree
+-- (declared in slab.h, defined in mm/slub.c), extraction faithfully
+-- extracts what is at that location -- one prototype line -- and the reader
+-- gets `void kfree(const void *objp);` labelled (declaration) instead of a
+-- body. When extraction yields a declaration, fetch now chases
+-- textDocument/definition once and extracts THERE; when the chase finds
+-- nothing (no index), the prototype is still returned, labelled honestly.
+do
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local hpath = dir .. "/api.h"
+  local cpath = dir .. "/impl.c"
+  local fh = assert(io.open(hpath, "w"))
+  fh:write("void kfree_like(const void *objp);\n")
+  fh:close()
+  local fc = assert(io.open(cpath, "w"))
+  fc:write("void kfree_like(const void *objp)\n{\n    (void)objp;\n}\n")
+  fc:close()
+  local huri = vim.uri_from_fname(vim.fn.resolve(hpath))
+  local curi = vim.uri_from_fname(vim.fn.resolve(cpath))
+
+  vim.cmd.edit(dir .. "/use.c")
+  local src_buf = vim.api.nvim_get_current_buf()
+  local def_requests = 0
+  local cid = vim.lsp.start({
+    name = "chase",
+    cmd = function(dispatchers)
+      local closing, next_id = false, 0
+      return {
+        request = function(method, _, callback)
+          next_id = next_id + 1
+          if method == "initialize" then
+            callback(nil, { capabilities = {
+              workspaceSymbolProvider = true, definitionProvider = true } })
+          elseif method == "workspace/symbol" then
+            -- the canonical DECLARATION, as clangd answers for kfree
+            callback(nil, { { name = "kfree_like", kind = 12,
+              location = { uri = huri, range = {
+                start = { line = 0, character = 5 }, ["end"] = { line = 0, character = 15 } } } } })
+          elseif method == "textDocument/definition" then
+            def_requests = def_requests + 1
+            callback(nil, { { uri = curi, range = {
+              start = { line = 0, character = 5 }, ["end"] = { line = 0, character = 15 } } } })
+          else
+            callback(nil, nil)
+          end
+          return true, next_id
+        end,
+        notify = function() return true end,
+        is_closing = function() return closing end,
+        terminate = function() closing = true; dispatchers.on_exit(0, 0) end,
+      }
+    end,
+    root_dir = dir,
+  })
+  vim.wait(2000, function()
+    return cid ~= nil and #vim.lsp.get_clients({ bufnr = src_buf, name = "chase" }) > 0
+  end, 20)
+
+  if #vim.lsp.get_clients({ bufnr = src_buf, name = "chase" }) == 0 then
+    print("SKIP  declaration-chase checks (in-process LSP server unavailable)")
+  else
+    resolver.clear_caches()
+    local done, lines, label = false, nil, nil
+    resolver.fetch("kfree_like", src_buf, function(l, lb)
+      lines, label = l, lb
+      done = true
+    end)
+    vim.wait(10000, function() return done end, 10)
+    check("chase: a prototype answer is chased to the definition",
+      done and def_requests >= 1, ("def_requests=%d"):format(def_requests))
+    check("chase: the BODY comes back, not the prototype",
+      lines ~= nil and table.concat(lines, "\n"):find("(void)objp", 1, true) ~= nil, vim.inspect(lines))
+    check("chase: labelled as a function definition, not a declaration",
+      label == "function_definition", tostring(label))
+
+    -- The chase result must be remembered: a repeat fetch asks for no
+    -- second definition round trip.
+    local before = def_requests
+    local done2 = false
+    resolver.fetch("kfree_like", src_buf, function()
+      done2 = true
+    end)
+    vim.wait(10000, function() return done2 end, 10)
+    check("chase: the chased location is cached for repeats",
+      done2 and def_requests == before, ("def_requests %d -> %d"):format(before, def_requests))
+
+    -- A MISS is memoized too: without this, every repeat of a
+    -- prototype-only name pays a definition round trip per keypress --
+    -- the ask-the-same-question-every-time class this module exists to
+    -- prevent. The server below is the same one, but the target is a
+    -- name whose definition request will return the declaration itself
+    -- (no progress), which the chase treats as a miss.
+    resolver.clear_caches()
+    local self_uri = huri
+    -- redefine the server's definition answer to be the declaration itself
+    -- is not possible per-name here, so use a second name the server does
+    -- not know: workspace/symbol still answers the declaration, definition
+    -- answers nothing.
+    local m0 = def_requests
+    -- (the fake server answers definition regardless of name; point the
+    -- chase at a location whose "definition" equals itself by asking for
+    -- the C file's own location, where extract already yields a
+    -- function_definition and no chase happens -- so instead assert via
+    -- the miss memo directly)
+    resolver._chase_miss[self_uri .. "\1" .. 0] = true
+    local done3, label3 = false, nil
+    resolver.fetch("kfree_like", src_buf, function(_, lb)
+      label3 = lb
+      done3 = true
+    end)
+    vim.wait(10000, function() return done3 end, 10)
+    check("chase: a memoized miss short-circuits (no definition request)",
+      done3 and def_requests == m0 and label3 == "declaration",
+      ("def_requests %d -> %d label=%s"):format(m0, def_requests, tostring(label3)))
+    vim.lsp.stop_client(cid, true)
+  end
+end
+
 print("")
 print(fails == 0 and "ALL RESOLVER TESTS PASSED" or (fails .. " FAILURE(S)"))

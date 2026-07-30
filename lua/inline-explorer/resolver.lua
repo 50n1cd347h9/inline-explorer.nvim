@@ -80,7 +80,18 @@ M._extract_cache = {}
 function M.clear_caches()
   M._locate_cache = {}
   M._extract_cache = {}
+  M._chase_miss = {}
 end
+
+-- Declaration locations whose definition chase came up empty, so repeats
+-- do not pay a definition round trip per keypress -- the
+-- ask-the-same-question-every-time class this module just spent a real
+-- kernel session eliminating. Session-scoped and cleared with the other
+-- caches; the accepted staleness is that a definition which becomes
+-- findable later (an index finishing) is not noticed until clear_caches.
+-- That trade is taken knowingly: the alternative charges every repeat of
+-- every prototype-only name forever.
+M._chase_miss = {}
 
 -- A buffer's changedtick, or nil when the buffer is not loaded. A cached
 -- answer about a file is only reusable while that file is unchanged; an
@@ -751,6 +762,78 @@ function M.extract_heuristic(bufnr, srow)
   return out
 end
 
+-- Chase a declaration to its definition, once. workspace/symbol answers
+-- with the CANONICAL DECLARATION for names like kfree -- declared in
+-- slab.h, defined in mm/slub.c -- and extraction is faithful to the
+-- location it is given, so without this the reader gets one prototype
+-- line labelled (declaration) where they asked for a body.
+-- cb(dloc or nil); nil means no usable definition elsewhere (no index, or
+-- the definition IS the declaration), and the caller keeps the prototype,
+-- honestly labelled.
+function M._chase_definition(loc, cb)
+  local target = vim.fn.bufnr(vim.uri_to_fname(loc.uri))
+  if target == -1 then
+    return cb(nil)
+  end
+  local clients = vim.lsp.get_clients({ bufnr = target, method = "textDocument/definition" })
+  if #clients == 0 then
+    return cb(nil)
+  end
+  local span = profile.start()
+  local answered = false
+  local function finish(dloc)
+    if answered then
+      return
+    end
+    answered = true
+    span(dloc and "locate:definition-chase" or "locate:chase-miss",
+      (loc.name or "?") .. " @ " .. vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t"))
+    cb(dloc)
+  end
+  vim.defer_fn(function()
+    finish(nil)
+  end, M._timeout_ms)
+  clients[1]:request("textDocument/definition", {
+    textDocument = { uri = loc.uri },
+    position = loc.range.start,
+  }, function(err, result)
+    if err or not result then
+      return finish(nil)
+    end
+    local first = result
+    if vim.islist(result) then
+      first = result[1]
+    end
+    if not first then
+      return finish(nil)
+    end
+    -- Location or LocationLink; normalize to { uri, range }.
+    local uri = first.uri or first.targetUri
+    local range = first.range or first.targetSelectionRange or first.targetRange
+    if not uri or not range then
+      return finish(nil)
+    end
+    -- The definition being the declaration itself is a miss, not progress.
+    if uri == loc.uri and range.start.line == loc.range.start.line then
+      return finish(nil)
+    end
+    finish({ uri = uri, range = range, kind = loc.kind, name = loc.name })
+  end, target)
+end
+
+-- Overwrite the cached location for `name` with a better one (the chased
+-- definition), so repeat fetches go straight there instead of re-walking
+-- declaration -> definition every time. Mirrors locate's own key and tick
+-- rules; a definition file we cannot tick is simply not cached, same as in
+-- locate.
+function M._locate_cache_replace(name, source_bufnr, dloc)
+  local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
+  local key = client_key(bufnr) .. "\1" .. name
+  local b = vim.fn.bufnr(vim.uri_to_fname(dloc.uri))
+  local tick = b ~= -1 and tick_of(b) or nil
+  cache_put(M._locate_cache, key, dloc, tick, M._locate_cache_n)
+end
+
 -- Composed lookup: name -> definition body. locate then extract, one
 -- callback: cb(lines, label, err). On failure lines is nil and err carries
 -- the reason (extract itself always yields something via its fallbacks, so a
@@ -761,7 +844,29 @@ function M.fetch(name, source_bufnr, cb)
       return cb(nil, nil, err or "not found")
     end
     M.extract(loc, source_bufnr, function(lines, label)
-      cb(lines, label, nil)
+      if label ~= "declaration" then
+        return cb(lines, label, nil)
+      end
+      -- A declaration is an answer to a different question. Chase the
+      -- definition once; the extract above already attached the
+      -- declaration's file, which is what the definition request needs.
+      local misskey = loc.uri .. "\1" .. loc.range.start.line
+      if M._chase_miss[misskey] then
+        return cb(lines, label, nil)
+      end
+      M._chase_definition(loc, function(dloc)
+        if not dloc then
+          M._chase_miss[misskey] = true
+          return cb(lines, label, nil)
+        end
+        M.extract(dloc, source_bufnr, function(l2, lb2)
+          if not l2 or lb2 == "declaration" then
+            return cb(lines, label, nil)
+          end
+          M._locate_cache_replace(name, source_bufnr, dloc)
+          cb(l2, lb2, nil)
+        end)
+      end)
     end)
   end)
 end
