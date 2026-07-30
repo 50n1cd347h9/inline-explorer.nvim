@@ -332,6 +332,26 @@ do
       check("extract: a first touch uses the cold budget, not the general one",
         done3 and waited < 2000, ("waited %.0fms (cold=%d general=%d)"):format(
           waited, resolver._cold_timeout_ms, resolver._timeout_ms))
+
+      -- The retry probe must send a WELL-FORMED request. Its first version
+      -- read `params` from inside the timeout closure while the local of
+      -- that name was declared below it, so the name resolved to a global --
+      -- nil -- and the probe sent documentSymbol with no textDocument. The
+      -- server rejected that in single-digit milliseconds and the probe
+      -- reported retry-failed, which read as evidence about the server when
+      -- it was evidence about this file. The wedge server swallows the
+      -- retry (never answers), so what this pins is the absence of the
+      -- instant `retry-failed` that only a malformed request produces.
+      vim.wait(500)
+      local saw_retry_failed = false
+      for _, e in ipairs(profile.events) do
+        if e.name == "extract:retry-failed" then
+          saw_retry_failed = true
+        end
+      end
+      check("extract: the retry probe does not fail instantly on a malformed request",
+        not saw_retry_failed,
+        "extract:retry-failed recorded -- the probe's request is malformed again")
       resolver._cold_timeout_ms = saved_cold
       resolver._timeout_ms = 300
       profile.enabled, profile.logfile = was, wasfile

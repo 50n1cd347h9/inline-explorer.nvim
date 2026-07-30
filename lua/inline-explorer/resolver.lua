@@ -539,6 +539,14 @@ function M.extract(loc, source_bufnr, cb)
   -- extracted answer produced because the server was momentarily busy would
   -- be cached and then served for the rest of the session. The flag is set
   -- before on_timeout's value reaches the callback.
+  -- Declared BEFORE the timeout closure below, which reads it. As a local
+  -- declared after that closure, the name inside it resolved to a global --
+  -- nil -- so the retry probe sent a documentSymbol request with no
+  -- textDocument at all. The server rejected it in single-digit
+  -- milliseconds, and the probe dutifully reported "retry-failed", which
+  -- read as evidence about the server when it was evidence about this file.
+  local params = { textDocument = { uri = loc.uri } }
+
   local timed_out = false
   local budget = #newly_attached > 0 and M._cold_timeout_ms or M._timeout_ms
   local finish = require("inline-explorer.async").once_with_timeout(function(lines, label)
@@ -591,7 +599,6 @@ function M.extract(loc, source_bufnr, cb)
     return M.extract_sync(loc)
   end, budget)
 
-  local params = { textDocument = { uri = loc.uri } }
   vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
     -- pcall so a malformed/unexpected response shape can't leave cb unfired.
     local ok, lines, label = pcall(function()
