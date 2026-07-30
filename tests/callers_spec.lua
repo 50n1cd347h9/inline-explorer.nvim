@@ -75,6 +75,31 @@ do
     end)())
 end
 
+-- 1b. The same fallback with rg masked: the runner that broke this had no
+-- rg, and grep gives no column -- the first version assumed column 1,
+-- which lands on indentation whose ancestors never include the
+-- call_expression, so every hit failed confirmation and the fallback
+-- reported zero callers while every rg-equipped machine passed.
+do
+  local orig = vim.fn.executable
+  vim.fn.executable = function(n)
+    if n == "rg" then
+      return 0
+    end
+    return orig(n)
+  end
+  local done, items, source = false, nil, nil
+  callers.get("target_fn", buf, function(i, s2)
+    items, source = i, s2
+    done = true
+  end)
+  vim.wait(10000, function() return done end, 10)
+  vim.fn.executable = orig
+  check("grep(no rg): still finds the three call sites without column info",
+    done and source == "grep" and items ~= nil and #items == 3,
+    ("source=%s n=%s"):format(tostring(source), items and #items))
+end
+
 -- 2. In-process LSP server with callHierarchy: LSP wins, labelled so.
 do
   local uri1 = vim.uri_from_fname(vim.fn.resolve(dir .. "/use1.c"))

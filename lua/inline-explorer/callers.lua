@@ -46,8 +46,20 @@ local function grep_callers(name, root, cb)
       -- rg --vimgrep: file:line:col:text   grep -rnw: file:line:text
       local file, lnum, col = line:match("^(.-):(%d+):(%d+):")
       if not file then
-        file, lnum = line:match("^(.-):(%d+):")
-        col = "1"
+        local text
+        file, lnum, text = line:match("^(.-):(%d+):(.*)$")
+        -- grep gives no column, and assuming column 1 is not a harmless
+        -- default: tree-sitter's confirmation resolves the node AT the
+        -- column, and column 1 of an indented call line is whitespace whose
+        -- ancestors never include the call_expression -- every hit then
+        -- fails confirmation and the fallback reports zero callers. CI
+        -- caught this (no rg on the runner); rg's --vimgrep column had
+        -- hidden it everywhere rg exists. Find the identifier in the line,
+        -- word-bounded, instead of guessing.
+        if file and text then
+          local s0 = text:find("%f[%w_]" .. name .. "%f[^%w_]")
+          col = tostring(s0 or 1)
+        end
       end
       if file then
         n = n + 1
