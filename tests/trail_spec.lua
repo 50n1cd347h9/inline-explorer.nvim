@@ -85,6 +85,41 @@ check("eviction: newer stacked views survive", vim.api.nvim_buf_is_valid(b))
 trail._stack_n = saved_n
 trail.clear()
 
+-- Abandoning a fresh view by a plain buffer switch must not leak its
+-- state entry. bufhidden=wipe kills the buffer; before the fix the entry
+-- -- origin array plus undo snapshots -- stayed in view.state forever,
+-- because close() requires the view to be current and the trail sweep
+-- skipped invalid buffers.
+do
+  trail.clear()
+  vim.cmd.edit(paths[1])
+  local src = vim.api.nvim_get_current_buf()
+  local v = view.open()
+  check("leak: view registered", view.state[v] ~= nil)
+  vim.api.nvim_set_current_buf(src)
+  vim.wait(500, function() return view.state[v] == nil end, 10)
+  check("leak: abandoning the view by a buffer switch drops its state entry",
+    view.state[v] == nil and not vim.api.nvim_buf_is_valid(v),
+    ("state=%s valid=%s"):format(tostring(view.state[v] ~= nil), tostring(vim.api.nvim_buf_is_valid(v))))
+end
+
+-- Undo snapshots are capped: full-buffer copies measured 10.1 MB after 50
+-- expansions of a 10k-line view before the cap existed.
+do
+  local history = require("inline-explorer.history")
+  vim.cmd.edit(paths[2])
+  local v = view.open()
+  local st = view.state[v]
+  local saved = history._cap
+  history._cap = 5
+  for _ = 1, 12 do
+    history.snapshot(st, v)
+  end
+  check("undo cap: depth bounded by the cap", #st.undo <= 5, #st.undo)
+  history._cap = saved
+  view.close()
+end
+
 print("")
 print(fails == 0 and "ALL TRAIL TESTS PASSED" or (fails .. " FAILURE(S)"))
 if fails > 0 then vim.cmd("cq") end

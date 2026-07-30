@@ -15,17 +15,23 @@
 -- including when the window is closed by any other means (:q, WinClosed).
 local M = {}
 
--- The open picker's state, a module field so tests can drive and inspect
--- it without simulating keystrokes.
+-- The CURRENT picker's state, a module field so tests can drive and
+-- inspect it. Every picker also closes over its own state: the exactly-
+-- once contract broke when a second picker opened while the first was up
+-- -- open() overwrote this single slot, the first on_choice never fired,
+-- and the first window's WinClosed then cancelled the SECOND picker.
+-- Reproduced before the fix: "A fired 0 times; B fired 1 times", with B
+-- receiving (nil, nil) through A's autocmd.
 M._state = nil
 
-local function finish(item, idx)
-  local st = M._state
+local function finish(st, item, idx)
   if not st or st.done then
     return
   end
   st.done = true
-  M._state = nil
+  if M._state == st then
+    M._state = nil
+  end
   if vim.api.nvim_win_is_valid(st.win) then
     vim.api.nvim_win_close(st.win, true)
   end
@@ -38,11 +44,11 @@ function M._accept()
     return
   end
   local row = vim.api.nvim_win_get_cursor(st.win)[1]
-  finish(st.items[row], row)
+  finish(st, st.items[row], row)
 end
 
 function M._cancel()
-  finish(nil, nil)
+  finish(M._state, nil, nil)
 end
 
 function M.open(items, opts, on_choice)
@@ -81,7 +87,13 @@ function M.open(items, opts, on_choice)
   -- meaning here.
   vim.wo[win].winhighlight = "CursorLine:PmenuSel"
 
-  M._state = { buf = buf, win = win, items = items, on_choice = on_choice, done = false }
+  -- A new picker CANCELS the previous one first, delivering its nil --
+  -- otherwise the earlier caller's done-callback waits forever.
+  if M._state and not M._state.done then
+    finish(M._state, nil, nil)
+  end
+  local st = { buf = buf, win = win, items = items, on_choice = on_choice, done = false }
+  M._state = st
 
   for _, lhs in ipairs({ "<CR>" }) do
     vim.keymap.set("n", lhs, M._accept, { buffer = buf, nowait = true })
@@ -91,11 +103,15 @@ function M.open(items, opts, on_choice)
   end
   -- Any other way the window dies (:q, :close, a WinClosed from elsewhere)
   -- must still deliver the cancel -- on_choice firing exactly once is the
-  -- contract callers rely on for their own done-callbacks.
+  -- contract callers rely on for their own done-callbacks. The autocmd
+  -- closes over THIS picker's state, so a stale window closing late can
+  -- never cancel a newer picker.
   vim.api.nvim_create_autocmd("WinClosed", {
     pattern = tostring(win),
     once = true,
-    callback = M._cancel,
+    callback = function()
+      finish(st, nil, nil)
+    end,
   })
   return win
 end

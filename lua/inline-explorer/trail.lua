@@ -21,7 +21,15 @@ M._pos = 0
 M._stack_n = 8
 
 local function wipe(buf)
-  if vim.api.nvim_buf_is_valid(buf) and #vim.fn.win_findbuf(buf) == 0 then
+  -- The state entry goes unconditionally: an INVALID buffer's entry is
+  -- exactly the leak -- the buffer died (e.g. a :b switch wiped a fresh
+  -- view) but the entry, with its full origin array and undo snapshots,
+  -- stayed behind a validity guard that skipped it forever.
+  if not vim.api.nvim_buf_is_valid(buf) then
+    view.state[buf] = nil
+    return
+  end
+  if #vim.fn.win_findbuf(buf) == 0 then
     view.state[buf] = nil
     pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end

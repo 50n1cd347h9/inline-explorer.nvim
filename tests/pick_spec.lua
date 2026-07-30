@@ -82,6 +82,34 @@ do
     #trail._stack >= 1 and trail._stack[#trail._stack].buf == v, #trail._stack)
 end
 
+-- A second picker opening while the first is up must CANCEL the first --
+-- delivering its nil -- and the first window's late WinClosed must not
+-- touch the second. Before the fix, A's callback never fired and A's
+-- autocmd cancelled B: "A fired 0 times; B fired 1 times (nil)".
+do
+  local a_fired, a_val, b_fired, b_val = 0, "unset", 0, "unset"
+  select_ui.open({ "a1", "a2" }, { prompt = "A" }, function(item)
+    a_fired = a_fired + 1
+    a_val = item
+  end)
+  local a_win = select_ui._state.win
+  select_ui.open({ "b1", "b2" }, { prompt = "B" }, function(item)
+    b_fired = b_fired + 1
+    b_val = item
+  end)
+  check("second picker: the first callback fired exactly once, with nil",
+    a_fired == 1 and a_val == nil, ("fired=%d val=%s"):format(a_fired, tostring(a_val)))
+  check("second picker: the first window is gone", not vim.api.nvim_win_is_valid(a_win))
+  -- late WinClosed for A (if any queued) must not cancel B
+  vim.wait(100)
+  check("second picker: B is still open and choosable", select_ui._state ~= nil
+    and vim.api.nvim_win_is_valid(select_ui._state.win))
+  select_ui._accept()
+  vim.wait(500, function() return b_fired > 0 end, 10)
+  check("second picker: B delivers its own choice exactly once",
+    b_fired == 1 and b_val == "b1", ("fired=%d val=%s"):format(b_fired, tostring(b_val)))
+end
+
 -- Cancelling must fire the callback exactly once, as nil.
 do
   local done, chose = false, "unset"

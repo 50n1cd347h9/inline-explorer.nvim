@@ -152,8 +152,10 @@ Expansion reads downward in place. Two more movements complete the set:
 `gd` jumps the whole view to a definition, and `<leader>eu` lists who calls
 the function under the cursor — pick one and the view switches to that
 caller. Both push the view you left onto a trail; `<C-o>`/`<C-i>` walk it,
-and every view on the trail stays alive, so going back restores your
-expansions exactly as you left them.
+and views on the trail stay alive, so going back restores your expansions
+exactly as you left them. The trail keeps the 8 most recent views (a module
+field, `trail._stack_n`); beyond that depth the oldest view is dropped and
+its expansions go with it.
 
 The caller list is a small floating window over a real buffer, so the
 motions are just vim: `j`/`k` (and `gg`, `G`, `/`, counts) move, `<CR>`

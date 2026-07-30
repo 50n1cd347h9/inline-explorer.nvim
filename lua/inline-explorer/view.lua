@@ -48,6 +48,17 @@ function M.open(src)
     origin[i] = i - 1
   end
   M.state[view] = { source_bufnr = src, nodes = {}, undo = {}, redo = {}, origin = origin }
+  -- The state entry dies with the buffer. Without this, a view abandoned
+  -- by a plain buffer switch (bufhidden=wipe) left its entry -- origin
+  -- array plus undo snapshots -- in M.state forever: close() requires the
+  -- view to be current, and the trail's sweep skipped invalid buffers.
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = view,
+    once = true,
+    callback = function()
+      M.state[view] = nil
+    end,
+  })
 
   vim.api.nvim_set_current_buf(view)
   vim.wo.foldmethod = "manual"
@@ -150,14 +161,30 @@ function M._remap_rows(old_src, new_src)
 end
 
 -- Re-entrancy guard: one resolver round trip per view at a time, so two quick
--- keypresses on a slow server cannot interleave their splices. The stamp goes
--- stale after FETCH_GUARD_MS, so a leaked flag can never wedge the view
--- permanently (the resolver's own timeout fires well before that).
-M.FETCH_GUARD_MS = 5000
+-- keypresses on a slow server cannot interleave their splices. The stamp
+-- goes stale after FETCH_GUARD_MS so a leaked flag cannot wedge the view
+-- forever -- but the stale-out must outlast the resolver's WORST case, not
+-- its typical one. fetch chains up to four sequential budgets (locate,
+-- extract, definition chase, second extract), so the previous fixed 5000ms
+-- re-armed the guard mid-flight: measured 9.6s on a stubbed slow server,
+-- with the guard re-granted at 5.2s -- reopening the exact interleaved-
+-- splice hazard it exists to prevent. Derived, not guessed, so a timeout
+-- tuning cannot silently outgrow it again. M.FETCH_GUARD_MS, when set, is
+-- an override -- the stale-out tests use it to force expiry without
+-- waiting sixteen real seconds; production leaves it nil and derives.
+M.FETCH_GUARD_MS = nil
+
+function M.fetch_guard_ms()
+  if M.FETCH_GUARD_MS then
+    return M.FETCH_GUARD_MS
+  end
+  local r = require("inline-explorer.resolver")
+  return 3 * r._timeout_ms + math.max(r._cold_timeout_ms, r._timeout_ms) + 1000
+end
 
 function M.begin_fetch(st)
   local now = vim.uv.now()
-  if st.fetch_started and (now - st.fetch_started) < M.FETCH_GUARD_MS then
+  if st.fetch_started and (now - st.fetch_started) < M.fetch_guard_ms() then
     return false
   end
   st.fetch_started = now
