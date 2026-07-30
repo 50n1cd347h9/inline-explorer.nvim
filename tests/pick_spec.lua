@@ -49,6 +49,10 @@ do
   vim.wait(10000, function() return select_ui._state ~= nil end, 10)
   local st = select_ui._state
   check("picker: a floating list window opened", st ~= nil and vim.api.nvim_win_is_valid(st.win))
+  check("picker: the selected row borrows PmenuSel, not the subtle CursorLine",
+    st ~= nil and vim.wo[st.win].cursorline
+      and vim.wo[st.win].winhighlight:find("CursorLine:PmenuSel", 1, true) ~= nil,
+    st and vim.wo[st.win].winhighlight)
   local title = st and vim.api.nvim_win_get_config(st.win).title
   local title_text = ""
   if type(title) == "table" then

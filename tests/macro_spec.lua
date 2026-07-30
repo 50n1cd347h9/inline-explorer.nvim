@@ -310,5 +310,33 @@ do
   check("dead-client claims pruned", macro._pending[99991] == nil and macro._pending[99992] == nil)
 end
 
+-- A leading space on the expansion's first line must not defeat the
+-- already-grouped check. clangd 21 emits ExpandMacro text whose first line
+-- can carry one, the check was anchored (`^%b()$`), so a `({...})` arrived
+-- "not grouped", got wrapped again, and the reader saw `( ({ ... }))` --
+-- the exact nest simplify exists to remove, reintroduced downstream of
+-- simplify because the wrap happened AFTER it ran.
+do
+  local src = "void f(void) { fa->len = READ_ONCE(sqe->len); }"
+  local col = src:find("READ_ONCE") - 1
+  local out = macro.replace_in_src(src, 0, col,
+    { " ({ do { } while (0); (*(&x)); })" })
+  check("splice: leading space does not cause a second paren wrap",
+    out:find("( ({", 1, true) == nil and out:find("(({", 1, true) == nil, out)
+  check("splice: the statement expression itself survives",
+    out:find("({ do { } while (0);", 1, true) ~= nil, out)
+end
+
+-- And the class, not just the instance: even when a wrap IS added for
+-- precedence, wrapping an already-parenthesized expression must collapse
+-- to a single pair.
+do
+  local src = "void f(void) { y = M(a) * 2; }"
+  local col = src:find("M%(") - 1
+  local out = macro.replace_in_src(src, 0, col, { "(a + 1)" })
+  check("splice: wrapping a parenthesized expansion yields ONE pair",
+    out:find("(a + 1) * 2", 1, true) ~= nil and out:find("((a + 1))", 1, true) == nil, out)
+end
+
 print("")
 print(fails == 0 and "ALL MACRO TESTS PASSED" or (fails .. " FAILURE(S)"))

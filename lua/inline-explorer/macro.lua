@@ -112,11 +112,25 @@ function M.replace_in_src(src, row, col, exp_lines)
   end
   -- Collapse the redundant paren nests kernel macros wrap their bodies in
   -- (`(({ ... }))` and friends) before deciding on our own parenthesisation.
-  local exp = require("inline-explorer.simplify").parens(table.concat(parts, "\n"))
+  local simplify = require("inline-explorer.simplify")
+  local exp = simplify.parens(table.concat(parts, "\n"))
+  -- Trim before the grouped check: it is text-anchored, and clangd's
+  -- ExpandMacro text can carry a leading space on its first line -- which
+  -- made a `({...})` arrive "not grouped", earned it a second wrap, and put
+  -- `( ({ ... }))` in front of the reader: the exact nest simplify exists
+  -- to remove, reintroduced AFTER simplify had already run.
+  exp = exp:gsub("^%s+", ""):gsub("%s+$", "")
   -- Parenthesise in expression context to preserve precedence, unless the
   -- expansion is already a single balanced (...) or ({...}) group.
   local already_grouped = exp:match("^%b()$") ~= nil
   local rep = (stmt_ctx or already_grouped) and exp or ("(" .. exp .. ")")
+  -- And collapse whatever nest OUR wrap may just have created. This is the
+  -- class fix where the trim above is the instance fix: it is AST-based,
+  -- so no future whitespace shape can sneak a `((X))` past it, and a
+  -- deliberate precedence wrap always survives as exactly one pair.
+  if not stmt_ctx then
+    rep = simplify.parens(rep)
+  end
   return src:sub(1, sb(inv)) .. rep .. src:sub(eb(inv) + 1)
 end
 

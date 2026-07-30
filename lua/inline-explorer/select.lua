@@ -74,6 +74,12 @@ function M.open(items, opts, on_choice)
     title = title ~= "" and (" " .. title .. " ") or nil,
   })
   vim.wo[win].cursorline = true
+  -- The stock CursorLine is designed to be subtle -- fine in a file, too
+  -- quiet for a picker, where the highlighted row IS the answer to "what
+  -- happens when I press enter". PmenuSel is the group every colorscheme
+  -- designs to read as "the selected entry", so borrow it for exactly that
+  -- meaning here.
+  vim.wo[win].winhighlight = "CursorLine:PmenuSel"
 
   M._state = { buf = buf, win = win, items = items, on_choice = on_choice, done = false }
 
