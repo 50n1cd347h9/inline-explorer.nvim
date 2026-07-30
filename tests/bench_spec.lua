@@ -128,8 +128,8 @@ local function act(pat, fn, capture_opts)
   return spans, complete
 end
 
-local function expand_on(pat)
-  return act(pat, expander.expand)
+local function expand_on(pat, capture_opts)
+  return act(pat, expander.expand, capture_opts)
 end
 local function inline_on(pat, capture_opts)
   return act(pat, inliner.smart, capture_opts)
@@ -247,7 +247,7 @@ local scenarios = {
       -- measured on purpose further down instead.
       resolver.clear_caches()
       local sym = meta.cold[((i - 1) % #meta.cold) + 1]
-      local spans, complete = expand_on(sym .. "%(")
+      local spans, complete = expand_on(sym .. "%(", { until_span = "^total:expand" })
       if complete and bench.count(spans, "^extract:local") == 1 then
         return bench.elapsed_ms(spans)
       end
@@ -259,7 +259,7 @@ local scenarios = {
     action = function(i)
       resolver.clear_caches()
       local sym = meta.warm[((i - 1) % #meta.warm) + 1]
-      local spans, complete = expand_on(sym .. "%(")
+      local spans, complete = expand_on(sym .. "%(", { until_span = "^total:expand" })
       if complete and bench.count(spans, "^extract:local") == 1 then
         return bench.elapsed_ms(spans)
       end
@@ -270,7 +270,7 @@ local scenarios = {
     name = "inline:function",
     action = function()
       resolver.clear_caches()
-      local spans, complete = inline_on(meta.fn_call .. "%(")
+      local spans, complete = inline_on(meta.fn_call .. "%(", { until_span = "^total:inline%-function" })
       return complete and bench.count(spans, "^total:inline%-function") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
@@ -281,7 +281,7 @@ local scenarios = {
       -- the generated file; disambiguate with the call's argument, same
       -- idiom as invariant 5 above, so the cursor lands on the invocation.
       resolver.clear_caches()
-      local spans, complete = inline_on(meta.macro_call .. "%(4%)")
+      local spans, complete = inline_on(meta.macro_call .. "%(4%)", { until_span = "^total:inline%-macro" })
       return complete and bench.count(spans, "^total:inline%-macro") == 1 and bench.elapsed_ms(spans) or nil
     end,
   },
@@ -289,7 +289,7 @@ local scenarios = {
     name = "expand:same-file",
     action = function()
       resolver.clear_caches()
-      local spans, complete = expand_on(meta.same_file .. "%(3%)")
+      local spans, complete = expand_on(meta.same_file .. "%(3%)", { until_span = "^total:expand$" })
       -- Unlike every other scenario above, this one had no span-shape guard
       -- at all: `total:expand-failed` satisfies both `complete` and the
       -- `^total:` sum in elapsed_ms, so a silently-failing expansion would
@@ -308,7 +308,7 @@ local scenarios = {
     -- number that merely looks worse.
     name = "expand:cached",
     action = function()
-      local spans, complete = expand_on(meta.warm[1] .. "%(")
+      local spans, complete = expand_on(meta.warm[1] .. "%(", { until_span = "^total:expand" })
       if complete and bench.count(spans, "^extract:cached") == 1 then
         return bench.elapsed_ms(spans)
       end
@@ -318,7 +318,7 @@ local scenarios = {
   {
     name = "inline:cached",
     action = function()
-      local spans, complete = inline_on(meta.fn_call .. "%(")
+      local spans, complete = inline_on(meta.fn_call .. "%(", { until_span = "^total:inline%-function" })
       if complete and bench.count(spans, "^total:inline%-function") == 1
         and bench.count(spans, "^extract:cached") == 1 then
         return bench.elapsed_ms(spans)

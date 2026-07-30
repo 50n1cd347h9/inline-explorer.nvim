@@ -122,9 +122,15 @@ real.run({
     return out:gsub("\n", " ")
   end,
   verify = function(dir)
-    -- `make test` propagates failure: its teststatic recipe ends in `false`
-    -- when the round trip does not reproduce the input.
-    return real.sh("make -s test 2>&1", dir)
+    -- `teststatic`, not `test`. The full target is teststatic + testshared
+    -- + test64: three builds of the touched .c and three runs of the SAME
+    -- compress-and-decompress oracle against the same static sources --
+    -- verified verdict-identical across the whole corpus, at half the
+    -- wall clock (measured ~111s -> ~55s for the spec), and this job runs
+    -- on every PR and every push. teststatic alone still rebuilds the
+    -- touched file (compile errors propagate) and its recipe still ends in
+    -- `false` on a failed round trip.
+    return real.sh("make -s teststatic 2>&1", dir)
   end,
   -- A cheap, deterministic gate that runs BEFORE `verify` on every accepted
   -- transform: one `gcc -fsyntax-only` pass over the rewritten translation

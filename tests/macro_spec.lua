@@ -15,7 +15,7 @@ local function check(l, ok, d)
     print("PASS  " .. l)
   else
     fails = fails + 1
-    print("FAIL  " .. l .. (d and ("\n----\n" .. d .. "\n----") or ""))
+    print("FAIL  " .. l .. (d ~= nil and ("\n----\n" .. tostring(d) .. "\n----") or ""))
   end
 end
 

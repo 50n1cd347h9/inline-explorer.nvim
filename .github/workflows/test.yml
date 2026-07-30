@@ -156,10 +156,15 @@ jobs:
           python3 - <<'PY'
           import json, sys
           d = json.load(open("compile_commands.json"))
-          hits = [e for e in d if e.get("file", "").endswith("kernel/sched/core.c")]
-          print(f"compile_commands.json: {len(d)} entries, {len(hits)} covering kernel/sched/core.c")
-          if not hits:
-              sys.exit("FAILED: compile database does not cover kernel/sched/core.c")
+          for want in ("kernel/sched/core.c", "mm/slub.c"):
+              hits = [e for e in d if e.get("file", "").endswith(want)]
+              print(f"compile_commands.json: {len(d)} entries, {len(hits)} covering {want}")
+              if not hits:
+                  # slub matters as much as core: without it the spec's kfree
+                  # end-to-end section degrades to a coverage-statement check
+                  # that cannot fail, and the exact user-reported case goes
+                  # untested while every gate stays green.
+                  sys.exit(f"FAILED: compile database does not cover {want}")
           PY
       - name: Real-kernel regression
         run: |
@@ -183,8 +188,14 @@ jobs:
           if echo "$out" | grep -q "FAILURE"; then echo "FAILED: real-kernel spec"; exit 1; fi
 
   perf-regression:
+    # Runs on push AND pull_request, same doctrine as real-source: a job
+    # absent from a PR's checks is treated by GitHub as satisfied, and this
+    # job's five structural invariants -- span shapes, round-trip counts,
+    # attach-cache behavior -- are clock-independent, so the contended-
+    # runner argument that keeps the TIMING gate off in CI never applied to
+    # them. Before this change a keypress-path regression the invariants
+    # would catch could merge green and only turn red after landing.
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
       - name: Install Neovim

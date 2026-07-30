@@ -66,7 +66,7 @@ local function check(label, ok, detail)
     print("PASS  " .. label)
   else
     fails = fails + 1
-    print("FAIL  " .. label .. (detail and ("\n----\n" .. detail .. "\n----") or ""))
+    print("FAIL  " .. label .. (detail ~= nil and ("\n----\n" .. tostring(detail) .. "\n----") or ""))
   end
 end
 
