@@ -237,15 +237,42 @@ check("repeat lookups are served from cache, not the server",
   c.server == 0 and c.cached > 0,
   ("cached spans=%d server spans=%d over %d repeat lookups"):format(c.cached, c.server, #resolved))
 
--- Editing the file must retire the entries rather than serve a stale body.
-profile.clear()
-vim.api.nvim_buf_set_lines(buf, 0, 0, false, { "/* inline-explorer cache invalidation probe */" })
-local _, after_edit = fetch(resolved[1])
-local ce = span_counts()
-check("an edit to the source retires the cached lookup",
-  ce.server > 0, ("cached=%d server=%d"):format(ce.cached, ce.server))
-check("the lookup after an edit still returns a body", after_edit ~= nil)
-vim.cmd("silent! undo")
+-- Editing the DEFINITION's file must retire the entries rather than serve a
+-- stale body. Deliberately not the source buffer: entries are keyed on the
+-- definition file's state, so editing the file you are reading from does not
+-- (and should not) invalidate anything -- and in this file most callees are
+-- defined in this same file, so an edit here would pass for the wrong reason
+-- and the check would prove nothing about the guard it names.
+do
+  local probe = resolved[1]
+  local def_loc
+  do
+    local done = false
+    resolver.locate(probe, buf, function(l)
+      def_loc = l
+      done = true
+    end)
+    vim.wait(30000, function()
+      return done
+    end, 5)
+  end
+
+  if not def_loc then
+    check("located the definition to probe invalidation with", false, probe)
+  else
+    local def_buf = vim.uri_to_bufnr(def_loc.uri)
+    vim.fn.bufload(def_buf)
+    profile.clear()
+    vim.api.nvim_buf_set_lines(def_buf, 0, 0, false, { "/* inline-explorer cache invalidation probe */" })
+    local _, after_edit = fetch(probe)
+    local ce = span_counts()
+    check("an edit to the definition's file retires the cached lookup",
+      ce.server > 0,
+      ("probe=%s def=%s cached=%d server=%d"):format(probe, vim.uri_to_fname(def_loc.uri), ce.cached, ce.server))
+    check("the lookup after an edit still returns a body", after_edit ~= nil)
+    vim.api.nvim_buf_set_lines(def_buf, 0, 1, false, {})
+  end
+end
 
 local function pct(t, p)
   local s = vim.deepcopy(t)

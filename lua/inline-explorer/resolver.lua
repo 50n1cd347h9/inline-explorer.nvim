@@ -123,25 +123,65 @@ function M.locate(name, source_bufnr, cb)
     return cb(nil, "no language server attached to the source buffer")
   end
 
-  -- Keyed on the source buffer's own state: a name resolves through whatever
-  -- that buffer's clients index, and the buffer's own edits can introduce or
-  -- remove the declaration the server answers with.
+  -- Keyed on the client set (which decides what a name can resolve to) plus
+  -- the name, and validated against the DEFINITION file's state rather than
+  -- the source buffer's.
+  --
+  -- Guarding on the source buffer's changedtick was the first attempt and it
+  -- guards the wrong file twice over. It is too strict for the common case:
+  -- a name's definition does not move because you typed a character in the
+  -- file you are reading from, yet every keystroke would throw the whole
+  -- cache away, which is precisely the editing session the cache is for. And
+  -- it is too weak for the case that matters: if the DEFINITION moves, the
+  -- cached range goes stale, extract re-requests documentSymbol with that
+  -- stale range as its reference, `_symbol_range` picks whatever now
+  -- contains it, and the wrong body is spliced -- a wrong answer, not a slow
+  -- one. The definition file's tick catches exactly that.
   local key = client_key(bufnr) .. "\1" .. name
-  local tick = tick_of(bufnr)
-  if tick then
-    local hit = cache_get(M._locate_cache, key, tick)
-    if hit then
-      local span = profile.start()
-      span("locate:cached")
-      return cb(hit, nil)
+  local function loc_tick(loc)
+    -- Only consult a buffer that already exists; uri_to_bufnr would create
+    -- one, and a definition file nobody has opened cannot have been edited
+    -- in this session anyway.
+    local b = vim.fn.bufnr(vim.uri_to_fname(loc.uri))
+    return b ~= -1 and tick_of(b) or nil
+  end
+
+  do
+    local e = M._locate_cache[key]
+    if e then
+      local now_tick = loc_tick(e.value)
+      -- An entry recorded before the definition file was loaded carries no
+      -- tick, and `extract` loads that file moments later -- so by the next
+      -- lookup a tick exists where none was stored. That is a file being
+      -- OPENED, not changed, and treating it as a change threw away roughly
+      -- half of all repeats: CI reported 8 of 12 repeat lookups going back
+      -- to the server while every local run, where the definitions happened
+      -- to live in an already-loaded buffer, hit every time. Adopt the tick
+      -- instead -- but only when the buffer is unmodified, because then its
+      -- content is still what is on disk and therefore still what the server
+      -- indexed when it gave us this range. A buffer with unsaved edits gets
+      -- no such benefit and is retired.
+      if e.tick == nil and now_tick ~= nil then
+        local b = vim.fn.bufnr(vim.uri_to_fname(e.value.uri))
+        if b ~= -1 and not vim.bo[b].modified then
+          e.tick = now_tick
+        end
+      end
+      if e.tick == now_tick then
+        e.at = vim.uv.now()
+        local span = profile.start()
+        span("locate:cached")
+        return cb(e.value, nil)
+      end
+      M._locate_cache[key] = nil
     end
   end
 
   local span = profile.start()
   local finish = once_with_timeout(function(loc, err)
     span(loc and "locate:ok" or "locate:miss")
-    if loc and tick then
-      cache_put(M._locate_cache, key, loc, tick, M._locate_cache_n)
+    if loc then
+      cache_put(M._locate_cache, key, loc, loc_tick(loc), M._locate_cache_n)
     end
     cb(loc, err)
   end, function()
@@ -395,9 +435,16 @@ function M.extract(loc, source_bufnr, cb)
   local ekey = loc.uri .. "\1" .. loc.range.start.line .. ":" .. loc.range.start.character
     .. "\1" .. loc.range["end"].line .. ":" .. loc.range["end"].character
   -- Attachments WE create are cached, not dropped when the request settles:
-  -- re-attaching a definition header makes clangd rebuild its whole preamble
-  -- (measured on linux-6.12, net/sock.h: ~470ms per repeat extract with an
-  -- immediate detach vs ~16ms when the attachment is kept). The least
+  -- re-attaching a definition header makes clangd rebuild its whole preamble.
+  -- Re-measured 2026-07-30 on linux-6.12 (defconfig, clangd 18.1.3, reading
+  -- kernel/sched/core.c, probing include/linux/sched.h, 12 reps after 3
+  -- discarded, our own result caches disabled so this is the server's cost
+  -- and not ours): p50 178.4ms with an immediate detach against 11.0ms with
+  -- the attachment kept -- 16.2x. The figure this comment carried before
+  -- (~470ms against ~16ms) came from an earlier run on a different header
+  -- and had never been reproduced; the ratio holds, the absolute numbers
+  -- did not, so they are replaced with ones that can be re-derived from the
+  -- method above. The least
   -- recently used entries beyond _attach_cache_n are detached instead, so a
   -- long session stays bounded without repaying the preamble every keypress.
   -- A buffer the user actually has in a window is never detached.

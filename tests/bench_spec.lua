@@ -212,6 +212,18 @@ local scenarios = {
   {
     name = "expand:cold",
     action = function(i)
+      -- Every scenario whose baseline describes a SERVER round trip clears
+      -- the resolver's result caches first. Without this they measure the
+      -- cache instead, and silently: the structural invariants above run
+      -- before the scenarios and resolve these very names, so by the time a
+      -- scenario runs its answer is already cached, `extract:warm` never
+      -- fires, the guard rejects every rep, and the population is empty.
+      -- That is not a loud failure -- `expand:warm` is also the noise-floor
+      -- calibration scenario, so an empty population makes the floor
+      -- unmeasurable, which SUSPENDS the whole timing gate while the
+      -- structural invariants still report green. The cached path is
+      -- measured on purpose further down instead.
+      resolver.clear_caches()
       local sym = meta.cold[((i - 1) % #meta.cold) + 1]
       local spans, complete = expand_on(sym .. "%(")
       if complete and bench.count(spans, "^extract:cold") == 1 then
@@ -223,6 +235,7 @@ local scenarios = {
   {
     name = "expand:warm",
     action = function(i)
+      resolver.clear_caches()
       local sym = meta.warm[((i - 1) % #meta.warm) + 1]
       local spans, complete = expand_on(sym .. "%(")
       if complete and bench.count(spans, "^extract:warm") == 1 then
@@ -234,6 +247,7 @@ local scenarios = {
   {
     name = "inline:function",
     action = function()
+      resolver.clear_caches()
       local spans, complete = inline_on(meta.fn_call .. "%(")
       return complete and bench.count(spans, "^total:inline%-function") == 1 and bench.elapsed_ms(spans) or nil
     end,
@@ -244,6 +258,7 @@ local scenarios = {
       -- "%(" alone matches the #define line itself, ahead of the call site in
       -- the generated file; disambiguate with the call's argument, same
       -- idiom as invariant 5 above, so the cursor lands on the invocation.
+      resolver.clear_caches()
       local spans, complete = inline_on(meta.macro_call .. "%(4%)")
       return complete and bench.count(spans, "^total:inline%-macro") == 1 and bench.elapsed_ms(spans) or nil
     end,
@@ -251,6 +266,7 @@ local scenarios = {
   {
     name = "expand:same-file",
     action = function()
+      resolver.clear_caches()
       local spans, complete = expand_on(meta.same_file .. "%(3%)")
       -- Unlike every other scenario above, this one had no span-shape guard
       -- at all: `total:expand-failed` satisfies both `complete` and the
@@ -258,6 +274,34 @@ local scenarios = {
       -- report a (fast) latency and pass. Require exactly one genuine
       -- `total:expand` span, same idiom as the other scenarios' guards.
       return complete and bench.count(spans, "^total:expand$") == 1 and bench.elapsed_ms(spans) or nil
+    end,
+  },
+  {
+    -- The counterpart to the clears above: this one deliberately does NOT
+    -- clear, so it measures the path a user actually repeats -- returning to
+    -- a name already looked up. It is guarded on `extract:cached` for the
+    -- same reason the others are guarded on `extract:cold`/`extract:warm`:
+    -- if the cache ever stops being consulted this population empties and
+    -- says so, rather than quietly measuring a round trip and reporting a
+    -- number that merely looks worse.
+    name = "expand:cached",
+    action = function()
+      local spans, complete = expand_on(meta.warm[1] .. "%(")
+      if complete and bench.count(spans, "^extract:cached") == 1 then
+        return bench.elapsed_ms(spans)
+      end
+      return nil
+    end,
+  },
+  {
+    name = "inline:cached",
+    action = function()
+      local spans, complete = inline_on(meta.fn_call .. "%(")
+      if complete and bench.count(spans, "^total:inline%-function") == 1
+        and bench.count(spans, "^extract:cached") == 1 then
+        return bench.elapsed_ms(spans)
+      end
+      return nil
     end,
   },
 }
