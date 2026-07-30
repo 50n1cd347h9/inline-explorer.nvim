@@ -5,23 +5,39 @@ local C = require("inline-explorer.csrc")
 
 local M = {}
 
--- Collect declarator identifier names visible in the caller's enclosing function.
+-- Declarator identifier names visible where the call sits.
+--
+-- Normally that is the caller's enclosing function. When tree-sitter cannot
+-- build one -- a preprocessor conditional straddling braces turns the region
+-- into an ERROR node, which is ordinary kernel style -- there is no
+-- function_definition ancestor to scope by. Returning nothing there would
+-- switch collision renaming off silently, and a callee parameter sharing a
+-- name with a caller variable would be emitted as `T name = (name);`, whose
+-- initialiser C resolves to the new, uninitialised local. So fall back to the
+-- whole translation unit: this narrows that common silent defect at the cost
+-- of renaming more aggressively than strictly necessary. That trade is only
+-- safe because the rename pass below is total over the callee body -- every
+-- occurrence of a renamed name, call position included, is renamed with it,
+-- so a name the callee declares consistently means the callee's own
+-- declaration everywhere it appears, never a stale reference to whatever it
+-- shadowed.
 function M.enclosing_scope(call, src)
-  local fn = call
-  while fn and fn:type() ~= "function_definition" do
-    fn = fn:parent()
+  local scope = call
+  while scope and scope:type() ~= "function_definition" do
+    local parent = scope:parent()
+    if not parent then
+      break -- no enclosing function: `scope` is now the root, use it
+    end
+    scope = parent
   end
   local set = {}
-  if not fn then
-    return set
-  end
   local qs = {
     "(parameter_declaration declarator: (_) @d)",
     "(init_declarator declarator: (_) @d)",
     "(declaration declarator: (_) @d)", -- covers array/pointer declarators, not just plain identifiers
   }
   for _, q in ipairs(qs) do
-    for _, d in ipairs(C.query_nodes(fn, src, q)) do
+    for _, d in ipairs(C.query_nodes(scope, src, q)) do
       local nm = d:type() == "identifier" and C.text(d, src) or C.decl_name(d, src)
       if nm then
         set[nm] = true
@@ -128,10 +144,12 @@ function M.analyze_callee(callee_src, fname, N, scope)
   if next(rename) then
     for _, id in ipairs(C.query_nodes(body, callee_src, "(identifier) @i")) do
       local r = rename[C.text(id, callee_src)]
-      -- Do not rename the callee of a call (function names live in caller scope).
-      local parent = id:parent()
-      local is_callee = parent and parent:type() == "call_expression" and parent:field("function")[1] == id
-      if r and not is_callee then
+      -- rename's keys are names the callee itself declares (its params and
+      -- top-level body locals), so a renamed name shadows any same-named
+      -- caller-scope function -- every occurrence in the body, including
+      -- `name(...)` in call position, refers to the callee's own
+      -- declaration and must be renamed along with it.
+      if r then
         body_edits[#body_edits + 1] = { C.sb(id), C.eb(id), r }
       end
     end
@@ -154,9 +172,23 @@ function M.analyze_callee(callee_src, fname, N, scope)
 end
 
 -- ctx: everything the printers need to know about the call site.
---   braced          the enclosing statement sits directly inside a {} block
---                   (if not, hoisting printers must wrap in a block: a
---                   declaration cannot follow a bare label / unbraced if body)
+--   braced          lines may be inserted directly above the enclosing
+--                   statement: it sits directly inside a {} block AND starts
+--                   its own line. If not, hoisting printers wrap the statement
+--                   in a block instead -- a declaration cannot follow an
+--                   unbraced if body, and after a bare label (goto or case) a
+--                   declaration is a constraint violation gcc accepts by
+--                   default and diagnoses only under -Wpedantic; a statement
+--                   sharing its line has nothing to insert above but its
+--                   neighbour's line.
+--   wrap_unsafe     wrapping would change meaning, so no hoisting printer may
+--                   run at all: the target is a declaration that cannot be
+--                   hoisted above, either because it does not start its own
+--                   line or because its parent is not a compound_statement
+--                   (it follows a bare label instead), and a declaration's
+--                   scope is the block it sits in, so enclosing it in one
+--                   hides the declared name from the rest of the block (see
+--                   decide).
 --   unconditional   the call is reached unconditionally in a plain statement
 --                   (not in a loop/if header, ?: arm, or after &&/||)
 --   stmt_bol/indent/unit  layout facts; the source's tabs/spaces are preserved
@@ -182,12 +214,32 @@ function M.analyze_context(caller_src, call)
     end
   end
   local stmt_bol = C.sb(target) - C.scol(target)
-  local indent = caller_src:sub(stmt_bol + 1, C.sb(target))
+  local prefix = caller_src:sub(stmt_bol + 1, C.sb(target))
+  -- Indentation is the leading space/tab run (form feed and vertical tab are C
+  -- whitespace too, but are not treated as indentation here). Anything else on
+  -- the line before the statement -- `hits++; f(x);`, `case 1: f(x);`,
+  -- `else f(x);` -- is code, and `indent` taking only space and tab is what
+  -- stops it being copied onto every hoisted line. That copy was a real defect
+  -- for `hits++; f(x);`, where it compiled and re-ran the increment once per
+  -- hoisted line; for the label and `else` shapes the parent is a
+  -- case_statement / if_statement, so `braced` was already false and the
+  -- wrapping printer handled them.
+  --
+  -- `starts_line` is the separate half, and it only bites when the parent IS a
+  -- compound_statement: a statement sharing its line has no line of its own to
+  -- insert above, and inserting at the line's start would put the hoisted
+  -- setup BEFORE the neighbouring statement -- reading an argument the
+  -- neighbour goes on to mutate. So it is not a hoist target: treat it like an
+  -- unbraced body and let the wrapping printer replace it in place.
+  local starts_line = prefix:match("^[ \t]*$") ~= nil
+  local indent = prefix:match("^[ \t]*")
   local parent_t = target:parent() and target:parent():type()
+  local braced = starts_line and parent_t == "compound_statement"
   return {
     call = call,
     target = target,
-    braced = parent_t == "compound_statement",
+    braced = braced,
+    wrap_unsafe = t == "declaration" and not braced,
     unconditional = unconditional,
     stmt_bol = stmt_bol,
     indent = indent,
@@ -202,6 +254,22 @@ end
 --                   not preserve semantics (documented trade-off)
 --   canonical       the always-correct GNU statement expression + goto form
 function M.decide(ir, ctx, mode)
+  -- Both hoisting printers fall back to wrapping the target in a block when it
+  -- is not `braced`, and that is scope-neutral for a statement but not for a
+  -- declaration: the declared name would become local to the new block and the
+  -- rest of the enclosing block would see whatever it shadowed instead --
+  -- compiling silently, running differently. The canonical printer splices
+  -- `({ ... })` where the call was and never moves the declaration, so it is
+  -- the only safe rendering -- and canonical form is not just `({...})`: it
+  -- always rewrites every `return` via `goto __ie_endN;` / `__ie_endN:;` to
+  -- reach the result, regardless of how many returns the callee has. This
+  -- holds in readable mode too: readable's contract is that it never emits
+  -- `({...})` OR `goto`, and this is its one exception, suspending the whole
+  -- no-statement-expression-and-no-goto guarantee for this one case, because
+  -- the alternative is wrong rather than merely ugly.
+  if ctx.wrap_unsafe then
+    return "canonical"
+  end
   if ir.simple and (mode == "readable" or ctx.unconditional) then
     return "pretty"
   end

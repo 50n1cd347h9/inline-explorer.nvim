@@ -188,6 +188,21 @@ The `mode` option chooses the output style (toggle live with
   the body top-to-bottom. Prettier, but **not guaranteed to compile or preserve
   semantics** for functions with early returns / labels / short-circuits.
 
+`readable` has exactly one exception, and it suspends the whole
+no-`({...})`-and-no-`goto` guarantee, not just the `({...})` half: a call
+inside a *declaration* that cannot be hoisted, either because it does not
+start its own line (`if (a > 0) { int v = f(a); ... }`) or because it follows
+a bare label instead of sitting directly in a `{}` block (`L: int v = f(a);`,
+or the same after a `case`/`default` label — gcc accepts a declaration there
+by default and only `-Wpedantic` objects). The usual fallback — wrapping the
+declaration in a block — would make the declared name local to that block, so
+the rest of the enclosing block would silently read whatever it shadowed.
+Both modes render it as a statement expression instead — always with a
+`goto __ie_endN;`/`__ie_endN:;` pair, since the canonical printer rewrites
+every `return` that way regardless of how many the callee has — which
+splices in place and leaves scope alone. Correctness outranks the stylistic
+promise.
+
 ```lua
 require("inline-explorer").setup({ mode = "correct" }) -- or "readable"
 ```
@@ -197,9 +212,116 @@ require("inline-explorer").setup({ mode = "correct" }) -- or "readable"
 Correctness is verified on **real OSS**, not just hand-written snippets:
 
 - `tests/real_cjson_spec.lua` clones [cJSON](https://github.com/DaveGamble/cJSON)
-  and, for **every** in-file call to a same-file static function, applies
-  correct-mode substitution then has gcc **rebuild and run cJSON's test suite**.
-  Every transform the engine accepts must compile and pass.
+  (pinned to tag `v1.7.19`) and, for **every** in-file call to a same-file
+  static function, applies correct-mode substitution then has gcc **rebuild
+  and run cJSON's test suite**. Every transform the engine accepts must
+  compile and pass; today that is 188 out of 188.
+- `tests/real_zlib_spec.lua` does the same against
+  [zlib](https://github.com/madler/zlib) (pinned to tag `v1.3.1`), a
+  different flavour of C from cJSON's: state machines, goto-based error
+  handling, bit manipulation, and functions declared through zlib's own
+  `#define local static` macro. Adding it found **three real engine
+  defects**, all now fixed: a caller whose parse tree has a preprocessor
+  conditional straddling braces (ordinary kernel style) got an
+  `ERROR`-node ancestor instead of a `function_definition`, silently
+  switching off collision-renaming; a call whose statement did not start
+  its own line (`hits++; f(x);`, `case 1: f(x);`, `else f(x);`) got the
+  preceding code copied onto every hoisted line, which compiled but ran
+  the wrong thing; and a project macro in type position (zlib's `local`)
+  was mistaken for the real return type, which gcc only warns about by
+  default and `-pedantic-errors` rejects outright. All three are pinned as
+  regression cases in `tests/substitute_spec.lua`.
+
+  What is left after those fixes is **8 residual failures**, pinned as an
+  **exact set** (`known_failures` in `real_zlib_spec.lua`) rather than a
+  bare count or a one-directional suppression list: the harness fails the
+  run if a failure appears that is not on the list (a regression) OR if an
+  entry on the list stops failing (fixed without the list being updated —
+  a suppression list nobody has to maintain stops meaning anything). All
+  eight are documented engine LIMITS, not silently-ignored bugs:
+
+  - **One** (`adler32_z`) is a macro whose own body hardcodes an
+    identifier instead of routing it through the macro's parameter list,
+    so renaming that identifier for collision safety changes which
+    variable the expanded macro touches — a wrong VALUE, not a syntax
+    error, so it is caught only by rebuilding and running the project's
+    own tests.
+  - **Six** (`deflateEnd`, `deflateReset`, `deflate`, `deflate_stored`,
+    `deflate_huff`, `deflate_rle`) call a helper function or macro whose
+    own definition sits later in the same file than the call site the
+    callee's body is being spliced into — true at the helper's original
+    position, but not at the earlier position the splice lands at.
+  - **One** (`gzvprintf`) takes a `va_list` parameter, which cannot be
+    given a copy initializer in C (only `va_copy` may do that).
+
+  Alongside `verify` (rebuild + run the project's own tests), a second,
+  **deterministic** gate runs on every accepted transform:
+  `gcc -fsyntax-only -Werror=implicit-function-declaration
+  -Werror=implicit-int`. `verify` is a round trip (compress then
+  decompress and compare), so it cannot see a SYMMETRIC break — making
+  `adler32()` return a constant leaves both directions agreeing on the
+  same wrong checksum, and the round trip passes regardless. The syntax
+  gate has no such blind spot for the other 7 residual failures — each is
+  an identifier the gate either resolves or does not, deterministically —
+  but measuring (not assuming) what it actually buys: disabling the gate
+  and rerunning the full spec reproduces the identical counts and the
+  identical 8 failures via `make test`'s own build, with zlib's default
+  `CFLAGS` and no `-Werror` anywhere. All 7 are hard, deterministic
+  `error:`/`undefined reference` failures under the plain build too, not
+  something that depends on an uninitialised stack slot. The gate's real,
+  demonstrated value is speed — one `-fsyntax-only` pass over a single
+  file instead of a full rebuild and test run — and a cleaner,
+  single-file diagnostic, not catching a break the plain build would
+  otherwise miss. (`adler32_z`'s defect is a wrong value rather than an
+  unresolved identifier, so it is invisible to the syntax gate regardless;
+  only `verify`'s round trip catches it.)
+
+  Both specs' clones are pinned to a tag, not each project's default
+  branch: an unpinned clone drifts as upstream commits land, silently
+  moving the summary numbers and the `known_failures` exact-set pin for a
+  reason that has nothing to do with this plugin.
+
+  The summary line each spec prints is not just "how many passed":
+
+  ```
+  real zlib: sites=238  skipped-ambiguous=28  dead-branch=33  engine-accepted=177  built+passed=169  unverifiable-files=0  unverifiable-dead-sites=0
+  ```
+
+  - **`sites`** — every in-file call to an in-file function the harness
+    looked at.
+  - **`skipped-ambiguous`** — declined outright as genuinely ambiguous
+    without a preprocessor: the callee name has more than one definition
+    in the file, or the same name is also a macro. Not attempted at all.
+  - **`dead-branch`** — a single, unambiguous definition, but this
+    particular call site's own line does not survive the project's own
+    `gcc -E` in this build (e.g. it lives under an `#ifdef` this harness's
+    `./configure` never activates). The engine is never asked to
+    transform it, so it counts as **neither accepted nor passed** —
+    crediting it as either would report a transform as verified that gcc
+    never actually compiled.
+  - **`engine-accepted`** — the engine returned a transform for this site
+    (as opposed to declining it, e.g. for an arity it cannot match).
+  - **`built+passed`** — of the accepted transforms, how many both
+    compiled (or, for zlib, passed the deterministic `gcc -fsyntax-only`
+    gate too) AND left the project's own test suite passing. **This is
+    the only number that means "verified correct."** `engine-accepted`
+    minus `built+passed` is the failure count reported in `FAILURE(S)`
+    below the summary line (pinned exactly for zlib, expected to be zero
+    for cJSON).
+  - **`unverifiable-files`** / **`unverifiable-dead-sites`** — both exist
+    so that a site the harness could not confidently classify is visible
+    rather than silently folded into a bucket it does not belong in. A
+    `#line` directive or a failed `gcc -E` makes a whole file's
+    dead-branch check untrustworthy (`unverifiable-files`); a call
+    site whose blank-content dead-branch reading is contradicted by its
+    own callee token surviving on a neighbouring line — the shape where a
+    call sits inside a different, enclosing multi-line macro invocation —
+    is flagged per-site instead (`unverifiable-dead-sites`). Both fail
+    open into "attempted" rather than being dropped, and both are counted
+    here rather than left to a per-file `print()` a monitoring grep would
+    never see, so a reader does not mistake a site nobody actually
+    verified for one that quietly passed.
+
 - `tests/substitute_spec.lua` compiles+runs a focused set of shaped cases
   (pointers, early returns, labels, collisions, void, a kernel-style accessor).
 - `tests/properties_spec.lua` and `tests/pbt_spec.lua` add **property-based
@@ -222,11 +344,18 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
 
 ```sh
 nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!"
+nvim --headless --clean -u NONE -c "luafile tests/real_zlib_spec.lua" -c "qa!"
 nvim --headless --clean -u NONE -c "luafile tests/substitute_spec.lua" -c "qa!"
 nvim --headless --clean -u NONE -c "luafile tests/properties_spec.lua" -c "qa!"
 IE_PBT_CASES=100 IE_PBT_SEED=42 \
   nvim --headless --clean -u NONE -c "luafile tests/pbt_spec.lua" -c "qa!"
 ```
+
+Both real-source specs require `git` + network + `gcc` (zlib also needs `make`)
+and skip cleanly if any is missing — except in CI, where `tests/real_zlib_spec.lua`
+is specifically NOT allowed to skip (see the `real-source` job in
+`.github/workflows/test.yml`): a clone or toolchain failure there must show up
+as a red build, not a quietly-skipped green one.
 
 Limitations: macros and variadic functions are not inlinable this way; the current
 action rewrites the whole view buffer, so it resets any block-expansion folds in

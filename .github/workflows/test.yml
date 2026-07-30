@@ -25,21 +25,73 @@ jobs:
             if echo "$out" | grep -q "FAILURE"; then echo "FAILED: $s"; exit 1; fi
           done
 
-  real-cjson:
+  real-source:
+    # Runs on push AND pull_request (unlike perf-regression below): a job
+    # gated to `push` only is silently absent from a PR's checks, and GitHub
+    # treats an absent required check as satisfied rather than pending or
+    # failed -- the same false-green class this branch's whole
+    # known_failures pin exists to close. zlib's leg (`allow_skip: "false"`
+    # below) is exactly the job whose entire point is proving the pin
+    # holds; skipping it on every PR and only ever running it after merge
+    # would mean a broken pin is discovered on main, not caught before.
+    # The run costs ~2-4 minutes (clone + configure + up to 177 rebuilds);
+    # that is not expensive enough to justify leaving PRs unchecked.
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # cJSON has no residual known_failures (188/188/188): its own
+          # tests hit none of the engine limits zlib's C exercises (goto-based
+          # state machines, macros defined later in a file, va_list). It also
+          # depends on the network for its clone, so a SKIP: here is allowed
+          # -- an offline runner should not fail the build.
+          - spec: real_cjson_spec
+            name: cJSON
+            allow_skip: "true"
+          # zlib DOES pin known_failures (an exact set -- see
+          # tests/real_zlib_spec.lua), so success here means the pin
+          # matched, not that there were zero failures. A SKIP: is NOT
+          # allowed: unlike cJSON this job's whole point is to prove the
+          # pin holds, and a clone/configure/baseline failure silently
+          # reported as SKIP: would otherwise read as green in the exact
+          # same way an untested spec would -- indistinguishable from
+          # actually having run and passed.
+          - spec: real_zlib_spec
+            name: zlib
+            allow_skip: "false"
     steps:
       - uses: actions/checkout@v4
       - name: Install Neovim
         run: |
           curl -sL https://github.com/neovim/neovim/releases/download/v0.11.3/nvim-linux-x86_64.tar.gz | tar xz
           echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
-      - name: Real-source regression (cJSON)
+      - name: Real-source regression (${{ matrix.name }})
         run: |
-          out=$(nvim --headless --clean -u NONE -c "luafile tests/real_cjson_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+          out=$(nvim --headless --clean -u NONE -c "luafile tests/${{ matrix.spec }}.lua" -c "qa!" 2>&1 | tr '\r' '\n')
           echo "$out"
-          echo "$out" | grep -Eq "ALL ACCEPTED TRANSFORMS COMPILE \+ PASS|SKIP:" || { echo "FAILED: real_cjson_spec"; exit 1; }
-          if echo "$out" | grep -q "FAILURE"; then echo "FAILED"; exit 1; fi
+          if echo "$out" | grep -q "^SKIP:"; then
+            if [ "${{ matrix.allow_skip }}" = "true" ]; then
+              echo "SKIPPED (network or toolchain unavailable) -- allowed for ${{ matrix.name }}"
+              exit 0
+            fi
+            echo "FAILED: ${{ matrix.name }} spec printed SKIP: -- not treated as success for this job"
+            exit 1
+          fi
+          if echo "$out" | grep -q "KNOWN-FAILURES PIN"; then
+            # This spec pins its residual failures as an exact set (see
+            # real_source.lua's known_failures handling): success means the
+            # pin matched -- an unlisted failure (regression) or a listed
+            # failure that stopped failing (fix nobody updated the list
+            # for) both print "KNOWN-FAILURES PIN MISMATCH -- FAILURE"
+            # instead of "... PIN OK", so checking for the bare word
+            # FAILURE below would not work here -- a pinned, EXPECTED
+            # failure also prints in the ordinary FAILURE(S) block above.
+            echo "$out" | grep -q "KNOWN-FAILURES PIN OK" || { echo "FAILED: ${{ matrix.name }} known_failures pin mismatch"; exit 1; }
+          else
+            echo "$out" | grep -q "ALL ACCEPTED TRANSFORMS COMPILE + PASS" || { echo "FAILED: ${{ matrix.name }} spec (no pass banner)"; exit 1; }
+            if echo "$out" | grep -q "FAILURE"; then echo "FAILED: ${{ matrix.name }} spec"; exit 1; fi
+          fi
 
   perf-regression:
     runs-on: ubuntu-latest
