@@ -127,6 +127,9 @@ Open a file (with a language server attached), then:
 | `u` / `<C-r>` | —                           | Undo / redo the last expansion (inside the view)    |
 | `]e` / `[e`   | `:InlineExplorerNext`/`Prev`| Jump to the next / previous expansion block         |
 | `<leader>el`  | `:InlineExplorerList`       | Expansion blocks in the location list               |
+| `<leader>eu`  | `:InlineExplorerCallers`    | Pick a caller of the function under the cursor; the view switches there |
+| `gd`          | —                           | Jump the view to the definition under the cursor (view-local) |
+| `<C-o>` / `<C-i>` | `:InlineExplorerTrail`  | Back / forward along the navigation trail (view-local); the command lists it |
 | `<leader>eq`  | `:InlineExplorerClose`      | Close the reading view                              |
 
 Expansions nest: move the cursor onto any function/macro inside an expanded body
@@ -142,6 +145,23 @@ re-fetched.
 For deep sessions, `require("inline-explorer").breadcrumb()` returns the chain
 of expansions the cursor is inside (`do_work > helper`), empty outside a view —
 drop it into your statusline.
+
+## Moving, not just expanding
+
+Expansion reads downward in place. Two more movements complete the set:
+`gd` jumps the whole view to a definition, and `<leader>eu` lists who calls
+the function under the cursor — pick one and the view switches to that
+caller. Both push the view you left onto a trail; `<C-o>`/`<C-i>` walk it,
+and every view on the trail stays alive, so going back restores your
+expansions exactly as you left them.
+
+Caller lists are labelled with their source: `[lsp]` is the server's index
+(resolves identity, but silently incomplete while indexing), `[grep]` is a
+text search confirmed by tree-sitter (sees calls through macros, but cannot
+tell two same-named statics apart). Zero callers never opens an empty
+picker — you get a notification instead, because "no callers found" and
+"the index has not finished" are indistinguishable and the UI must not
+pretend otherwise.
 
 > Tip: until your keymaps are sorted, drive it entirely by command
 > (`:InlineExplorerOpen`, then `:InlineExplorerExpand` on a symbol). The commands

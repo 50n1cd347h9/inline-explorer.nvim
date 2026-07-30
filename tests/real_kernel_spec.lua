@@ -279,6 +279,50 @@ local function pct(t, p)
   table.sort(s)
   return s[math.max(1, math.ceil(#s * p / 100))]
 end
+-- Navigation on the real workload: callHierarchy against real clangd, and
+-- the trail preserving a view across a switch. Span/count gates only.
+do
+  local callers = require("inline-explorer.callers")
+  local trail = require("inline-explorer.trail")
+  local view = require("inline-explorer.view")
+
+  -- resched_curr is defined and called in this file many times.
+  local done, items, source = false, nil, nil
+  vim.api.nvim_set_current_buf(buf)
+  local defline = nil
+  for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    if l:match("^void resched_curr") or l:match("^static.*resched_curr") then
+      defline = i
+      break
+    end
+  end
+  if defline then
+    vim.api.nvim_win_set_cursor(0, { defline, 6 })
+  end
+  callers.get("resched_curr", buf, function(i2, s2)
+    items, source = i2, s2
+    done = true
+  end)
+  vim.wait(60000, function() return done end, 20)
+  check("kernel callers: non-empty from real clangd or labelled grep",
+    done and items ~= nil and #items > 0, ("source=%s n=%s"):format(tostring(source), items and #items))
+
+  -- Trail across a real switch: the origin view must come back by identity.
+  local v0 = view.open(buf)
+  local before = vim.api.nvim_buf_line_count(v0)
+  if items and #items > 0 then
+    trail.goto_location(items[1])
+    local v1 = vim.api.nvim_get_current_buf()
+    check("kernel trail: switch lands in a view", view.state[v1] ~= nil)
+    trail.back()
+    check("kernel trail: back restores the SAME buffer",
+      vim.api.nvim_get_current_buf() == v0)
+    check("kernel trail: line count unchanged across the round trip",
+      vim.api.nvim_buf_line_count(v0) == before)
+  end
+  trail.clear()
+end
+
 print(("\nreal kernel: %s  attach=%.0fms  first p50=%.1fms p90=%.1fms  repeat p50=%.1fms p90=%.1fms  n=%d")
   :format(TARGET, attach_ms, pct(first_ms, 50), pct(first_ms, 90),
     pct(second_ms, 50), pct(second_ms, 90), #resolved))

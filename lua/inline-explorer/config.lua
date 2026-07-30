@@ -12,6 +12,10 @@ M.defaults = {
     next_block = "]e", -- jump to the next expansion block (buffer-local)
     prev_block = "[e", -- jump to the previous expansion block (buffer-local)
     list_blocks = "<leader>el", -- expansion blocks in the location list
+    callers = "<leader>eu", -- callers picker (view-local; also :InlineExplorerCallers)
+    goto_def = "gd", -- jump the VIEW to the definition under the cursor (view-local)
+    trail_back = "<C-o>", -- back along the navigation trail (view-local)
+    trail_forward = "<C-i>", -- forward along the navigation trail (view-local)
   },
   indent = "  ", -- indent prepended to each expansion level
   header = true, -- wrap each expansion in `/* v name */ ... /* ^ name */`

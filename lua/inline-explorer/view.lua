@@ -7,9 +7,15 @@ M.ns = vim.api.nvim_create_namespace("inline_explorer")
 -- view_bufnr -> { source_bufnr, nodes = { { name, s_mark, e_mark }, ... } }
 M.state = {}
 
--- Open a reading view for the current buffer and switch to it.
-function M.open()
-  local src = vim.api.nvim_get_current_buf()
+-- Open a reading view and switch to it. `src` selects the source buffer;
+-- omitted, the current buffer is used. The guard is not decoration: user
+-- commands (InlineExplorerOpen) call this with the command-opts TABLE as
+-- the first argument, so anything that is not a buffer number must mean
+-- "current buffer".
+function M.open(src)
+  if type(src) ~= "number" then
+    src = vim.api.nvim_get_current_buf()
+  end
   if M.state[src] then
     vim.notify("[inline-explorer] already in a reading view", vim.log.levels.INFO)
     return
@@ -67,6 +73,24 @@ function M.open()
   if km.list_blocks then
     vim.keymap.set("n", km.list_blocks, nav.list, { buffer = view, desc = "Inline Explorer: list expansion blocks" })
   end
+  local trail = require("inline-explorer.trail")
+  local pick = require("inline-explorer.pick")
+  if km.callers then
+    vim.keymap.set("n", km.callers, function() pick.callers() end,
+      { buffer = view, desc = "Inline Explorer: callers of the function under the cursor" })
+  end
+  if km.goto_def then
+    vim.keymap.set("n", km.goto_def, function() pick.definition() end,
+      { buffer = view, desc = "Inline Explorer: jump the view to the definition" })
+  end
+  if km.trail_back then
+    vim.keymap.set("n", km.trail_back, trail.back,
+      { buffer = view, desc = "Inline Explorer: back along the trail" })
+  end
+  if km.trail_forward then
+    vim.keymap.set("n", km.trail_forward, trail.forward,
+      { buffer = view, desc = "Inline Explorer: forward along the trail" })
+  end
   return view
 end
 
@@ -77,6 +101,8 @@ function M.close()
     vim.notify("[inline-explorer] not in a reading view", vim.log.levels.WARN)
     return
   end
+  -- Closing the view ends the journey: every stacked view goes with it.
+  require("inline-explorer.trail").clear()
   M.state[view] = nil
   vim.api.nvim_buf_delete(view, { force = true })
 end

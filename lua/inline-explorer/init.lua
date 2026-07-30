@@ -51,6 +51,13 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("InlineExplorerNext", nav.next, { desc = "Jump to the next expansion block" })
   vim.api.nvim_create_user_command("InlineExplorerPrev", nav.prev, { desc = "Jump to the previous expansion block" })
   vim.api.nvim_create_user_command("InlineExplorerList", nav.list, { desc = "List expansion blocks in the location list" })
+  local pick = require("inline-explorer.pick")
+  local trail = require("inline-explorer.trail")
+  vim.api.nvim_create_user_command("InlineExplorerCallers", function()
+    pick.callers()
+  end, { desc = "Pick a caller of the function under the cursor and go there" })
+  vim.api.nvim_create_user_command("InlineExplorerTrail", trail.list,
+    { desc = "The navigation trail in the location list" })
 
   local map = vim.keymap.set
   local km = o.keymaps
