@@ -89,13 +89,18 @@ end
 -- which is what we want. Callers must not expect the profile report to
 -- survive a capture -- it owns the ring for the duration of the call.
 --
--- With the instrumentation as it stands today, the plugin records nothing
--- after an action's final `total:` span (the inliner records total after
--- the rewrite, the expander after the splice, and the resolver's/macro's
--- timeout guards drop late responses without recording a span at all), so
--- window attribution above is exact, not merely approximate. If that ever
--- changes -- an instrumented call after the final total: gets added -- this
--- becomes approximate and would need revisiting.
+-- Window attribution is exact for every action that does not hit an
+-- extract timeout. One instrumented call CAN land after the final
+-- `total:` span: the resolver's retry-after-timeout probe fires a
+-- background documentSymbol whose extract:retry-* span arrives late by
+-- design (a real log shows it printing after total:inline-function).
+-- That is reachable only when an extract timed out, which never happens
+-- against the healthy in-process fixtures here -- and if it did, the
+-- late span would land in this capture's settle window and flip
+-- `complete` false, failing the scenario loudly rather than skewing a
+-- number silently. An earlier version of this paragraph claimed nothing
+-- is ever recorded after total:, which the retry probe had already made
+-- false.
 --
 -- `opts.settle_cap_ms` (default 300, floored at 120ms) is the settle wait
 -- below -- the observation window for a multi-phase action such as a

@@ -1,5 +1,5 @@
 -- Random C generator for the property-based tests: small callees drawn from a
--- UB-free statement pool, spliced into one of 9 caller contexts, plus greedy
+-- UB-free statement pool, spliced into one of 11 caller contexts, plus greedy
 -- shrinking. Everything is deterministic: the only randomness source is the
 -- Park-Miller LCG below, so a seed fully reproduces a case.
 --
@@ -151,7 +151,8 @@ function M.case(r)
   return case
 end
 
--- The 9 caller contexts. CALL is replaced by the call expression.
+-- The 11 caller contexts. CALL is replaced by the call expression.
+-- (An earlier comment said 9; two contexts were added without updating it.)
 local CONTEXTS = {
   "    int r = CALL;\n    return r;",
   "    return CALL + 1;",

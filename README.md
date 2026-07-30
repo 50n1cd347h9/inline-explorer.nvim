@@ -242,7 +242,9 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
 
 - `tests/real_cjson_spec.lua` clones [cJSON](https://github.com/DaveGamble/cJSON)
   (pinned to tag `v1.7.19`) and, for **every** in-file call to a same-file
-  static function, applies correct-mode substitution then has gcc **rebuild
+  function (static or not -- the harness has no storage-class filter, and a
+  third of the 188 sites call CJSON_PUBLIC functions), applies correct-mode
+  substitution then has gcc **rebuild
   and run cJSON's test suite**. Every transform the engine accepts must
   compile and pass; today that is 188 out of 188.
 - `tests/real_kernel_spec.lua` runs against real Linux kernel source
@@ -270,8 +272,9 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
   target file — the spec verifies that itself, because a database of host
   tools only (which is what a partial kernel build leaves behind) would
   let clangd guess flags and every result would describe something other
-  than kernel code. Point `IE_KERNEL_DIR` at the tree. CI builds a single
-  object (`make kernel/sched/core.o`) rather than the whole kernel, and
+  than kernel code. Point `IE_KERNEL_DIR` at the tree. CI builds two
+  objects (`make kernel/sched/core.o mm/slub.o` — the second feeds the
+  kfree end-to-end check) rather than the whole kernel, and
   does **not** accept a `SKIP:` as green.
 
 - `tests/real_zlib_spec.lua` does the same against
@@ -447,17 +450,25 @@ Defaults:
 ```lua
 require("inline-explorer").setup({
   keymaps = {
-    substitute = "<leader>ei", -- smart inline (in place); the primary action
-    expand = "<leader>ee",     -- explicit block-paste (also the fallback)
-    toggle_fold = "<leader>ec",
-    open = "<leader>eo",
-    close = "<leader>eq",
-    undo = "u",                -- buffer-local to the view
-    redo = "<C-r>",            -- buffer-local to the view
+    substitute = "<leader>ei",  -- smart inline (functions in place, macros expanded; else block)
+    expand = "<leader>ee",      -- explicit block-paste expand
+    toggle_fold = "<leader>ec", -- fold / unfold the expansion under the cursor
+    open = "<leader>eo",        -- open a reading view
+    close = "<leader>eq",       -- close the reading view
+    undo = "u",                 -- undo the last expansion (view-local)
+    redo = "<C-r>",             -- redo (view-local)
+    next_block = "]e",          -- next expansion block (view-local)
+    prev_block = "[e",          -- previous expansion block (view-local)
+    list_blocks = "<leader>el", -- expansion blocks in the location list
+    callers = "<leader>eu",     -- callers picker (view-local)
+    goto_def = "gd",            -- jump the view to a definition (view-local)
+    trail_back = "<C-o>",       -- back along the navigation trail (view-local)
+    trail_forward = "<C-i>",    -- forward along the trail (view-local)
   },
-  indent = "  ", -- indent added per expansion level
-  header = true, -- wrap each expansion in /* v name */ ... /* ^ name */
-  mode = "correct", -- inline-substitution output: "correct" | "readable"
+  indent = "  ",   -- indent prepended to each expansion level
+  header = true,   -- wrap expansions in /* v name */ ... /* ^ name */
+  mode = "correct", -- inline-substitution output style ("correct" | "readable")
+  profile = false, -- per-stage latency recording (:InlineExplorerProfile)
 })
 ```
 

@@ -418,9 +418,35 @@ do
   check("kernel callers: non-empty from real clangd or labelled grep",
     done and items ~= nil and #items > 0, ("source=%s n=%s"):format(tostring(source), items and #items))
 
-  -- Trail across a real switch: the origin view must come back by identity.
+  -- Trail across a real switch: the origin view must come back by identity
+  -- WITH ITS EXPANSIONS. The nav spec promises expansion state preserved
+  -- across switch-and-back; asserting only buffer identity and line count
+  -- would hold for an empty view too, so a real expansion is created
+  -- first -- through the real expander against real clangd -- and its
+  -- node count and the grown line count are what must survive.
   local v0 = view.open(buf)
+  do
+    local placed = false
+    for i, l in ipairs(vim.api.nvim_buf_get_lines(v0, 0, -1, false)) do
+      local c = l:find("resched_curr%(")
+      if c and not l:find("^void resched_curr") and not l:find("^static") then
+        vim.api.nvim_win_set_cursor(0, { i, c - 1 })
+        placed = true
+        break
+      end
+    end
+    if placed then
+      local before_lines = vim.api.nvim_buf_line_count(v0)
+      require("inline-explorer.expander").expand()
+      vim.wait(30000, function()
+        return vim.api.nvim_buf_line_count(v0) > before_lines
+      end, 20)
+    end
+  end
+  local nodes_before = #(view.state[v0].nodes or {})
   local before = vim.api.nvim_buf_line_count(v0)
+  check("kernel trail: an expansion exists before the switch",
+    nodes_before > 0, nodes_before)
   if items and #items > 0 then
     trail.goto_location(items[1])
     local v1 = vim.api.nvim_get_current_buf()
@@ -428,8 +454,11 @@ do
     trail.back()
     check("kernel trail: back restores the SAME buffer",
       vim.api.nvim_get_current_buf() == v0)
-    check("kernel trail: line count unchanged across the round trip",
-      vim.api.nvim_buf_line_count(v0) == before)
+    check("kernel trail: the expansion survived the round trip",
+      #(view.state[v0].nodes or {}) == nodes_before
+        and vim.api.nvim_buf_line_count(v0) == before,
+      ("nodes %d->%d lines %d->%d"):format(nodes_before, #(view.state[v0].nodes or {}),
+        before, vim.api.nvim_buf_line_count(v0)))
   end
   trail.clear()
 end
