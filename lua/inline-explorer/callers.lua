@@ -9,6 +9,8 @@
 -- every textual call, including through macros the AST cannot follow, but
 -- cannot tell two same-named statics apart. The label is what tells the
 -- user which contract they are looking at.
+local C = require("inline-explorer.csrc")
+
 local M = {}
 
 M._timeout_ms = 4000
@@ -24,7 +26,18 @@ local function sort_items(items)
   return items
 end
 
+-- The hit line for an LSP item: through the loaded buffer when one
+-- exists, from disk otherwise. The grep path does not come here at all --
+-- it slices lines out of the file text it already read for tree-sitter
+-- confirmation (measured before that change: 170-190 redundant prefix
+-- reads per invocation, 150k-200k lines re-read, 25-33ms, for content
+-- already sitting in memory).
 local function line_text(path, lnum0)
+  local b = vim.fn.bufnr(path)
+  if b ~= -1 and vim.api.nvim_buf_is_loaded(b) then
+    local l = vim.api.nvim_buf_get_lines(b, lnum0, lnum0 + 1, false)[1]
+    return l and vim.trim(l) or ""
+  end
   local lines = vim.fn.readfile(path, "", lnum0 + 2)
   local l = lines[lnum0 + 1]
   return l and vim.trim(l) or ""
@@ -34,13 +47,23 @@ end
 -- confirms each hit is the callee of a call_expression and names the
 -- enclosing function. Parsed per FILE, not per hit.
 local function grep_callers(name, root, cb)
-  local cmd
+  -- The cap is enforced at the PRODUCER. Consuming only the first
+  -- _grep_max lines of a completed run still paid for the whole run:
+  -- measured for kfree over a kernel tree, rg buffered 6.3MB / 40,324
+  -- hits in ~200ms where a head-stopped pipe finishes in single-digit
+  -- ms -- and which 200 survived varied run to run, so the item set was
+  -- nondeterministic on top of slow. head closes the pipe at the cap and
+  -- rg dies on the SIGPIPE; the +1 line is how the consumer detects
+  -- truncation without a second source of truth.
+  local shellcmd
   if vim.fn.executable("rg") == 1 then
-    cmd = { "rg", "--vimgrep", "--word-regexp", "--max-count", "50", name, root }
+    shellcmd = ("rg --vimgrep --word-regexp --max-count 50 %s %s | head -n %d")
+      :format(vim.fn.shellescape(name), vim.fn.shellescape(root), M._grep_max + 1)
   else
-    cmd = { "grep", "-rnw", name, root }
+    shellcmd = ("grep -rnw %s %s | head -n %d")
+      :format(vim.fn.shellescape(name), vim.fn.shellescape(root), M._grep_max + 1)
   end
-  vim.system(cmd, { text = true }, function(out)
+  vim.system({ "sh", "-c", shellcmd }, { text = true }, function(out)
     local hits_by_file, n, truncated = {}, 0, false
     for line in (out.stdout or ""):gmatch("[^\n]+") do
       -- rg --vimgrep: file:line:col:text   grep -rnw: file:line:text
@@ -74,13 +97,10 @@ local function grep_callers(name, root, cb)
     vim.schedule(function()
       local items = {}
       for file, hits in pairs(hits_by_file) do
-        local ok, src = pcall(function()
-          return table.concat(vim.fn.readfile(file), "\n")
-        end)
+        local ok, flines = pcall(vim.fn.readfile, file)
         if ok then
-          local pok, root_node = pcall(function()
-            return vim.treesitter.get_string_parser(src, "c"):parse()[1]:root()
-          end)
+          local src = table.concat(flines, "\n")
+          local pok, root_node = pcall(C.parse, src)
           if pok then
             for _, h in ipairs(hits) do
               local node = root_node:named_descendant_for_range(h.lnum, h.col, h.lnum, h.col)
@@ -90,11 +110,8 @@ local function grep_callers(name, root, cb)
               while nd do
                 if nd:type() == "call_expression" then
                   local fn = nd:field("function")[1]
-                  if fn then
-                    local _, _, a, _, _, b = fn:range(true)
-                    if src:sub(a + 1, b) == name then
-                      is_call = true
-                    end
+                  if fn and C.text(fn, src) == name then
+                    is_call = true
                   end
                   break
                 end
@@ -106,7 +123,6 @@ local function grep_callers(name, root, cb)
                 local up = node
                 while up do
                   if up:type() == "function_definition" then
-                    local C = require("inline-explorer.csrc")
                     local fd = C.func_declarator(up:field("declarator")[1])
                     encl = (fd and C.decl_name(fd:field("declarator")[1], src)) or "?"
                     break
@@ -118,7 +134,7 @@ local function grep_callers(name, root, cb)
                   uri = vim.uri_from_fname(file),
                   range = { start = { line = h.lnum, character = h.col },
                     ["end"] = { line = h.lnum, character = h.col + #name } },
-                  text = line_text(file, h.lnum),
+                  text = vim.trim(flines[h.lnum + 1] or ""), -- sliced from the read we already did
                 }
               end
             end

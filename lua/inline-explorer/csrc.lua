@@ -321,11 +321,22 @@ function M.find_function_def(root, src, name)
   end
 end
 
-function M.find_calls(root, src, name)
+-- Calls to `name` under `root`, as call_expression nodes. `limit`, when
+-- given, stops the walk at the limit-th match: the common caller wants
+-- occurrence 1, and collecting every call in the file first paid the
+-- whole-file walk for it -- 28.9ms on a 22k-line kernel file against
+-- 0.7ms stopping early (p50/11). iter_captures streams, so breaking out
+-- really does stop the traversal; query_nodes would have materialized
+-- every capture first.
+function M.find_calls(root, src, name, limit)
   local calls = {}
-  for _, id in ipairs(M.query_nodes(root, src, "(call_expression function: (identifier) @f)")) do
+  local q = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
+  for _, id in q:iter_captures(root, src) do
     if M.text(id, src) == name then
       calls[#calls + 1] = id:parent()
+      if limit and #calls >= limit then
+        break
+      end
     end
   end
   return calls

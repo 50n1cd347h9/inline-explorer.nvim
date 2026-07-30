@@ -47,7 +47,7 @@ end
 
 -- Test/introspection hook: run the analysis without printing.
 function M._probe(caller_src, callee_src, fname, occ, mode)
-  local call = C.find_calls(C.parse(caller_src), caller_src, fname)[occ or 1]
+  local call = C.find_calls(C.parse(caller_src), caller_src, fname, occ or 1)[occ or 1]
   if not call then
     return nil, "call to '" .. fname .. "' not found"
   end
@@ -110,12 +110,24 @@ function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode)
   end
   local fname = C.text(fn, caller_src)
 
+  -- Count occurrences only up to the already-located call: collecting every
+  -- call in the file to number one of them re-paid the whole-file walk
+  -- (half of the measured 72ms on a 22k-line file). Calls before the cursor
+  -- are the only ones that can affect its occurrence index, so the walk
+  -- stops at the located byte.
   local occ, i = nil, 0
-  for _, id in ipairs(C.find_calls(root, caller_src, fname)) do
-    i = i + 1
-    if C.sb(id) == C.sb(call) then
-      occ = i
-      break
+  local q = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
+  local target_sb = C.sb(call)
+  for _, id in q:iter_captures(root, caller_src) do
+    if C.text(id, caller_src) == fname then
+      i = i + 1
+      if C.sb(id:parent()) == target_sb then
+        occ = i
+        break
+      end
+      if C.sb(id) > target_sb then
+        break -- past the cursor: the located call was not a plain match
+      end
     end
   end
   return M.inline_call(caller_src, callee_src, fname, N, occ or 1, mode)
