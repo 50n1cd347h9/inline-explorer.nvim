@@ -25,6 +25,96 @@ local function once_with_timeout(cb, on_timeout)
   return require("inline-explorer.async").once_with_timeout(cb, on_timeout, M._timeout_ms)
 end
 
+-- Result caches. The attach cache further down keeps the SERVER from
+-- rebuilding a preamble; these keep US from asking the same question twice.
+-- They are separate problems and neither substitutes for the other: measured
+-- on linux-6.12 with real clangd, walking the same 29 callees in
+-- kernel/sched/core.c a second time cost the same as the first (p50 54.6ms
+-- then 54.0ms, p90 166.0ms then 160.6ms, worst 567.5ms), because every
+-- invocation reissued workspace/symbol and documentSymbol from scratch. On
+-- zlib the same repeat costs under 1ms, which is why this never showed up
+-- until the plugin was pointed at the source it was written for.
+--
+-- Capacities are module fields so tests can shrink them.
+M._locate_cache_n = 64
+M._extract_cache_n = 64
+M._locate_cache = {}
+M._extract_cache = {}
+
+-- Drop everything. Called on LspAttach/LspDetach (below) because a changed
+-- client set can change what a name resolves to, and exposed for tests.
+function M.clear_caches()
+  M._locate_cache = {}
+  M._extract_cache = {}
+end
+
+-- A buffer's changedtick, or nil when the buffer is not loaded. A cached
+-- answer about a file is only reusable while that file is unchanged; an
+-- unloaded target has no tick to compare, so entries recorded against one
+-- are not reused rather than trusted.
+local function tick_of(bufnr)
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+    return vim.api.nvim_buf_get_changedtick(bufnr)
+  end
+  return nil
+end
+
+local function cache_get(cache, key, tick)
+  local e = cache[key]
+  if not e then
+    return nil
+  end
+  -- Recorded against a file state we can no longer confirm, or one that has
+  -- since been edited: forget it rather than answer from it.
+  if e.tick ~= tick then
+    cache[key] = nil
+    return nil
+  end
+  e.at = vim.uv.now()
+  return e.value
+end
+
+local function cache_put(cache, key, value, tick, cap)
+  cache[key] = { value = value, tick = tick, at = vim.uv.now() }
+  local n, entries = 0, {}
+  for k, e in pairs(cache) do
+    n = n + 1
+    entries[n] = { k = k, at = e.at }
+  end
+  if n <= cap then
+    return
+  end
+  table.sort(entries, function(a, b)
+    return a.at < b.at
+  end)
+  for i = 1, n - cap do
+    cache[entries[i].k] = nil
+  end
+end
+
+-- The client set decides what a name can resolve to, so it is part of the
+-- key rather than something to invalidate on. Sorted so the key does not
+-- depend on get_clients' ordering.
+local function client_key(bufnr)
+  local ids = {}
+  for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+    ids[#ids + 1] = c.id
+  end
+  table.sort(ids)
+  return table.concat(ids, ",")
+end
+
+-- Deliberately NOT invalidated on LspAttach/LspDetach. That was the first
+-- thing tried and it was self-defeating: `extract` attaches the source
+-- buffer's clients to each definition file it opens, which fires LspAttach,
+-- which would clear the very entry the next call is about to want. Measured
+-- on linux-6.12, an LspAttach-clearing version left kernel/sched/core.c's
+-- repeat walk at p50 53.1ms against 54.0ms uncached -- no improvement at all
+-- -- while mm/memory.c, whose few resolvable callees live in the file
+-- already open, went to 0.1ms. The client set is part of the key instead
+-- (see client_key), so a changed set produces a different key rather than
+-- needing a sweep, and content changes are caught by the changedtick guard.
+
 -- Ask whichever server is attached to the source buffer where `name` is defined.
 -- Calls cb(location, err) where location = { uri, range, kind, name }.
 function M.locate(name, source_bufnr, cb)
@@ -33,9 +123,26 @@ function M.locate(name, source_bufnr, cb)
     return cb(nil, "no language server attached to the source buffer")
   end
 
+  -- Keyed on the source buffer's own state: a name resolves through whatever
+  -- that buffer's clients index, and the buffer's own edits can introduce or
+  -- remove the declaration the server answers with.
+  local key = client_key(bufnr) .. "\1" .. name
+  local tick = tick_of(bufnr)
+  if tick then
+    local hit = cache_get(M._locate_cache, key, tick)
+    if hit then
+      local span = profile.start()
+      span("locate:cached")
+      return cb(hit, nil)
+    end
+  end
+
   local span = profile.start()
   local finish = once_with_timeout(function(loc, err)
     span(loc and "locate:ok" or "locate:miss")
+    if loc and tick then
+      cache_put(M._locate_cache, key, loc, tick, M._locate_cache_n)
+    end
     cb(loc, err)
   end, function()
     return nil, "workspace/symbol timed out (server busy or stuck?)"
@@ -278,6 +385,15 @@ function M.extract(loc, source_bufnr, cb)
   -- never to fire and we must fall back immediately instead of waiting.
   local target = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(target)
+
+  -- Cache key computed here, but NOT consulted until after the attachment
+  -- block below. Attaching the definition file is a side effect other code
+  -- depends on -- the macro path needs the target attached before clangd
+  -- will run its ExpandMacro tweak -- so a cache hit skips the
+  -- documentSymbol round trip and nothing else. Ordering this way is a
+  -- precaution about that dependency, not a fix for an observed break.
+  local ekey = loc.uri .. "\1" .. loc.range.start.line .. ":" .. loc.range.start.character
+    .. "\1" .. loc.range["end"].line .. ":" .. loc.range["end"].character
   -- Attachments WE create are cached, not dropped when the request settles:
   -- re-attaching a definition header makes clangd rebuild its whole preamble
   -- (measured on linux-6.12, net/sock.h: ~470ms per repeat extract with an
@@ -294,6 +410,20 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
   cache_attachment(target, newly_attached)
+
+  -- Now that the attachment side effect has happened, a cached body may
+  -- stand in for the documentSymbol round trip. Invalidated by the
+  -- definition file's own changedtick: editing the definition must produce
+  -- the new body, not the one spliced last time. bufload above guarantees
+  -- the tick is available, unlike in locate.
+  local etick = tick_of(target)
+  if etick then
+    local hit = cache_get(M._extract_cache, ekey, etick)
+    if hit then
+      span("extract:cached")
+      return cb(hit[1], hit[2])
+    end
+  end
   -- The span says whether WE made the server open a new document, which is
   -- what actually costs a preamble build. "already open" covers both our own
   -- attachment cache and a file the user has open anyway (a definition in the
@@ -307,10 +437,23 @@ function M.extract(loc, source_bufnr, cb)
 
   -- A wedged server must not hang the keypress: after the timeout, extract
   -- locally and say so (the late response, if any, is dropped by the guard).
+  -- once_with_timeout routes the timeout's own result through the SAME
+  -- callback as a real response, so without this flag a degraded, locally
+  -- extracted answer produced because the server was momentarily busy would
+  -- be cached and then served for the rest of the session. The flag is set
+  -- before on_timeout's value reaches the callback.
+  local timed_out = false
   local finish = once_with_timeout(function(lines, label)
     span(stage)
+    -- A real response is cached on the way out, fallback label included:
+    -- whatever the user was shown is what they get again, and the
+    -- changedtick guard retires it as soon as the file changes.
+    if lines and etick and not timed_out then
+      cache_put(M._extract_cache, ekey, { lines, label }, etick, M._extract_cache_n)
+    end
     cb(lines, label)
   end, function()
+    timed_out = true
     vim.notify("[inline-explorer] documentSymbol timed out; extracted locally", vim.log.levels.WARN)
     return M.extract_sync(loc)
   end)

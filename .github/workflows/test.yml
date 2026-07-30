@@ -93,6 +93,94 @@ jobs:
             if echo "$out" | grep -q "FAILURE"; then echo "FAILED: ${{ matrix.name }} spec"; exit 1; fi
           fi
 
+  real-kernel:
+    # The workload this plugin was actually written for. Every other spec is
+    # a proxy, and the proxies hid a real defect for the project's whole
+    # life: resolution results were never memoized, so every keystroke
+    # reissued workspace/symbol and documentSymbol for a name already
+    # resolved. A repeat lookup costs under a millisecond on zlib, so
+    # nothing failed; on linux-6.12's kernel/sched/core.c it cost p50
+    # 54.6ms, p90 166.0ms and 567.5ms at worst -- the same as the first
+    # lookup. Only real kernel source made that visible.
+    #
+    # Runs on push AND pull_request, for the same reason as real-source: a
+    # job absent from a PR's checks is treated by GitHub as satisfied.
+    # allow_skip is deliberately absent -- see the SKIP handling below.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Neovim
+        run: |
+          curl -sL https://github.com/neovim/neovim/releases/download/v0.11.3/nvim-linux-x86_64.tar.gz | tar xz
+          echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Install build tools and clangd
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc bison flex libelf-dev clangd
+      - name: Cache kernel tree
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          # The key pins the tarball AND the object built from it: a change
+          # to either must not reuse a tree prepared for the other.
+          key: linux-6.12-sched-core-o-v1
+          path: kernel-src
+      - name: Fetch and build just enough kernel
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p kernel-src && cd kernel-src
+          curl -sL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz | tar xJ
+          cd linux-6.12
+          make -s ARCH=x86_64 defconfig
+          # One real translation unit is enough to assert the invariant, and
+          # building the whole kernel in CI is not. `make compile_commands.json`
+          # recurses into targets that rebuild far more than this needs, so the
+          # generator script is run directly against the .cmd files instead.
+          make -s -j"$(nproc)" kernel/sched/core.o
+          python3 scripts/clang-tools/gen_compile_commands.py -d . -o compile_commands.json
+      - name: Verify the kernel build produced what the spec needs
+        run: |
+          set -euo pipefail
+          cd kernel-src/linux-6.12
+          # `make -s` hides everything, so a build that quietly did nothing
+          # still exits 0 and leaves a step marked green. Name the artifacts
+          # instead of trusting the exit code: the object, its .cmd file (the
+          # compile database is generated from those, not from the object),
+          # and a database that actually covers kernel/sched/core.c. A
+          # database of host tools only -- which is exactly what a partial
+          # kernel build leaves behind -- would let clangd answer from
+          # guessed flags, and every measurement would describe something
+          # other than kernel source.
+          test -f kernel/sched/core.o || { echo "FAILED: kernel/sched/core.o was not built"; exit 1; }
+          test -f kernel/sched/.core.o.cmd || { echo "FAILED: no .core.o.cmd -- nothing for the generator to read"; exit 1; }
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("compile_commands.json"))
+          hits = [e for e in d if e.get("file", "").endswith("kernel/sched/core.c")]
+          print(f"compile_commands.json: {len(d)} entries, {len(hits)} covering kernel/sched/core.c")
+          if not hits:
+              sys.exit("FAILED: compile database does not cover kernel/sched/core.c")
+          PY
+      - name: Real-kernel regression
+        run: |
+          out=$(IE_KERNEL_DIR="$PWD/kernel-src/linux-6.12" \
+            nvim --headless --clean -u NONE -c "luafile tests/real_kernel_spec.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+          echo "$out"
+          # A SKIP: is NEVER green here. Everything this spec needs is
+          # installed or built in the steps above, so a skip means one of
+          # them silently did not produce what it claimed -- a missing
+          # clangd, a kernel tree that never unpacked, or a compile database
+          # covering no kernel code (the spec checks that last one itself,
+          # because a database of host tools only would let clangd guess
+          # flags and every result would describe something other than
+          # kernel source). Each of those is indistinguishable from a pass
+          # if the skip is allowed through.
+          if echo "$out" | grep -q "^SKIP:"; then
+            echo "FAILED: real-kernel spec printed SKIP: -- everything it needs is provisioned above"
+            exit 1
+          fi
+          echo "$out" | grep -q "ALL REAL KERNEL TESTS PASSED" || { echo "FAILED: real-kernel spec (no pass banner)"; exit 1; }
+          if echo "$out" | grep -q "FAILURE"; then echo "FAILED: real-kernel spec"; exit 1; fi
+
   perf-regression:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'

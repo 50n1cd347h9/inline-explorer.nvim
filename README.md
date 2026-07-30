@@ -216,6 +216,35 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
   static function, applies correct-mode substitution then has gcc **rebuild
   and run cJSON's test suite**. Every transform the engine accepts must
   compile and pass; today that is 188 out of 188.
+- `tests/real_kernel_spec.lua` runs against real Linux kernel source
+  (linux-6.12, `kernel/sched/core.c`), which is the workload this plugin
+  was written for. Every other spec is a proxy, and the proxies hid a real
+  defect for the project's whole life: resolution results were never
+  memoized, so every keystroke reissued `workspace/symbol` and
+  `textDocument/documentSymbol` for a name that had already been resolved.
+  A repeat lookup costs under a millisecond on zlib, so nothing ever
+  failed; measured with real clangd on `kernel/sched/core.c` it cost p50
+  54.6ms, p90 166.0ms and 567.5ms at worst — the same as the first
+  lookup, because there was effectively no second lookup. With the caches
+  in place the same repeat walk drops to p50 0.0ms, p90 0.1ms.
+
+  What the spec asserts is **structural, not a timing threshold**: the
+  second lookup of a name must not reach the server at all, checked by
+  counting profile spans (`locate:cached`/`extract:cached` against
+  `locate:ok`/`extract:cold`/`extract:warm`). A slow machine cannot turn
+  it red, and a cache that merely got lucky on timing cannot turn it
+  green. Timings are printed alongside for information only. It also
+  checks that editing the file retires the cached entry rather than
+  serving a stale body.
+
+  It needs a kernel tree whose `compile_commands.json` actually covers the
+  target file — the spec verifies that itself, because a database of host
+  tools only (which is what a partial kernel build leaves behind) would
+  let clangd guess flags and every result would describe something other
+  than kernel code. Point `IE_KERNEL_DIR` at the tree. CI builds a single
+  object (`make kernel/sched/core.o`) rather than the whole kernel, and
+  does **not** accept a `SKIP:` as green.
+
 - `tests/real_zlib_spec.lua` does the same against
   [zlib](https://github.com/madler/zlib) (pinned to tag `v1.3.1`), a
   different flavour of C from cJSON's: state machines, goto-based error

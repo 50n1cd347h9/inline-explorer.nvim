@@ -321,5 +321,122 @@ do
   end
 end
 
+
+-- Result caching: a repeat lookup of the same name, against an unchanged
+-- file, must not go back to the server -- and must stop doing so the moment
+-- the definition's file changes. This is the difference between ~55ms and
+-- ~0ms per invocation on real kernel source (linux-6.12, kernel/sched/core.c:
+-- p50 60.1ms uncached vs 0.0ms cached, worst case 571ms vs 0.1ms), so the
+-- checks below count SERVER REQUESTS, not elapsed time: a cache that merely
+-- got lucky on timing would still pass a timing assertion.
+do
+  local dpath = vim.fn.tempname() .. ".c"
+  local f = assert(io.open(dpath, "w"))
+  f:write("int cached_fn(int a)\n{\n    return a + 1;\n}\n\nint caller(void) { return cached_fn(1); }\n")
+  f:close()
+
+  vim.cmd.edit(dpath)
+  local src_buf = vim.api.nvim_get_current_buf()
+  local uri = vim.uri_from_fname(vim.fn.resolve(dpath))
+  local counts = { ["workspace/symbol"] = 0, ["textDocument/documentSymbol"] = 0 }
+
+  local cid = vim.lsp.start({
+    name = "counting",
+    cmd = function(dispatchers)
+      local closing, next_id = false, 0
+      return {
+        request = function(method, _, callback)
+          next_id = next_id + 1
+          if method == "initialize" then
+            callback(nil, { capabilities = {
+              documentSymbolProvider = true, workspaceSymbolProvider = true } })
+          elseif method == "workspace/symbol" then
+            counts[method] = counts[method] + 1
+            callback(nil, { {
+              name = "cached_fn", kind = 12,
+              location = { uri = uri, range = {
+                start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } } },
+            } })
+          elseif method == "textDocument/documentSymbol" then
+            counts[method] = counts[method] + 1
+            callback(nil, { {
+              name = "cached_fn", kind = 12,
+              range = { start = { line = 0, character = 0 }, ["end"] = { line = 3, character = 1 } },
+              selectionRange = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } },
+            } })
+          else
+            callback(nil, nil)
+          end
+          return true, next_id
+        end,
+        notify = function() return true end,
+        is_closing = function() return closing end,
+        terminate = function() closing = true; dispatchers.on_exit(0, 0) end,
+      }
+    end,
+    root_dir = vim.fn.fnamemodify(dpath, ":h"),
+  })
+  vim.wait(2000, function()
+    return cid ~= nil and #vim.lsp.get_clients({ bufnr = src_buf, name = "counting" }) > 0
+  end, 20)
+
+  if #vim.lsp.get_clients({ bufnr = src_buf, name = "counting" }) == 0 then
+    print("SKIP  cache checks (in-process LSP server unavailable)")
+  else
+    resolver.clear_caches()
+
+    local function fetch_once()
+      local done, got = false, nil
+      resolver.fetch("cached_fn", src_buf, function(lines) got = lines; done = true end)
+      vim.wait(3000, function() return done end, 5)
+      return got
+    end
+
+    local first = fetch_once()
+    local c1w, c1d = counts["workspace/symbol"], counts["textDocument/documentSymbol"]
+    check("cache: first fetch reaches the server", c1w >= 1 and c1d >= 1,
+      ("symbol=%d documentSymbol=%d"):format(c1w, c1d))
+    check("cache: first fetch returns the body", first ~= nil and
+      table.concat(first, "\n"):find("return a + 1", 1, true) ~= nil, vim.inspect(first))
+
+    local second = fetch_once()
+    check("cache: repeat fetch asks the server nothing",
+      counts["workspace/symbol"] == c1w and counts["textDocument/documentSymbol"] == c1d,
+      ("symbol=%d->%d documentSymbol=%d->%d"):format(c1w, counts["workspace/symbol"],
+        c1d, counts["textDocument/documentSymbol"]))
+    check("cache: repeat fetch returns the same body",
+      second ~= nil and table.concat(second, "\n") == table.concat(first, "\n"))
+
+    -- Editing the definition must retire the entry, not serve the old body.
+    local tbuf = vim.uri_to_bufnr(uri)
+    vim.fn.bufload(tbuf)
+    vim.api.nvim_buf_set_lines(tbuf, 2, 3, false, { "    return a + 99;" })
+    local third = fetch_once()
+    check("cache: an edit to the definition goes back to the server",
+      counts["textDocument/documentSymbol"] > c1d,
+      ("documentSymbol=%d->%d"):format(c1d, counts["textDocument/documentSymbol"]))
+    check("cache: an edit to the definition yields the NEW body",
+      third ~= nil and table.concat(third, "\n"):find("return a + 99", 1, true) ~= nil,
+      vim.inspect(third))
+
+    -- Capacity is honoured rather than growing without bound.
+    local saved_n = resolver._locate_cache_n
+    resolver._locate_cache_n = 2
+    resolver.clear_caches()
+    for i = 1, 5 do
+      local done = false
+      resolver.locate("cached_fn_" .. i, src_buf, function() done = true end)
+      vim.wait(2000, function() return done end, 5)
+    end
+    local n = 0
+    for _ in pairs(resolver._locate_cache) do n = n + 1 end
+    check("cache: locate cache is bounded by its capacity", n <= 2, ("entries=%d"):format(n))
+    resolver._locate_cache_n = saved_n
+    resolver.clear_caches()
+
+    if cid then vim.lsp.stop_client(cid, true) end
+  end
+end
+
 print("")
 print(fails == 0 and "ALL RESOLVER TESTS PASSED" or (fails .. " FAILURE(S)"))
