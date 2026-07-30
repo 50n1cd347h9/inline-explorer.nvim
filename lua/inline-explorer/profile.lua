@@ -40,11 +40,15 @@ local function append(name, ms, detail)
   if not f then
     return
   end
-  -- Sub-second resolution and the action id: without both, two spans in the
-  -- same second cannot be ordered or attributed from the file alone.
-  local frac = (vim.uv.hrtime() % 1000000000) / 1000000
+  -- Seconds and milliseconds must come from the SAME clock. Taking the
+  -- seconds from os.date and the fraction from hrtime's nanosecond part --
+  -- which is what this did first -- pairs a wall clock with an unrelated
+  -- monotonic one, and the result runs backwards within an action:
+  -- extract:attach at .544 followed by extract:cold at .036. gettimeofday
+  -- gives both halves of one reading.
+  local sec, usec = vim.uv.gettimeofday()
   f:write(("%s.%03d #%-4d %-26s %9.1fms%s\n"):format(
-    os.date("%Y-%m-%dT%H:%M:%S"), frac, M.action, name, ms,
+    os.date("%Y-%m-%dT%H:%M:%S", sec), math.floor(usec / 1000), M.action, name, ms,
     detail and ("  " .. detail) or ""))
   f:close()
 end

@@ -518,7 +518,15 @@ function M.extract(loc, source_bufnr, cb)
   -- before on_timeout's value reaches the callback.
   local timed_out = false
   local finish = once_with_timeout(function(lines, label)
-    span(stage, detail())
+    -- A timeout is not a measurement of the server. once_with_timeout routes
+    -- its own result through this same callback, so labelling by `stage`
+    -- recorded a wedged request as a successful `extract:cold` whose
+    -- duration was really just _timeout_ms -- a real log showed
+    -- `extract:cold 4030.0ms` against a 4000ms timeout, which reads as "the
+    -- server took four seconds" when what it means is "we stopped waiting
+    -- and extracted locally, and the true cost is unknown but at least
+    -- four seconds".
+    span(timed_out and "extract:timeout" or stage, detail())
     -- A real response is cached on the way out, fallback label included:
     -- whatever the user was shown is what they get again, and the
     -- changedtick guard retires it as soon as the file changes.

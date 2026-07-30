@@ -54,11 +54,16 @@ function M.expand(prefetched)
   end
 
   if pre then
-    local pf = require("inline-explorer.profile")
-    pf.begin_action()
-    local pre_span = pf.start()
+    -- Deliberately does NOT number a new action. This branch is only ever
+    -- reached as the continuation of an inline that fell back to block
+    -- paste, so the work belongs to the action already in progress.
+    -- Numbering here split one keypress across two ids in the log --
+    -- `#7 total:block-fallback 133.0ms` followed by a stray
+    -- `#8 total:expand 0.6ms` -- which is exactly the grouping the ids
+    -- exist to make reliable.
+    local pre_span = require("inline-explorer.profile").start()
     M._insert(st, bufnr, lnum, name, pre.body, pre.label)
-    pre_span("total:expand")
+    pre_span("total:expand", name)
     return
   end
 

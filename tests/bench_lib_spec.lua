@@ -360,5 +360,50 @@ do
     table.concat(vim.fn.readfile(dir .. "/c1.h"), "\n") == table.concat(vim.fn.readfile(dir2 .. "/c1.h"), "\n"))
 end
 
+-- The log's own timestamps must be monotonic within an action. They were not:
+-- the seconds came from os.date and the fraction from hrtime's nanosecond
+-- part, two unrelated clocks, so a real session log showed extract:attach at
+-- .544 followed by extract:cold at .036. Nothing in the suite could see it --
+-- it only appears in the file, not in the in-memory events -- so the check
+-- reads the file back.
+do
+  local profile = require("inline-explorer.profile")
+  local was, wasfile = profile.enabled, profile.logfile
+  local tmp = vim.fn.tempname()
+  profile.enabled, profile.logfile = true, tmp
+  profile.clear()
+  profile.begin_action()
+  -- Deliberately spread over more than a second. The broken version paired
+  -- os.date's seconds with hrtime's nanosecond remainder, which wraps once
+  -- per second -- so a burst inside a single second is monotonic by accident
+  -- and proves nothing. Crossing at least one wrap is what makes this
+  -- diagnostic: verified that a 24ms burst passes against the broken code
+  -- while this loop fails it.
+  for i = 1, 12 do
+    local s = profile.start()
+    local t = vim.uv.hrtime()
+    while (vim.uv.hrtime() - t) / 1e6 < 120 do end
+    s("probe:" .. i)
+  end
+  local stamps, bad = {}, nil
+  for _, line in ipairs(vim.fn.readfile(tmp)) do
+    local hh, mm, ss, ms = line:match("T(%d+):(%d+):(%d+)%.(%d+)")
+    if hh then
+      stamps[#stamps + 1] = ((tonumber(hh) * 60 + tonumber(mm)) * 60 + tonumber(ss)) * 1000 + tonumber(ms)
+    end
+  end
+  for i = 2, #stamps do
+    if stamps[i] < stamps[i - 1] then
+      bad = ("line %d went backwards: %d -> %d"):format(i, stamps[i - 1], stamps[i])
+      break
+    end
+  end
+  check("profile log timestamps never run backwards", #stamps >= 12 and bad == nil,
+    bad or ("stamps=%d"):format(#stamps))
+  profile.enabled, profile.logfile = was, wasfile
+  profile.clear()
+  vim.fn.delete(tmp)
+end
+
 print("")
 print(fails == 0 and "ALL BENCH LIB TESTS PASSED" or (fails .. " FAILURE(S)"))

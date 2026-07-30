@@ -55,7 +55,7 @@ function M.smart()
   -- making it repeat the round trip. The guard is released first: expand
   -- acquires its own when it does have to fetch.
   local function block_fallback(prefetched)
-    total("total:block-fallback")
+    total("total:block-fallback", ident)
     view.end_fetch(st)
     vim.schedule(function()
       expander.expand(prefetched)

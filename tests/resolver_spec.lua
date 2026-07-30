@@ -279,6 +279,35 @@ do
       return got_lines ~= nil
     end, 20)
     check("extract: wedged server falls back to extract_sync", got_label == "function_definition", tostring(got_label))
+
+    -- A timeout must not be recorded as a successful extract. once_with_timeout
+    -- routes its own result through the same callback as a real response, so
+    -- labelling by stage recorded a wedged request as `extract:cold` whose
+    -- duration was really just _timeout_ms: a real session log showed
+    -- `extract:cold 4030.0ms` against a 4000ms timeout, which reads as the
+    -- server having taken four seconds when it means we stopped waiting.
+    do
+      local profile = require("inline-explorer.profile")
+      local was, wasfile = profile.enabled, profile.logfile
+      profile.enabled, profile.logfile = true, false
+      profile.clear()
+      local done2 = false
+      resolver.extract({ uri = vim.uri_from_fname(hpath),
+        range = { start = { line = 0, character = 11 }, ["end"] = { line = 0, character = 19 } },
+        kind = 12, name = "wedge_fn" }, src_buf, function() done2 = true end)
+      vim.wait(3000, function() return done2 end, 5)
+      local names = {}
+      for _, e in ipairs(profile.events) do names[#names + 1] = e.name end
+      local saw_timeout, saw_cold = false, false
+      for _, n in ipairs(names) do
+        if n == "extract:timeout" then saw_timeout = true end
+        if n == "extract:cold" or n == "extract:warm" then saw_cold = true end
+      end
+      check("extract: a timeout is labelled as one, not as a cold extract",
+        saw_timeout and not saw_cold, table.concat(names, ","))
+      profile.enabled, profile.logfile = was, wasfile
+      profile.clear()
+    end
     check("extract: fallback body intact", got_lines ~= nil and table.concat(got_lines, "\n"):find("return 9", 1, true) ~= nil)
 
     -- Attachment hygiene: definition-file attachments are cached (dropping
