@@ -154,7 +154,7 @@ do
   -- fire, which is exactly when the extra detail is wanted.
   local function outcomes(sp)
     local n = 0
-    for _, pat in ipairs({ "^extract:cold$", "^extract:warm$", "^extract:cached$",
+    for _, pat in ipairs({ "^extract:local$", "^extract:cold$", "^extract:warm$", "^extract:cached$",
       "^extract:no%-lsp$", "^extract:no%-capability$" }) do
       n = n + bench.count(sp, pat)
     end
@@ -165,14 +165,21 @@ do
     spans and bench.names(spans))
 end
 
--- 2. A second symbol from an already-attached header is warm, not cold.
+-- 2. C extraction must never wait for the server. This invariant used to
+--    assert the cold/warm attach distinction on the documentSymbol path;
+--    with local-first extraction the point IS that neither symbol issues a
+--    documentSymbol wait at all -- the first touch of a definition file was
+--    measured (real kernel, real clangd) at 400ms-4s of preamble build per
+--    file, on a keypress, and the wait bought nothing tree-sitter had not
+--    already provided. cold/warm remain live spans for the non-C server
+--    path, which resolver_spec exercises by forcing _local_first off.
 do
   local first, first_complete = expand_on(meta.warm[1] .. "%(")
   local second, second_complete = expand_on(meta.warm[2] .. "%(")
-  check("first touch of a header is cold",
-    first_complete and bench.count(first, "^extract:cold") == 1, first and bench.names(first))
-  check("second symbol from the same header is warm",
-    second_complete and bench.count(second, "^extract:warm") == 1, second and bench.names(second))
+  check("first touch of a header extracts locally, no documentSymbol wait",
+    first_complete and bench.count(first, "^extract:local") == 1, first and bench.names(first))
+  check("second symbol from the same header extracts locally too",
+    second_complete and bench.count(second, "^extract:local") == 1, second and bench.names(second))
 end
 
 -- 3. Falling back to block-paste must not re-resolve: the inliner already has
@@ -241,7 +248,7 @@ local scenarios = {
       resolver.clear_caches()
       local sym = meta.cold[((i - 1) % #meta.cold) + 1]
       local spans, complete = expand_on(sym .. "%(")
-      if complete and bench.count(spans, "^extract:cold") == 1 then
+      if complete and bench.count(spans, "^extract:local") == 1 then
         return bench.elapsed_ms(spans)
       end
       return nil -- not actually cold: do not pollute the population
@@ -253,7 +260,7 @@ local scenarios = {
       resolver.clear_caches()
       local sym = meta.warm[((i - 1) % #meta.warm) + 1]
       local spans, complete = expand_on(sym .. "%(")
-      if complete and bench.count(spans, "^extract:warm") == 1 then
+      if complete and bench.count(spans, "^extract:local") == 1 then
         return bench.elapsed_ms(spans)
       end
       return nil

@@ -521,20 +521,33 @@ spans. The first tells you which stage costs most across a session, the second
 tells you which single call was the slow one — a different question, and
 usually the one being asked.
 
-The three `extract:` variants are the three costs, and telling them apart is
-the point of the labels:
+The `extract:` variants are the costs, and telling them apart is the point
+of the labels:
 
-- `extract:cold` — the server had to open a definition file it did not have
-  open, and build its preamble. Measured on linux-6.12 (defconfig, clangd
-  18.1.3, reading `kernel/sched/core.c`, probing `include/linux/sched.h`):
-  p50 178ms.
-- `extract:warm` — the file was already open, so no preamble, but the plugin
-  still asked the server. Same measurement: p50 11ms.
-- `extract:cached` — the plugin had already resolved this symbol and did not
-  ask the server at all. On the same kernel source, p50 0.1ms.
+- `extract:local` — the definition's range came from tree-sitter, in
+  milliseconds, without waiting for the server at all. **For C and C++ this
+  is the normal path.** It exists because the server alternative was
+  measured doing a compiler's worth of work per keypress: asking
+  `documentSymbol` about a file clangd has not opened makes it build that
+  file's preamble — preprocess and parse the entire transitive include
+  closure — which on a fully-built kernel tree cost 400–650ms typically,
+  ~1.2s on one measured machine, and >4s on a cold page cache. A real
+  session log then showed the wait buying nothing: every action whose
+  `documentSymbol` timed out completed correctly from the tree-sitter
+  fallback. So for C the fallback became the path, and the server is only
+  consulted when tree-sitter cannot produce a node-backed range.
+- `extract:cold` — server path (non-C-family languages, or tree-sitter
+  unavailable): the server had to open the definition file and build its
+  preamble. Measured on linux-6.12 (defconfig, clangd 18.1.3): p50 178ms,
+  with the pathological cases above.
+- `extract:warm` — server path, file already open: no preamble, but still a
+  round trip. Same measurement: p50 11ms.
+- `extract:cached` — the plugin had already resolved this symbol and
+  answered from its result cache. p50 0.1ms.
 
-The first case gets a shorter budget than the rest of the plugin's LSP calls
-(`resolver._cold_timeout_ms`, 1200ms, against `_timeout_ms`'s 4000ms), which
+The server path's first-touch case gets a shorter budget than the rest of the
+plugin's LSP calls
+(`resolver._cold_timeout_ms`, 2000ms, against `_timeout_ms`'s 4000ms), which
 is the opposite of what it looks like it should be. A first touch normally
 answers in 380–650ms, but occasionally a small header does not answer at all
 within seconds — and the only thing a long budget bought there was four

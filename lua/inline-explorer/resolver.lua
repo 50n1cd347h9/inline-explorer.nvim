@@ -39,7 +39,21 @@ M._timeout_ms = 4000
 -- 0.5ms after a forced timeout on the first. The user gets an instant
 -- fallback now and the server's own answer on the next look, instead of a
 -- four-second wait for the same fallback.
-M._cold_timeout_ms = 1200
+-- 2000, not 1200, since the retry probe produced real numbers: two
+-- first-touch requests on a fully-built kernel tree timed out at the old
+-- 1200ms budget and their retries succeeded 2.3ms and 19.4ms later -- true
+-- costs of ~1212ms and ~1236ms, tens of milliseconds past the budget that
+-- cut them off. Those are worth waiting for: the server's answer arrives
+-- inline instead of a fallback now and a correct answer later. The genuinely
+-- pathological case (a session-initial touch on a cold OS page cache,
+-- observed only as ">4020ms" before the budget existed) still times out
+-- either way, and is handled by the fallback plus the retry below.
+M._cold_timeout_ms = 2000
+
+-- Local-first extraction for C/C++ (see the block in M.extract). A module
+-- field so tests can force the server path, which remains the live path for
+-- other languages.
+M._local_first = true
 
 local function once_with_timeout(cb, on_timeout)
   return require("inline-explorer.async").once_with_timeout(cb, on_timeout, M._timeout_ms)
@@ -521,6 +535,43 @@ function M.extract(loc, source_bufnr, cb)
       return cb(hit[1], hit[2])
     end
   end
+
+  -- For C and C++, extraction is LOCAL-FIRST: tree-sitter finds the
+  -- definition's range in milliseconds, and the server is only consulted
+  -- when that fails. This inverts the module's original order, and the
+  -- reason is measured, not aesthetic. Asking documentSymbol about a file
+  -- the server has not opened makes clangd build that file's preamble --
+  -- preprocess and parse its entire transitive include closure, the same
+  -- work as compiling an empty .c that includes it. On a fully-built kernel
+  -- tree that is 400-650ms typically, ~1.2s on the user's machine, and >4s
+  -- on a cold page cache -- per definition FILE, on a keypress. And a real
+  -- session log showed the wait buying nothing: every action whose
+  -- documentSymbol timed out completed correctly from the tree-sitter
+  -- fallback (substitute:ok 4.8ms, macro:tweak 16.6ms) -- for C, the range
+  -- tree-sitter finds is the range the server would have returned.
+  --
+  -- The attach above still happens first: the macro path needs the target
+  -- attached before clangd will run its ExpandMacro tweak, and attaching
+  -- measured at 0.3-7ms -- it is the documentSymbol WAIT that cost seconds,
+  -- not the attach.
+  --
+  -- Only node-backed results are trusted; the brace-counting heuristic
+  -- stays a last resort behind the server. Languages without that safety
+  -- (no tree-sitter parser, or not C-family) keep the server-first order.
+  -- _local_first is a knob so tests can exercise the server path.
+  if M._local_first then
+    local tlang = buffer_lang(target)
+    if tlang == "c" or tlang == "cpp" then
+      local llines, llabel = M.extract_sync(loc)
+      if llines and #llines > 0 and llabel ~= "heuristic" then
+        if etick then
+          cache_put(M._extract_cache, ekey, { llines, llabel }, etick, M._extract_cache_n)
+        end
+        span("extract:local", detail())
+        return cb(llines, llabel)
+      end
+    end
+  end
   -- The span says whether WE made the server open a new document, which is
   -- what actually costs a preamble build. "already open" covers both our own
   -- attachment cache and a file the user has open anyway (a definition in the
@@ -578,16 +629,43 @@ function M.extract(loc, source_bufnr, cb)
     -- cannot see -- and no budget will fix it.
     --
     -- Costs nothing when profiling is off: the whole block is skipped.
-    if profile.enabled then
-      local probe = profile.start()
-      local answered = false
+    -- The retry is no longer only a diagnostic: a successful late answer is
+    -- fed into the extract cache, so the NEXT look at this symbol serves the
+    -- server's body instantly instead of repeating a round trip that just
+    -- proved slow. Measured before this existed: a symbol whose first touch
+    -- timed out cost another 89ms warm round trip on the next look, when the
+    -- answer had been available moments after the timeout and was thrown
+    -- away. The probe span still fires (when profiling is on) so the log
+    -- keeps separating "server finished just after we stopped waiting" from
+    -- "structurally slow"; the caching itself no longer depends on
+    -- profiling being enabled.
+    do
+      local probe = profile.enabled and profile.start() or nil
       vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(res)
+        local lines, label
         for _, r in pairs(res or {}) do
           if r.result then
-            answered = true
+            local ok2, range, rlabel = pcall(function()
+              local rg, lb = M._symbol_range(r.result, loc.range, loc.name, loc.uri)
+              return rg, lb
+            end)
+            if ok2 and range then
+              local ls = vim.api.nvim_buf_get_lines(target, range.start.line, range["end"].line + 1, false)
+              if #ls > 0 then
+                lines, label = ls, rlabel or kind_label(loc.kind)
+              end
+            end
           end
         end
-        probe(answered and "extract:retry-after-timeout" or "extract:retry-failed", detail())
+        if lines then
+          local now_tick = tick_of(target)
+          if now_tick then
+            cache_put(M._extract_cache, ekey, { lines, label }, now_tick, M._extract_cache_n)
+          end
+        end
+        if probe then
+          probe(lines and "extract:retry-after-timeout" or "extract:retry-failed", detail())
+        end
       end)
     end
     -- Name the file and say what happens next. "timed out" alone left the

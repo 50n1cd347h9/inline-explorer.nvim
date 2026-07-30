@@ -253,6 +253,12 @@ do
   if #vim.lsp.get_clients({ bufnr = src_buf, name = "wedge" }) == 0 then
     print("SKIP  timeout checks (in-process LSP server unavailable)")
   else
+    -- These checks exist to exercise the SERVER extraction path -- timeout,
+    -- cold budget, retry -- which local-first C extraction would bypass
+    -- entirely. It stays the live path for non-C-family languages, so
+    -- forcing it here tests real code, not a dead branch.
+    local saved_lf = resolver._local_first
+    resolver._local_first = false
     local saved = resolver._timeout_ms
     resolver._timeout_ms = 300
 
@@ -352,6 +358,91 @@ do
       check("extract: the retry probe does not fail instantly on a malformed request",
         not saw_retry_failed,
         "extract:retry-failed recorded -- the probe's request is malformed again")
+
+      -- A late answer must not be thrown away. A real kernel log showed a
+      -- symbol whose first touch timed out costing another 89ms round trip
+      -- on the next look, when the server's answer had arrived moments
+      -- after the timeout and was discarded. The server below swallows the
+      -- FIRST documentSymbol and answers every later one -- the same shape
+      -- as a preamble finishing just after the budget -- so the retry's
+      -- answer must land in the cache and the next fetch must be served
+      -- without a new request.
+      do
+        local dpath3 = vim.fn.tempname() .. ".h"
+        local f3 = assert(io.open(dpath3, "w"))
+        f3:write("static int late_fn(void)\n{\n    return 4;\n}\n")
+        f3:close()
+        local uri3 = vim.uri_from_fname(vim.fn.resolve(dpath3))
+        local ds_count, swallowed = 0, false
+        vim.cmd.edit(dpath3)
+        local src3 = vim.api.nvim_get_current_buf()
+        local cid3 = vim.lsp.start({
+          name = "late",
+          cmd = function(dispatchers)
+            local closing, next_id = false, 0
+            return {
+              request = function(method, _, callback)
+                next_id = next_id + 1
+                if method == "initialize" then
+                  callback(nil, { capabilities = {
+                    documentSymbolProvider = true, workspaceSymbolProvider = true } })
+                elseif method == "textDocument/documentSymbol" then
+                  ds_count = ds_count + 1
+                  if ds_count == 1 then
+                    swallowed = true -- first request: never answered
+                  else
+                    callback(nil, { {
+                      name = "late_fn", kind = 12,
+                      range = { start = { line = 0, character = 0 }, ["end"] = { line = 3, character = 1 } },
+                      selectionRange = { start = { line = 0, character = 11 }, ["end"] = { line = 0, character = 18 } },
+                    } })
+                  end
+                else
+                  callback(nil, nil)
+                end
+                return true, next_id
+              end,
+              notify = function() return true end,
+              is_closing = function() return closing end,
+              terminate = function() closing = true; dispatchers.on_exit(0, 0) end,
+            }
+          end,
+          root_dir = vim.fn.fnamemodify(dpath3, ":h"),
+        })
+        vim.wait(2000, function()
+          return cid3 ~= nil and #vim.lsp.get_clients({ bufnr = src3, name = "late" }) > 0
+        end, 20)
+
+        if #vim.lsp.get_clients({ bufnr = src3, name = "late" }) == 0 then
+          print("SKIP  retry-cache checks (in-process LSP server unavailable)")
+        else
+          resolver.clear_caches()
+          resolver._cold_timeout_ms = 100
+          resolver._timeout_ms = 100
+          local loc3 = { uri = uri3,
+            range = { start = { line = 0, character = 11 }, ["end"] = { line = 0, character = 18 } },
+            kind = 12, name = "late_fn" }
+          local done4 = false
+          resolver.extract(loc3, src3, function() done4 = true end)
+          vim.wait(4000, function() return done4 end, 5)
+          -- allow the retry round trip to land
+          vim.wait(2000, function() return ds_count >= 2 end, 10)
+          vim.wait(200)
+          check("retry cache: the retry reached the server", swallowed and ds_count >= 2,
+            ("ds_count=%d"):format(ds_count))
+
+          local before = ds_count
+          local done5, lines5 = false, nil
+          resolver.extract(loc3, src3, function(l) lines5 = l; done5 = true end)
+          vim.wait(4000, function() return done5 end, 5)
+          check("retry cache: the next fetch is served without a new request",
+            done5 and ds_count == before, ("ds_count %d -> %d"):format(before, ds_count))
+          check("retry cache: and returns the server's body, not the fallback",
+            lines5 ~= nil and table.concat(lines5, "\n"):find("return 4", 1, true) ~= nil,
+            vim.inspect(lines5))
+          if cid3 then vim.lsp.stop_client(cid3, true) end
+        end
+      end
       resolver._cold_timeout_ms = saved_cold
       resolver._timeout_ms = 300
       profile.enabled, profile.logfile = was, wasfile
@@ -393,6 +484,7 @@ do
     resolver._attach_cache_n = saved_cap
 
     resolver._timeout_ms = saved
+    resolver._local_first = saved_lf
     if client_id then
       vim.lsp.stop_client(client_id, true)
     end
@@ -461,6 +553,11 @@ do
   if #vim.lsp.get_clients({ bufnr = src_buf, name = "counting" }) == 0 then
     print("SKIP  cache checks (in-process LSP server unavailable)")
   else
+    -- The point of these checks is the SERVER-path result cache; C
+    -- local-first extraction would answer without ever issuing the
+    -- documentSymbol these counters count.
+    local saved_lf2 = resolver._local_first
+    resolver._local_first = false
     resolver.clear_caches()
 
     local function fetch_once()
@@ -510,7 +607,31 @@ do
     for _ in pairs(resolver._locate_cache) do n = n + 1 end
     check("cache: locate cache is bounded by its capacity", n <= 2, ("entries=%d"):format(n))
     resolver._locate_cache_n = saved_n
+    resolver._local_first = saved_lf2
     resolver.clear_caches()
+
+    -- Local-first itself, against the same counting server: a C definition
+    -- must be extracted without ANY documentSymbol round trip, and the
+    -- result must be the real body. This is the root fix for the measured
+    -- keypress-triggers-a-compile cost (400ms-4s per first-touched file on
+    -- kernel trees); if this ever regresses to asking the server, that cost
+    -- comes back exactly as it was.
+    do
+      resolver.clear_caches()
+      local before_ds = counts["textDocument/documentSymbol"]
+      local done6, lines6, label6 = false, nil, nil
+      resolver.extract({ uri = uri,
+        range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } },
+        kind = 12, name = "cached_fn" }, src_buf, function(l, lb) lines6, label6 = l, lb; done6 = true end)
+      vim.wait(3000, function() return done6 end, 5)
+      check("local-first: a C definition never waits for documentSymbol",
+        done6 and counts["textDocument/documentSymbol"] == before_ds,
+        ("documentSymbol %d -> %d"):format(before_ds, counts["textDocument/documentSymbol"]))
+      check("local-first: and yields the full definition with a node label",
+        lines6 ~= nil and table.concat(lines6, "\n"):find("return a + 99", 1, true) ~= nil
+          and label6 == "function_definition",
+        ("label=%s lines=%s"):format(tostring(label6), vim.inspect(lines6)))
+    end
 
     if cid then vim.lsp.stop_client(cid, true) end
   end
