@@ -145,8 +145,23 @@ do
   local spans, complete = expand_on(meta.cold[1] .. "%(")
   check("capture completed within the timeout", complete == true,
     spans and (bench.names(spans) .. " -- " .. tostring(select(2, bench.assert_complete(spans)))))
-  check("one expand = one locate + one extract",
-    complete and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
+  -- Counts the OUTCOME of extraction, not every span the stage emits.
+  -- `extract:` also covers the sub-spans that decompose a slow extract --
+  -- `extract:bufload` (reading the definition file off disk) and
+  -- `extract:attach` (handing it to the server) -- which exist precisely
+  -- because a single opaque `extract:cold` could not say where four seconds
+  -- went. Counting the prefix would make this invariant fail whenever those
+  -- fire, which is exactly when the extra detail is wanted.
+  local function outcomes(sp)
+    local n = 0
+    for _, pat in ipairs({ "^extract:cold$", "^extract:warm$", "^extract:cached$",
+      "^extract:no%-lsp$", "^extract:no%-capability$" }) do
+      n = n + bench.count(sp, pat)
+    end
+    return n
+  end
+  check("one expand = one locate + one extract outcome",
+    complete and bench.count(spans, "^locate:") == 1 and outcomes(spans) == 1,
     spans and bench.names(spans))
 end
 

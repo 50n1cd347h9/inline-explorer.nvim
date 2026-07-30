@@ -54,7 +54,9 @@ function M.expand(prefetched)
   end
 
   if pre then
-    local pre_span = require("inline-explorer.profile").start()
+    local pf = require("inline-explorer.profile")
+    pf.begin_action()
+    local pre_span = pf.start()
     M._insert(st, bufnr, lnum, name, pre.body, pre.label)
     pre_span("total:expand")
     return
@@ -64,16 +66,18 @@ function M.expand(prefetched)
     return notify("a lookup is already in flight", vim.log.levels.INFO)
   end
 
-  local span = require("inline-explorer.profile").start()
+  local pf2 = require("inline-explorer.profile")
+  pf2.begin_action()
+  local span = pf2.start()
   resolver.fetch(name, st.source_bufnr, function(body, label, err)
     vim.schedule(function()
       view.end_fetch(st)
       if not body or #body == 0 then
-        span("total:expand-failed")
+        span("total:expand-failed", name)
         return notify(err or ("could not extract a body for '" .. name .. "'"))
       end
       M._insert(st, bufnr, lnum, name, body, label)
-      span("total:expand")
+      span("total:expand", ("%s (%dL, %s)"):format(name, #body, tostring(label)))
     end)
   end)
 end

@@ -170,7 +170,7 @@ function M.locate(name, source_bufnr, cb)
       if e.tick == now_tick then
         e.at = vim.uv.now()
         local span = profile.start()
-        span("locate:cached")
+        span("locate:cached", name)
         return cb(e.value, nil)
       end
       M._locate_cache[key] = nil
@@ -179,7 +179,8 @@ function M.locate(name, source_bufnr, cb)
 
   local span = profile.start()
   local finish = once_with_timeout(function(loc, err)
-    span(loc and "locate:ok" or "locate:miss")
+    span(loc and "locate:ok" or "locate:miss",
+      loc and ("%s @ %s"):format(loc.name or name, vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")) or name)
     if loc then
       cache_put(M._locate_cache, key, loc, loc_tick(loc), M._locate_cache_n)
     end
@@ -424,7 +425,29 @@ function M.extract(loc, source_bufnr, cb)
   -- bookkeeping: if it reports zero, buf_request_all's handler is guaranteed
   -- never to fire and we must fall back immediately instead of waiting.
   local target = vim.uri_to_bufnr(loc.uri)
+
+  -- Identity and size travel with every span from here on. A four-second
+  -- extract and a 240ms one are the same row without them, and the first
+  -- question a slow log raises -- which file was that, and how big -- had no
+  -- answer in the data.
+  local function detail()
+    local n = vim.api.nvim_buf_is_loaded(target) and vim.api.nvim_buf_line_count(target) or -1
+    return ("%s @ %s%s"):format(
+      loc.name or "?",
+      vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t"),
+      n >= 0 and (" (" .. n .. "L)") or "")
+  end
+
+  -- Reading the definition file off disk is not the same cost as the
+  -- server's preamble, and both used to land inside one `extract:cold`. On
+  -- a large header they are minutes apart in character: one is I/O we do,
+  -- the other is work the server does that we only wait for.
+  local load_span = profile.start()
+  local was_loaded = vim.api.nvim_buf_is_loaded(target)
   vim.fn.bufload(target)
+  if not was_loaded then
+    load_span("extract:bufload", detail())
+  end
 
   -- Cache key computed here, but NOT consulted until after the attachment
   -- block below. Attaching the definition file is a side effect other code
@@ -448,6 +471,7 @@ function M.extract(loc, source_bufnr, cb)
   -- recently used entries beyond _attach_cache_n are detached instead, so a
   -- long session stays bounded without repaying the preamble every keypress.
   -- A buffer the user actually has in a window is never detached.
+  local attach_span = profile.start()
   local newly_attached = {}
   for _, c in ipairs(clients) do
     local pre = c.attached_buffers and c.attached_buffers[target]
@@ -457,6 +481,9 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
   cache_attachment(target, newly_attached)
+  if #newly_attached > 0 then
+    attach_span("extract:attach", detail())
+  end
 
   -- Now that the attachment side effect has happened, a cached body may
   -- stand in for the documentSymbol round trip. Invalidated by the
@@ -467,7 +494,7 @@ function M.extract(loc, source_bufnr, cb)
   if etick then
     local hit = cache_get(M._extract_cache, ekey, etick)
     if hit then
-      span("extract:cached")
+      span("extract:cached", detail())
       return cb(hit[1], hit[2])
     end
   end
@@ -478,7 +505,7 @@ function M.extract(loc, source_bufnr, cb)
   local stage = #newly_attached > 0 and "extract:cold" or "extract:warm"
   if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
     local lines, label = M.extract_sync(loc)
-    span("extract:no-capability")
+    span("extract:no-capability", detail())
     return cb(lines, label)
   end
 
@@ -491,7 +518,7 @@ function M.extract(loc, source_bufnr, cb)
   -- before on_timeout's value reaches the callback.
   local timed_out = false
   local finish = once_with_timeout(function(lines, label)
-    span(stage)
+    span(stage, detail())
     -- A real response is cached on the way out, fallback label included:
     -- whatever the user was shown is what they get again, and the
     -- changedtick guard retires it as soon as the file changes.

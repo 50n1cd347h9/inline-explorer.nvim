@@ -460,21 +460,35 @@ than guessing:
 ```
 
 Every span is appended to `stdpath("log")/inline-explorer-profile.log`, so a
-session can be inspected afterwards — or watched live from another shell:
+session can be inspected afterwards — or watched live from another shell.
+
+Each line carries an action id (`#3`), a sub-second timestamp, and the symbol
+and file the span was about. All three exist because a log without them could
+not answer the questions a slow session actually raises: which of these lines
+belong to the keypress that felt slow, in what order they happened when a
+whole action lands inside one second, and *which* definition was the
+four-second one rather than merely that one existed.
 
 ```sh
 tail -f ~/.local/state/nvim/inline-explorer-profile.log
 ```
 
 ```
-2026-07-29T10:55:15 locate:ok                     0.4ms
-2026-07-29T10:55:15 extract:cold                580.8ms
-2026-07-29T10:55:15 total:expand                581.7ms
-2026-07-29T10:55:16 extract:cold                208.6ms
-2026-07-29T10:55:16 macro:tweak                 111.8ms
-2026-07-29T10:55:16 rewrite                       3.2ms
-2026-07-29T10:55:16 total:inline-macro          332.0ms
+2026-07-30T10:55:15.204 #3    locate:ok                       0.4ms  sk_alloc @ sock.h
+2026-07-30T10:55:15.208 #3    extract:bufload                39.2ms  sk_alloc @ sock.h (4021L)
+2026-07-30T10:55:15.211 #3    extract:attach                  1.1ms  sk_alloc @ sock.h (4021L)
+2026-07-30T10:55:15.789 #3    extract:cold                  580.8ms  sk_alloc @ sock.h (4021L)
+2026-07-30T10:55:15.790 #3    total:expand                  581.7ms  sk_alloc (18L, function_definition)
+2026-07-30T10:55:16.402 #4    extract:cold                  208.6ms  tcp_v4_connect @ tcp_ipv4.c (3600L)
+2026-07-30T10:55:16.514 #4    macro:tweak                   111.8ms
+2026-07-30T10:55:16.517 #4    rewrite                         3.2ms
+2026-07-30T10:55:16.518 #4    total:inline-macro            332.0ms  tcp_v4_connect
 ```
+
+`extract:bufload` is the plugin reading the definition file off disk;
+`extract:attach` is handing it to the server; `extract:cold` is then the
+server's own preamble build. They used to be one number, which meant a
+four-second extract could not be attributed to any of them.
 
 Span names read as `stage:variant`, and the end-to-end numbers all start with
 `total:`, so they group together in the report. `extract:cold` means the plugin
@@ -494,7 +508,18 @@ total:inline-macro         1      332ms     332ms     332ms     332ms
 macro:tweak                1      112ms     112ms     112ms     112ms
 locate:ok                  3        3ms       1ms       2ms       2ms
 rewrite                    1        3ms       3ms       3ms       3ms
+
+action span                              ms  detail
+------------------------------------------------------------------------------
+#3     extract:cold                  580.8ms  sk_alloc @ sock.h (4021L)
+#4     extract:cold                  208.6ms  tcp_v4_connect @ tcp_ipv4.c (3600L)
+#4     macro:tweak                   111.8ms
 ```
+
+The table aggregates by stage; the list below it names the individual worst
+spans. The first tells you which stage costs most across a session, the second
+tells you which single call was the slow one — a different question, and
+usually the one being asked.
 
 The three `extract:` variants are the three costs, and telling them apart is
 the point of the labels:

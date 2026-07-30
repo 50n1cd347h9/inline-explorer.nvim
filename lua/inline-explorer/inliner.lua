@@ -45,6 +45,10 @@ function M.smart()
   end
 
   local profile = require("inline-explorer.profile")
+  -- Number this action before anything is recorded, so every span it
+  -- produces carries the same id and the log can be grouped with certainty
+  -- rather than by which lines happen to sit next to each other.
+  profile.begin_action()
   local total = profile.start()
 
   -- Hand whatever we already resolved to the block-paste path instead of
@@ -78,15 +82,22 @@ function M.smart()
       local prefetched = { name = ident, body = lines, label = label }
       if fname and label == "function_definition" then
         local N = (st.subst_n or 0) + 1
+        -- substitute covers parse, analysis (including enclosing_scope's
+        -- whole-translation-unit walk) and printing. Kept as one span
+        -- deliberately -- splitting it further would need the boundary
+        -- inside substitute itself -- but it now says which callee and how
+        -- big the caller was, which is what distinguishes a slow site from
+        -- a slow engine.
         local sspan = profile.start()
         local ok, new, serr = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
-        sspan(ok and new and "substitute:ok" or reject_stage(ok and serr or new))
+        sspan(ok and new and "substitute:ok" or reject_stage(ok and serr or new),
+          ("%s (caller %dL)"):format(ident, vim.api.nvim_buf_line_count(st.source_bufnr)))
         if ok and new then
           return vim.schedule(function()
             view.end_fetch(st)
             st.subst_n = N
             view.rewrite(st, bufnr, new, row)
-            total("total:inline-function")
+            total("total:inline-function", ident)
           end)
         end
         return block_fallback(prefetched) -- e.g. variadic function
@@ -107,7 +118,7 @@ function M.smart()
           if ok and new then
             view.end_fetch(st)
             view.rewrite(st, bufnr, new, row)
-            total("total:inline-macro")
+            total("total:inline-macro", ident)
           else
             total("total:macro-splice-failed")
             view.end_fetch(st)
