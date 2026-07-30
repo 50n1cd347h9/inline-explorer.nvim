@@ -756,7 +756,7 @@ do
     -- the C file's own location, where extract already yields a
     -- function_definition and no chase happens -- so instead assert via
     -- the miss memo directly)
-    resolver._chase_miss[self_uri .. "\1" .. 0] = true
+    resolver._chase_miss[self_uri .. "\1" .. 0] = vim.uv.now()
     local done3, label3 = false, nil
     resolver.fetch("kfree_like", src_buf, function(_, lb)
       label3 = lb
@@ -766,6 +766,22 @@ do
     check("chase: a memoized miss short-circuits (no definition request)",
       done3 and def_requests == m0 and label3 == "declaration",
       ("def_requests %d -> %d label=%s"):format(m0, def_requests, tostring(label3)))
+
+    -- The miss EXPIRES. The session-scoped version pinned a symbol probed
+    -- during index construction to its prototype until Neovim restarted --
+    -- and nothing in production calls clear_caches, so "until clear_caches"
+    -- meant never. Backdate the memo past the TTL and the chase must ask
+    -- the server again.
+    resolver._chase_miss[self_uri .. "\1" .. 0] = vim.uv.now() - resolver._chase_miss_ttl_ms - 1
+    resolver._extract_cache = {}
+    local m1 = def_requests
+    local done4 = false
+    resolver.fetch("kfree_like", src_buf, function()
+      done4 = true
+    end)
+    vim.wait(10000, function() return done4 end, 10)
+    check("chase: an expired miss is retried against the server",
+      done4 and def_requests > m1, ("def_requests %d -> %d"):format(m1, def_requests))
     vim.lsp.stop_client(cid, true)
   end
 end

@@ -14,9 +14,11 @@ local M = {}
 -- Keying on the text itself makes invalidation exact rather than a policy:
 -- edit the buffer and the string differs, so the entry cannot be reused.
 -- Lua interns strings, so the lookup does not re-hash the file on every
--- call. The entry holds the parser and the tree as well as the root, because
--- a node does not keep its tree alive on its own -- caching the root alone
--- would hand back nodes whose tree had been collected.
+-- call. The entry holds the parser and the tree alongside the root as
+-- belt and braces, not as a correctness requirement: on this Neovim a
+-- TSNode anchors its TSTree through its function environment (verified:
+-- a root cached alone survived 50 GC cycles with all children and ranges
+-- intact). An earlier version of this comment claimed the opposite.
 M._parse_cache_n = 4
 M._parse_cache = {}
 

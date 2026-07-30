@@ -87,8 +87,12 @@ M._extract_cache_n = 64
 M._locate_cache = {}
 M._extract_cache = {}
 
--- Drop everything. Called on LspAttach/LspDetach (below) because a changed
--- client set can change what a name resolves to, and exposed for tests.
+-- Drop everything. Nothing in production calls this -- the client set is
+-- part of the cache keys (see client_key) and content changes are caught
+-- by changedtick, so no sweep is needed; tests use it to isolate blocks.
+-- An earlier comment here claimed an LspAttach/LspDetach autocmd called
+-- it "below"; no such autocmd ever existed, and the comment further down
+-- explains why wiring one would be self-defeating.
 function M.clear_caches()
   M._locate_cache = {}
   M._extract_cache = {}
@@ -98,12 +102,17 @@ end
 -- Declaration locations whose definition chase came up empty, so repeats
 -- do not pay a definition round trip per keypress -- the
 -- ask-the-same-question-every-time class this module just spent a real
--- kernel session eliminating. Session-scoped and cleared with the other
--- caches; the accepted staleness is that a definition which becomes
--- findable later (an index finishing) is not noticed until clear_caches.
--- That trade is taken knowingly: the alternative charges every repeat of
--- every prototype-only name forever.
+-- kernel session eliminating.
+--
+-- Misses EXPIRE (default 5 minutes) rather than lasting the session. The
+-- session-scoped version pinned a symbol probed while clangd's background
+-- index was still building to its one-line prototype forever -- and
+-- nothing in production ever called clear_caches, so "until clear_caches"
+-- meant never. A TTL keeps the per-keypress saving (repeats within the
+-- window are free) while an index that finishes mid-session is noticed at
+-- the next expiry instead of at the next Neovim restart.
 M._chase_miss = {}
+M._chase_miss_ttl_ms = 5 * 60 * 1000
 
 -- A buffer's changedtick, or nil when the buffer is not loaded. A cached
 -- answer about a file is only reusable while that file is unchanged; an
@@ -659,7 +668,9 @@ function M.extract(loc, source_bufnr, cb)
     -- structurally expensive for this server -- inferred flags, a config we
     -- cannot see -- and no budget will fix it.
     --
-    -- Costs nothing when profiling is off: the whole block is skipped.
+    -- Only the SPAN is gated on profiling; the retry request and its cache
+    -- write always run -- the late answer repairing the cache is a feature
+    -- for every user, not a diagnostic for those with profiling on.
     -- The retry is no longer only a diagnostic: a successful late answer is
     -- fed into the extract cache, so the NEXT look at this symbol serves the
     -- server's body instantly instead of repeating a round trip that just
@@ -938,12 +949,13 @@ function M.fetch(name, source_bufnr, cb)
       -- definition once; the extract above already attached the
       -- declaration's file, which is what the definition request needs.
       local misskey = loc.uri .. "\1" .. loc.range.start.line
-      if M._chase_miss[misskey] then
+      local miss_at = M._chase_miss[misskey]
+      if miss_at and (vim.uv.now() - miss_at) < M._chase_miss_ttl_ms then
         return cb(lines, label, nil)
       end
       M._chase_definition(loc, function(dloc)
         if not dloc then
-          M._chase_miss[misskey] = true
+          M._chase_miss[misskey] = vim.uv.now()
           return cb(lines, label, nil)
         end
         M.extract(dloc, source_bufnr, function(l2, lb2)
