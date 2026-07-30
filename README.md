@@ -496,12 +496,22 @@ locate:ok                  3        3ms       1ms       2ms       2ms
 rewrite                    1        3ms       3ms       3ms       3ms
 ```
 
-`extract:cold` is the server building the definition header's preamble the
-first time that header is touched — on the Linux kernel that is ~0.5s for a
-big header like `net/sock.h`, while `extract:cached` for a later symbol in the
-same header is ~20ms. The plugin keeps the last few definition files attached
-for exactly that reason (`:InlineExplorerProfile clear` wipes both the report
-and the log between experiments).
+The three `extract:` variants are the three costs, and telling them apart is
+the point of the labels:
+
+- `extract:cold` — the server had to open a definition file it did not have
+  open, and build its preamble. Measured on linux-6.12 (defconfig, clangd
+  18.1.3, reading `kernel/sched/core.c`, probing `include/linux/sched.h`):
+  p50 178ms.
+- `extract:warm` — the file was already open, so no preamble, but the plugin
+  still asked the server. Same measurement: p50 11ms.
+- `extract:cached` — the plugin had already resolved this symbol and did not
+  ask the server at all. On the same kernel source, p50 0.1ms.
+
+The plugin keeps the last few definition files attached to stay out of the
+first case, and caches resolution results to stay out of the second
+(`:InlineExplorerProfile clear` wipes both the report and the log between
+experiments).
 
 Enable it permanently with `setup({ profile = true })`; set
 `require("inline-explorer.profile").logfile = false` to keep it in memory only.
