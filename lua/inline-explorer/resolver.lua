@@ -55,6 +55,18 @@ M._cold_timeout_ms = 2000
 -- other languages.
 M._local_first = true
 
+-- client.request became a colon-method in 0.11; 0.10 uses the dot form
+-- with a different first argument. Every module routes through this one
+-- shim -- macro.lua carried a private copy while callers and the chase
+-- used the bare colon form, which silently held the README's "Neovim
+-- 0.10+" promise hostage to whichever module a keypress happened to take.
+function M.client_request(client, method, params, handler, bufnr)
+  if vim.fn.has("nvim-0.11") == 1 then
+    return client:request(method, params, handler, bufnr)
+  end
+  return client.request(method, params, handler, bufnr)
+end
+
 local function once_with_timeout(cb, on_timeout)
   return require("inline-explorer.async").once_with_timeout(cb, on_timeout, M._timeout_ms)
 end
@@ -770,6 +782,49 @@ function M.extract_heuristic(bufnr, srow)
   return out
 end
 
+-- Load `uri`'s file into a buffer and attach `source_bufnr`'s clients to
+-- it, through the same LRU attach cache extract uses -- the server cannot
+-- answer requests about a document it has not been handed. Returns the
+-- target bufnr, or nil when there is nothing to attach.
+function M.ensure_attached(uri, source_bufnr)
+  local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
+  local clients = vim.lsp.get_clients({ bufnr = bufnr })
+  if #clients == 0 then
+    return nil
+  end
+  local target = vim.uri_to_bufnr(uri)
+  vim.fn.bufload(target)
+  local newly_attached = {}
+  for _, c in ipairs(clients) do
+    local pre = c.attached_buffers and c.attached_buffers[target]
+    vim.lsp.buf_attach_client(target, c.id)
+    if not pre then
+      newly_attached[#newly_attached + 1] = c.id
+    end
+  end
+  cache_attachment(target, newly_attached)
+  return target
+end
+
+-- The position of `loc.name` inside its own declaration, word-bounded --
+-- range.start can sit on `void`, and a request positioned on a keyword
+-- answers for nothing (the chase learned this from a field log; callers
+-- inherited the same rule).
+function M.name_position(target, loc)
+  local pos = loc.range.start
+  if loc.name then
+    local from = loc.range.start.line
+    local lines = vim.api.nvim_buf_get_lines(target, from, from + 4, false)
+    for i, l in ipairs(lines) do
+      local s0 = l:find("%f[%w_]" .. vim.pesc(loc.name) .. "%f[^%w_]")
+      if s0 then
+        return { line = from + i - 1, character = s0 - 1 }
+      end
+    end
+  end
+  return pos
+end
+
 -- Chase a declaration to its definition, once. workspace/symbol answers
 -- with the CANONICAL DECLARATION for names like kfree -- declared in
 -- slab.h, defined in mm/slub.c -- and extraction is faithful to the
@@ -795,18 +850,7 @@ function M._chase_definition(loc, cb)
   -- Find the name, word-bounded, in the declaration's first lines and aim
   -- there; range.start stays as the fallback when the name is not textual
   -- on those lines (unlikely, but a miss then is honest).
-  local pos = loc.range.start
-  if loc.name then
-    local from = loc.range.start.line
-    local lines = vim.api.nvim_buf_get_lines(target, from, from + 4, false)
-    for i, l in ipairs(lines) do
-      local s0 = l:find("%f[%w_]" .. vim.pesc(loc.name) .. "%f[^%w_]")
-      if s0 then
-        pos = { line = from + i - 1, character = s0 - 1 }
-        break
-      end
-    end
-  end
+  local pos = M.name_position(target, loc)
 
   local span = profile.start()
   local answered = false
@@ -829,7 +873,7 @@ function M._chase_definition(loc, cb)
   vim.defer_fn(function()
     finish(nil, "timeout")
   end, M._timeout_ms)
-  clients[1]:request("textDocument/definition", {
+  M.client_request(clients[1], "textDocument/definition", {
     textDocument = { uri = loc.uri },
     position = pos,
   }, function(err, result)

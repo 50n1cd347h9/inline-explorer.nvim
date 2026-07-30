@@ -8,18 +8,16 @@
 -- textDocument/hover markdown (older clangd, tweak failure, timeout).
 local M = {}
 
-local function parse(src)
-  return vim.treesitter.get_string_parser(src, "c"):parse()[1]:root()
-end
-local function sb(n)
-  return (select(3, n:range(true)))
-end
-local function eb(n)
-  return (select(6, n:range(true)))
-end
-local function scol(n)
-  return (select(2, n:range(true)))
-end
+-- The tree-sitter primitives come from csrc, not a private copy. The copy
+-- this replaced predated csrc's parse cache and never followed it, so the
+-- same smart-inline keypress parsed the caller cached on the substitute
+-- path and re-parsed it uncached here -- measured at 33-42ms on a
+-- 13k-line kernel file against ~0ms for the cache hit.
+local C = require("inline-explorer.csrc")
+local parse = C.parse
+local sb = C.sb
+local eb = C.eb
+local scol = C.scol
 
 -- Flatten LSP Hover.contents (MarkupContent | MarkedString | MarkedString[]).
 local function markup(contents)
@@ -339,11 +337,11 @@ M._install_interceptor = install_interceptor
 M._pending = pending
 
 -- client.request became a colon-method in 0.11; 0.10 uses the dot form.
+-- The 0.10/0.11 request-form shim lives in resolver.client_request now;
+-- this module had a private copy while callers and the chase used the bare
+-- colon form -- one home, one behavior.
 local function client_request(client, method, params, handler, bufnr)
-  if vim.fn.has("nvim-0.11") == 1 then
-    return client:request(method, params, handler, bufnr)
-  end
-  return client.request(method, params, handler, bufnr)
+  return require("inline-explorer.resolver").client_request(client, method, params, handler, bufnr)
 end
 
 -- Drop claim lists and interceptor bookkeeping for clients that no longer

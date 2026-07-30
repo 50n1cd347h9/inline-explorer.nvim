@@ -338,5 +338,33 @@ do
     out:find("(a + 1) * 2", 1, true) ~= nil and out:find("((a + 1))", 1, true) == nil, out)
 end
 
+-- The macro splice must ride csrc's parse cache. macro.lua carried a
+-- private pre-cache copy of parse(), so the SAME keypress that parsed the
+-- caller cached via substitute.call_name_at re-parsed it uncached here --
+-- measured at 33-42ms on a 13k-line kernel file, ~0ms cached. Counted, not
+-- timed: a warm cache plus one replace_in_src must add zero parser
+-- constructions for the same source text.
+do
+  local C = require("inline-explorer.csrc")
+  local src = "void f(void) { x = M(1); }"
+  C._parse_cache = {}
+  C.parse(src) -- warm
+  local real = vim.treesitter.get_string_parser
+  local made = 0
+  vim.treesitter.get_string_parser = function(text, ...)
+    -- simplify legitimately parses its own tiny wrapper fragments; the
+    -- finding was about re-parsing the CALLER, so count only that text.
+    if text == src then
+      made = made + 1
+    end
+    return real(text, ...)
+  end
+  local col = src:find("M%(") - 1
+  macro.replace_in_src(src, 0, col, { "(1 + 0)" })
+  vim.treesitter.get_string_parser = real
+  check("splice: rides the shared parse cache (zero caller re-parses for warm text)",
+    made == 0, ("caller parses=%d"):format(made))
+end
+
 print("")
 print(fails == 0 and "ALL MACRO TESTS PASSED" or (fails .. " FAILURE(S)"))

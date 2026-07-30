@@ -112,7 +112,14 @@ do
         request = function(method, _, callback)
           next_id = next_id + 1
           if method == "initialize" then
-            callback(nil, { capabilities = { callHierarchyProvider = true } })
+            callback(nil, { capabilities = {
+              callHierarchyProvider = true, workspaceSymbolProvider = true } })
+          elseif method == "workspace/symbol" then
+            -- the LSP path resolves the symbol's real location before it
+            -- aims callHierarchy (the window-0 params sent view URIs)
+            callback(nil, { { name = "target_fn", kind = 12,
+              location = { uri = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c")), range = {
+                start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } } } } })
           elseif method == "textDocument/prepareCallHierarchy" then
             prepare_count = prepare_count + 1
             callback(nil, { { name = "target_fn", kind = 12, uri = uri1,
@@ -211,6 +218,91 @@ do
       items ~= nil and #items == 3, items and #items)
     callers._timeout_ms = saved
     vim.lsp.stop_client(cid2, true)
+  end
+end
+
+-- callers.get must reach the LSP path with the REAL file, regardless of
+-- which window is current. The old code built position params from window
+-- 0; the plugin's own keymap lives inside the reading view -- a detached
+-- nofile copy named inline-explorer://... that no server has open -- so
+-- every in-view keypress skipped LSP and paid the full-tree grep fallback
+-- (measured 558ms vs 6.5ms on the kernel).
+do
+  local seen_uri
+  vim.cmd.edit(dir .. "/lib.c")
+  local src3 = vim.api.nvim_get_current_buf()
+  local cid3 = vim.lsp.start({
+    name = "hier2",
+    cmd = function(dispatchers)
+      local closing, next_id = false, 0
+      local uri1 = vim.uri_from_fname(vim.fn.resolve(dir .. "/use1.c"))
+      local liburi = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c"))
+      return {
+        request = function(method, params, callback)
+          next_id = next_id + 1
+          if method == "initialize" then
+            callback(nil, { capabilities = {
+              callHierarchyProvider = true, workspaceSymbolProvider = true, definitionProvider = true } })
+          elseif method == "workspace/symbol" then
+            callback(nil, { { name = "target_fn", kind = 12,
+              location = { uri = liburi, range = {
+                start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } } } } })
+          elseif method == "textDocument/prepareCallHierarchy" then
+            seen_uri = params.textDocument and params.textDocument.uri
+            -- clangd answers only for documents it has: a view's
+            -- inline-explorer:// URI gets an error, same as the field.
+            if seen_uri and seen_uri:find("^file://") then
+              callback(nil, { { name = "target_fn", kind = 12, uri = liburi,
+                range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 20 } },
+                selectionRange = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } } } })
+            else
+              callback({ code = -32602, message = "trying to get AST for non-added document" }, nil)
+            end
+          elseif method == "callHierarchy/incomingCalls" then
+            callback(nil, { {
+              from = { name = "u1", kind = 12, uri = vim.uri_from_fname(vim.fn.resolve(dir .. "/use1.c")),
+                range = { start = { line = 1, character = 0 }, ["end"] = { line = 4, character = 1 } },
+                selectionRange = { start = { line = 1, character = 4 }, ["end"] = { line = 1, character = 6 } } },
+              fromRanges = { { start = { line = 3, character = 11 }, ["end"] = { line = 3, character = 20 } } },
+            } })
+          else
+            callback(nil, nil)
+          end
+          return true, next_id
+        end,
+        notify = function() return true end,
+        is_closing = function() return closing end,
+        terminate = function() closing = true; dispatchers.on_exit(0, 0) end,
+      }
+    end,
+    root_dir = dir,
+  })
+  vim.wait(2000, function()
+    return cid3 ~= nil and #vim.lsp.get_clients({ bufnr = src3, name = "hier2" }) > 0
+  end, 20)
+  if #vim.lsp.get_clients({ bufnr = src3, name = "hier2" }) == 0 then
+    print("SKIP  view-context callers checks (in-process LSP server unavailable)")
+  else
+    -- Make a detached nofile copy current, as the in-view keymap does.
+    local view = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(view, 0, -1, false,
+      vim.api.nvim_buf_get_lines(src3, 0, -1, false))
+    pcall(vim.api.nvim_buf_set_name, view, "inline-explorer://lib.c")
+    vim.api.nvim_set_current_buf(view)
+    require("inline-explorer.resolver").clear_caches()
+    local done, items, source = false, nil, nil
+    callers.get("target_fn", src3, function(i2, s2)
+      items, source = i2, s2
+      done = true
+    end)
+    vim.wait(10000, function() return done end, 10)
+    check("view context: the LSP path is reached (source=lsp, not grep)",
+      done and source == "lsp", tostring(source))
+    check("view context: prepareCallHierarchy was aimed at a real file, not the view",
+      seen_uri ~= nil and seen_uri:find("^file://") ~= nil, tostring(seen_uri))
+    vim.lsp.stop_client(cid3, true)
+    vim.api.nvim_set_current_buf(src3)
+    pcall(vim.api.nvim_buf_delete, view, { force = true })
   end
 end
 
