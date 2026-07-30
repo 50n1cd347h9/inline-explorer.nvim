@@ -121,7 +121,7 @@ jobs:
         with:
           # The key pins the tarball AND the object built from it: a change
           # to either must not reuse a tree prepared for the other.
-          key: linux-6.12-sched-core-o-v1
+          key: linux-6.12-sched-core-slub-o-v2
           path: kernel-src
       - name: Fetch and build just enough kernel
         if: steps.kcache.outputs.cache-hit != 'true'
@@ -135,7 +135,7 @@ jobs:
           # building the whole kernel in CI is not. `make compile_commands.json`
           # recurses into targets that rebuild far more than this needs, so the
           # generator script is run directly against the .cmd files instead.
-          make -s -j"$(nproc)" kernel/sched/core.o
+          make -s -j"$(nproc)" kernel/sched/core.o mm/slub.o
           python3 scripts/clang-tools/gen_compile_commands.py -d . -o compile_commands.json
       - name: Verify the kernel build produced what the spec needs
         run: |
@@ -151,6 +151,7 @@ jobs:
           # guessed flags, and every measurement would describe something
           # other than kernel source.
           test -f kernel/sched/core.o || { echo "FAILED: kernel/sched/core.o was not built"; exit 1; }
+          test -f mm/slub.o || { echo "FAILED: mm/slub.o was not built -- the kfree end-to-end check needs it"; exit 1; }
           test -f kernel/sched/.core.o.cmd || { echo "FAILED: no .core.o.cmd -- nothing for the generator to read"; exit 1; }
           python3 - <<'PY'
           import json, sys

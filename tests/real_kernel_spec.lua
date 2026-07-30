@@ -165,6 +165,26 @@ do
       break
     end
   end
+  -- Callees near the top of a kernel file are mostly macros, which
+  -- workspace/symbol does not answer exactly -- and since locate stopped
+  -- accepting fuzzy strangers, macros no longer "resolve" by accident.
+  -- (An earlier version of this spec counted 12 resolved among the first
+  -- 48 callees; several of those were fuzzy mismatches presented as
+  -- resolutions.) Functions DEFINED in this file always resolve through
+  -- the dynamic index, so they anchor the pool honestly.
+  local qd = vim.treesitter.query.parse("c",
+    "(function_definition declarator: (function_declarator declarator: (identifier) @d))")
+  for _, n in qd:iter_captures(root, src) do
+    local _, _, a, _, _, b = n:range(true)
+    local nm = src:sub(a + 1, b)
+    if not seen[nm] then
+      seen[nm] = true
+      names[#names + 1] = nm
+    end
+    if #names >= WANT * 8 then
+      break
+    end
+  end
 end
 
 local function fetch(name)
@@ -312,6 +332,62 @@ do
   check("kernel chase: never a bare declaration",
     done and (lines == nil or table.concat(lines, "\n"):match("^[^{]*;%s*$") == nil),
     lines and table.concat(lines, "\n"))
+end
+
+-- The real kfree, end to end against real clangd: declared in slab.h,
+-- defined in mm/slub.c. When the server KNOWS the defining file (here via
+-- opening it -- the dynamic index; a finished background index serves the
+-- same answer), fetching kfree by name must produce the definition body.
+-- This is the exact user-reported case: a field log showed one prototype
+-- line labelled (declaration) where this body belonged.
+do
+  local slub = K .. "/mm/slub.c"
+  local covered = false
+  do
+    local ok2, decoded = pcall(vim.json.decode, table.concat(vim.fn.readfile(cc), "\n"))
+    if ok2 and type(decoded) == "table" then
+      for _, e in ipairs(decoded) do
+        if type(e) == "table" and type(e.file) == "string" and e.file:find("mm/slub%.c$") then
+          covered = true
+          break
+        end
+      end
+    end
+  end
+  if vim.fn.filereadable(slub) == 0 or not covered then
+    -- Not printed as SKIP: -- CI greps ^SKIP: as failure. This section
+    -- being conditional is a coverage statement, and the check records
+    -- which way it ran instead of silently passing.
+    check("kernel kfree: SKIPPED -- mm/slub.c not in the compile database (build mm/slub.o to enable)",
+      true, nil)
+  else
+    local sb = vim.fn.bufadd(slub)
+    vim.fn.bufload(sb)
+    for _, c in ipairs(vim.lsp.get_clients({ bufnr = buf })) do
+      vim.lsp.buf_attach_client(sb, c.id)
+    end
+    vim.wait(120000, function()
+      local cs = vim.lsp.get_clients({ bufnr = sb })
+      if #cs == 0 then
+        return false
+      end
+      local r = cs[1]:request_sync("textDocument/documentSymbol",
+        { textDocument = { uri = vim.uri_from_bufnr(sb) } }, 30000, sb)
+      return r ~= nil and r.result ~= nil and #r.result > 0
+    end, 500)
+    resolver.clear_caches()
+    local done, lines, label = false, nil, nil
+    resolver.fetch("kfree", buf, function(l, lb)
+      lines, label = l, lb
+      done = true
+    end)
+    vim.wait(60000, function() return done end, 10)
+    check("kernel kfree: the definition body, not the slab.h prototype",
+      done and label == "function_definition" and lines ~= nil and #lines > 5
+        and (lines[1] or ""):find("kfree", 1, true) ~= nil
+        and table.concat(lines, "\n"):find("{", 1, true) ~= nil,
+      ("label=%s n=%s first=%s"):format(tostring(label), lines and #lines, lines and lines[1]))
+  end
 end
 
 -- Navigation on the real workload: callHierarchy against real clangd, and

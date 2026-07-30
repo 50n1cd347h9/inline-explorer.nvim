@@ -770,5 +770,61 @@ do
   end
 end
 
+-- A fuzzy stranger is not an answer. With no exact workspace/symbol
+-- match, the old locate took the server's first fuzzy suggestion --
+-- against real clangd with no compile database, fetching kfree expanded
+-- ATOMIC_CHAR16_T_LOCK_FREE @ stdatomic.h. Wrong body, no warning.
+do
+  local jpath = vim.fn.tempname() .. ".c"
+  local jf = assert(io.open(jpath, "w"))
+  jf:write("int other_thing(void)\n{\n    return 1;\n}\n")
+  jf:close()
+  vim.cmd.edit(jpath)
+  local jbuf = vim.api.nvim_get_current_buf()
+  local jcid = vim.lsp.start({
+    name = "fuzzy",
+    cmd = function(dispatchers)
+      local closing, next_id = false, 0
+      return {
+        request = function(method, _, callback)
+          next_id = next_id + 1
+          if method == "initialize" then
+            callback(nil, { capabilities = { workspaceSymbolProvider = true } })
+          elseif method == "workspace/symbol" then
+            callback(nil, { { name = "ATOMIC_CHAR16_T_LOCK_FREE", kind = 14,
+              location = { uri = vim.uri_from_fname(jpath), range = {
+                start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 15 } } } } })
+          else
+            callback(nil, nil)
+          end
+          return true, next_id
+        end,
+        notify = function() return true end,
+        is_closing = function() return closing end,
+        terminate = function() closing = true; dispatchers.on_exit(0, 0) end,
+      }
+    end,
+    root_dir = vim.fn.fnamemodify(jpath, ":h"),
+  })
+  vim.wait(2000, function()
+    return jcid ~= nil and #vim.lsp.get_clients({ bufnr = jbuf, name = "fuzzy" }) > 0
+  end, 20)
+  if #vim.lsp.get_clients({ bufnr = jbuf, name = "fuzzy" }) == 0 then
+    print("SKIP  fuzzy-stranger checks (in-process LSP server unavailable)")
+  else
+    resolver.clear_caches()
+    local done, loc, lerr
+    resolver.locate("kfree", jbuf, function(l, e)
+      loc, lerr = l, e
+      done = true
+    end)
+    vim.wait(5000, function() return done end, 5)
+    check("locate: a fuzzy-only answer is a not-found, never a stranger's body",
+      loc == nil and lerr ~= nil and lerr:find("kfree", 1, true) ~= nil
+        and lerr:find("ATOMIC_CHAR16_T_LOCK_FREE", 1, true) ~= nil, tostring(lerr))
+    vim.lsp.stop_client(jcid, true)
+  end
+end
+
 print("")
 print(fails == 0 and "ALL RESOLVER TESTS PASSED" or (fails .. " FAILURE(S)"))

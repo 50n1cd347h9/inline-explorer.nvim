@@ -244,7 +244,12 @@ function M.locate(name, source_bufnr, cb)
       return finish(nil, "no symbol named '" .. name .. "'")
     end
 
-    -- Prefer an exact-name match; servers fuzzy-match otherwise.
+    -- Exact name or nothing. workspace/symbol fuzzy-matches, and falling
+    -- back to its first suggestion expands a STRANGER without saying so:
+    -- measured against real clangd with no compile database, fetching
+    -- kfree returned ATOMIC_CHAR16_T_LOCK_FREE @ stdatomic.h -- a wrong
+    -- body, silently, where an honest "not found" would have pointed at
+    -- the actual problem (an index that does not know the name).
     local pick
     for _, s in ipairs(all) do
       if s.name == name then
@@ -252,7 +257,10 @@ function M.locate(name, source_bufnr, cb)
         break
       end
     end
-    pick = pick or all[1]
+    if not pick then
+      return finish(nil, ("no symbol named exactly '%s' (closest: %s -- index incomplete?)"):format(
+        name, all[1].name or "?"))
+    end
 
     local loc = pick.location
     finish({ uri = loc.uri, range = loc.range, kind = pick.kind, name = pick.name }, nil)
@@ -802,41 +810,55 @@ function M._chase_definition(loc, cb)
 
   local span = profile.start()
   local answered = false
-  local function finish(dloc)
+  -- A miss says WHY. Two rounds of field logs read "chase-miss 220ms" and
+  -- discriminated nothing: a server error, an empty answer, the
+  -- declaration handed back as its own definition (an index that has never
+  -- seen the defining file), and a timeout all collapsed into one word,
+  -- and every hypothesis about which it was cost a full round trip to the
+  -- machine that has the problem.
+  local function finish(dloc, why)
     if answered then
       return
     end
     answered = true
+    local d = (loc.name or "?") .. " @ " .. vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")
     span(dloc and "locate:definition-chase" or "locate:chase-miss",
-      (loc.name or "?") .. " @ " .. vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t"))
+      dloc and d or (d .. " (" .. (why or "?") .. ")"))
     cb(dloc)
   end
   vim.defer_fn(function()
-    finish(nil)
+    finish(nil, "timeout")
   end, M._timeout_ms)
   clients[1]:request("textDocument/definition", {
     textDocument = { uri = loc.uri },
     position = pos,
   }, function(err, result)
-    if err or not result then
-      return finish(nil)
+    if err then
+      return finish(nil, "err: " .. tostring(err.message or err):sub(1, 60))
+    end
+    if not result then
+      return finish(nil, "nil result")
     end
     local first = result
     if vim.islist(result) then
       first = result[1]
     end
     if not first then
-      return finish(nil)
+      return finish(nil, "empty -- the index has no answer for this position")
     end
     -- Location or LocationLink; normalize to { uri, range }.
     local uri = first.uri or first.targetUri
     local range = first.range or first.targetSelectionRange or first.targetRange
     if not uri or not range then
-      return finish(nil)
+      return finish(nil, "no location in the answer")
     end
-    -- The definition being the declaration itself is a miss, not progress.
+    -- The definition being the declaration itself is a miss, not progress
+    -- -- and a diagnostic one: a server that answers a definition request
+    -- with the declaration is saying its index has never seen the defining
+    -- file. No compile database at the source root (an out-of-tree build,
+    -- e.g. buildroot, leaves none there) produces exactly this.
     if uri == loc.uri and range.start.line == pos.line then
-      return finish(nil)
+      return finish(nil, "self -- the index does not know the defining file (compile_commands.json missing?)")
     end
     finish({ uri = uri, range = range, kind = loc.kind, name = loc.name })
   end, target)
