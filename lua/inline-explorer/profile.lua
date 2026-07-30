@@ -27,6 +27,25 @@ local function noop() end
 -- written in.
 M.action = 0
 
+-- Server identity, logged once per client per session. The flags a server
+-- was started with, and its version, decide how it behaves on a first touch
+-- of a header -- and they are exactly what a log from someone else's machine
+-- cannot otherwise reveal. Without this, reproducing a stall means guessing
+-- at another environment's configuration one variable at a time.
+M._identified = {}
+
+function M.identify(client)
+  if not M.enabled or not client or M._identified[client.id] then
+    return
+  end
+  M._identified[client.id] = true
+  local info = client.server_info or {}
+  local cmd = client.config and client.config.cmd
+  local cmdstr = type(cmd) == "table" and table.concat(cmd, " ") or (type(cmd) == "function" and "<in-process>" or tostring(cmd))
+  local sp = M.start()
+  sp("server", ("%s %s | %s"):format(info.name or client.name or "?", info.version or "?", cmdstr))
+end
+
 function M.begin_action()
   M.action = M.action + 1
   return M.action

@@ -426,6 +426,9 @@ function M.extract(loc, source_bufnr, cb)
   local span = profile.start()
   local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
   local clients = vim.lsp.get_clients({ bufnr = bufnr })
+  for _, c in ipairs(clients) do
+    profile.identify(c)
+  end
   if #clients == 0 then
     local lines, label = M.extract_sync(loc)
     span("extract:no-lsp")
@@ -557,6 +560,28 @@ function M.extract(loc, source_bufnr, cb)
     cb(lines, label)
   end, function()
     timed_out = true
+    -- Re-issue the SAME request in the background and log how long it takes.
+    -- This is the one measurement that separates the two families of cause,
+    -- and it can only be taken on the machine that has the problem: a fast
+    -- retry means the server was building this file's preamble and has now
+    -- finished (a timing problem, which the shortened cold budget already
+    -- handles); a retry that is also slow means something about this file is
+    -- structurally expensive for this server -- inferred flags, a config we
+    -- cannot see -- and no budget will fix it.
+    --
+    -- Costs nothing when profiling is off: the whole block is skipped.
+    if profile.enabled then
+      local probe = profile.start()
+      local answered = false
+      vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(res)
+        for _, r in pairs(res or {}) do
+          if r.result then
+            answered = true
+          end
+        end
+        probe(answered and "extract:retry-after-timeout" or "extract:retry-failed", detail())
+      end)
+    end
     -- Name the file and say what happens next. "timed out" alone left the
     -- user with no way to tell a server that is wedged from one that is
     -- merely building a preamble for a file it has not seen -- and no
