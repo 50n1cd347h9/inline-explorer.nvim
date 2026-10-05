@@ -2,29 +2,28 @@
 --   nvim --headless --clean -u NONE -c "luafile tests/macro_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
 local macro = require("inline-explorer.macro")
 
-if not pcall(vim.treesitter.get_string_parser, "int x;", "c") then
-  print("SKIP: c parser unavailable")
+if not H.require_c_parser() then
   return
 end
 
-local fails = 0
-local function check(l, ok, d)
-  if ok then
-    print("PASS  " .. l)
-  else
-    fails = fails + 1
-    print("FAIL  " .. l .. (d ~= nil and ("\n----\n" .. tostring(d) .. "\n----") or ""))
-  end
-end
+local check = H.check
 
 -- clangd puts #define + "// Expands to" + expansion in a single code block.
 local hover_inline = table.concat({
-  "### `READ_ONCE`", "", "```c",
-  "#define READ_ONCE(x) ({ compiletime_assert_rwonce_type(x); __READ_ONCE(x); })", "",
-  "// Expands to", "",
-  "({", "    do { assert(); } while (0);", "    (*(volatile typeof(v) *)&(v));", "})",
+  "### `READ_ONCE`",
+  "",
+  "```c",
+  "#define READ_ONCE(x) ({ compiletime_assert_rwonce_type(x); __READ_ONCE(x); })",
+  "",
+  "// Expands to",
+  "",
+  "({",
+  "    do { assert(); } while (0);",
+  "    (*(volatile typeof(v) *)&(v));",
+  "})",
   "```",
 }, "\n")
 -- Older/alternate: separate code blocks with a plain "Expands to" line.
@@ -32,8 +31,15 @@ local hover_blocks = "### macro `MASK`\n```c\n#define MASK (0x3U << 0)\n```\n\nE
 
 do
   local e = table.concat(macro._expansion_lines(hover_inline), "\n")
-  check("expansion after inline '// Expands to', #define dropped", e:find("({", 1, true) and not e:find("#define", 1, true), e)
-  check("separate-block 'Expands to' -> value", table.concat(macro._expansion_lines(hover_blocks), "\n") == "(0x3U << 0)")
+  check(
+    "expansion after inline '// Expands to', #define dropped",
+    e:find("({", 1, true) and not e:find("#define", 1, true),
+    e
+  )
+  check(
+    "separate-block 'Expands to' -> value",
+    table.concat(macro._expansion_lines(hover_blocks), "\n") == "(0x3U << 0)"
+  )
   -- A plain function-signature hover has no "Expands to" -> not a macro.
   local sig = "### `foo`\n```c\nint foo(int a)\n```"
   check("function-signature hover -> nil (not spliced as a macro)", macro._expansion_lines(sig) == nil)
@@ -44,7 +50,11 @@ do
   local src = "int f(int x) { return x & MASK; }"
   local col = src:find("MASK") - 1
   local new = macro.replace_in_src(src, 0, col, { "(0x3U << 0)" })
-  check("object macro replaced, no double parens", new:find("x & (0x3U << 0)", 1, true) and not new:find("((0x3U", 1, true), new)
+  check(
+    "object macro replaced, no double parens",
+    new:find("x & (0x3U << 0)", 1, true) and not new:find("((0x3U", 1, true),
+    new
+  )
 end
 
 -- Function-like macro invocation -> whole call replaced.
@@ -68,18 +78,38 @@ end
 -- response, in both shapes the protocol allows.
 do
   local as_code_action = {
-    { title = "Inline function", kind = "refactor.inline", command = { command = "clangd.applyTweak", arguments = { { tweakID = "InlineFunction" } } } },
-    { title = "Expand macro READ_ONCE", kind = "refactor", command = { command = "clangd.applyTweak", arguments = { { tweakID = "ExpandMacro" } } } },
+    {
+      title = "Inline function",
+      kind = "refactor.inline",
+      command = { command = "clangd.applyTweak", arguments = { { tweakID = "InlineFunction" } } },
+    },
+    {
+      title = "Expand macro READ_ONCE",
+      kind = "refactor",
+      command = { command = "clangd.applyTweak", arguments = { { tweakID = "ExpandMacro" } } },
+    },
   }
   local cmd = macro._pick_expand_action(as_code_action)
-  check("pick: CodeAction shape -> inner command", cmd ~= nil and cmd.command == "clangd.applyTweak", cmd and vim.inspect(cmd))
-  check("pick: picks the Expand macro action, not Inline", cmd ~= nil and cmd.arguments[1].tweakID == "ExpandMacro", cmd and vim.inspect(cmd))
+  check(
+    "pick: CodeAction shape -> inner command",
+    cmd ~= nil and cmd.command == "clangd.applyTweak",
+    cmd and vim.inspect(cmd)
+  )
+  check(
+    "pick: picks the Expand macro action, not Inline",
+    cmd ~= nil and cmd.arguments[1].tweakID == "ExpandMacro",
+    cmd and vim.inspect(cmd)
+  )
 
   local as_command = {
     { title = "Expand macro FOO", command = "clangd.applyTweak", arguments = { { tweakID = "ExpandMacro" } } },
   }
   local cmd2 = macro._pick_expand_action(as_command)
-  check("pick: bare Command shape accepted", cmd2 ~= nil and cmd2.command == "clangd.applyTweak", cmd2 and vim.inspect(cmd2))
+  check(
+    "pick: bare Command shape accepted",
+    cmd2 ~= nil and cmd2.command == "clangd.applyTweak",
+    cmd2 and vim.inspect(cmd2)
+  )
 
   check("pick: no expand action -> nil", macro._pick_expand_action({
     { title = "Add include", kind = "quickfix" },
@@ -94,19 +124,32 @@ do
   local range = { start = { line = 3, character = 8 }, ["end"] = { line = 3, character = 12 } }
 
   local changes_shape = { changes = { [uri] = { { range = range, newText = "(0x3U << 0)" } } } }
-  check("edit: changes shape -> lines", table.concat(macro._edit_lines(changes_shape, uri) or {}, "\n") == "(0x3U << 0)")
+  check(
+    "edit: changes shape -> lines",
+    table.concat(macro._edit_lines(changes_shape, uri) or {}, "\n") == "(0x3U << 0)"
+  )
 
   local doc_changes_shape = {
     documentChanges = {
       { textDocument = { uri = "file:///other.c", version = 1 }, edits = { { range = range, newText = "WRONG" } } },
-      { textDocument = { uri = uri, version = 1 }, edits = { { range = range, newText = "({\n    do { } while (0);\n    v;\n})" } } },
+      {
+        textDocument = { uri = uri, version = 1 },
+        edits = { { range = range, newText = "({\n    do { } while (0);\n    v;\n})" } },
+      },
     },
   }
   local lines = macro._edit_lines(doc_changes_shape, uri)
-  check("edit: documentChanges shape, uri-matched", lines ~= nil and lines[1] == "({" and lines[#lines] == "})", lines and vim.inspect(lines))
+  check(
+    "edit: documentChanges shape, uri-matched",
+    lines ~= nil and lines[1] == "({" and lines[#lines] == "})",
+    lines and vim.inspect(lines)
+  )
 
   check("edit: wrong uri -> nil", macro._edit_lines(changes_shape, "file:///nope.c") == nil)
-  check("edit: empty newText -> nil", macro._edit_lines({ changes = { [uri] = { { range = range, newText = "" } } } }, uri) == nil)
+  check(
+    "edit: empty newText -> nil",
+    macro._edit_lines({ changes = { [uri] = { { range = range, newText = "" } } } }, uri) == nil
+  )
   check("edit: nil input tolerated", macro._edit_lines(nil, uri) == nil)
 end
 
@@ -118,8 +161,14 @@ do
   local inr = { start = { line = 3, character = 8 }, ["end"] = { line = 3, character = 12 } }
   local outr = { start = { line = 9, character = 0 }, ["end"] = { line = 9, character = 4 } }
 
-  check("matches: single-doc changes, range covers pos", macro._edit_matches({ changes = { [uri] = { { range = inr, newText = "X" } } } }, uri, pos) == true)
-  check("matches: range does not cover pos -> false", macro._edit_matches({ changes = { [uri] = { { range = outr, newText = "X" } } } }, uri, pos) == false)
+  check(
+    "matches: single-doc changes, range covers pos",
+    macro._edit_matches({ changes = { [uri] = { { range = inr, newText = "X" } } } }, uri, pos) == true
+  )
+  check(
+    "matches: range does not cover pos -> false",
+    macro._edit_matches({ changes = { [uri] = { { range = outr, newText = "X" } } } }, uri, pos) == false
+  )
   check("matches: two documents in changes -> false", macro._edit_matches({
     changes = { [uri] = { { range = inr, newText = "X" } }, ["file:///other.c"] = { { range = inr, newText = "Y" } } },
   }, uri, pos) == false)
@@ -161,10 +210,14 @@ do
   local ok, err = pcall(function()
     -- (a) active fetch consumes the matching edit exactly once.
     local got, calls = nil, 0
-    local a = { uri = uri, pos = pos, on_edit = function(e)
-      calls = calls + 1
-      got = e
-    end }
+    local a = {
+      uri = uri,
+      pos = pos,
+      on_edit = function(e)
+        calls = calls + 1
+        got = e
+      end,
+    }
     macro._pending[1] = { a }
     local r = h(nil, { edit = mine })
     check("interceptor: active fetch consumes matching edit", calls == 1 and got == mine)
@@ -185,9 +238,13 @@ do
 
     -- (d) a foreign edit mid-fetch still reaches the original handler, and the
     -- in-flight fetch keeps its claim.
-    local p = { uri = uri, pos = pos, on_edit = function()
-      check("interceptor: foreign edit must not be consumed", false)
-    end }
+    local p = {
+      uri = uri,
+      pos = pos,
+      on_edit = function()
+        check("interceptor: foreign edit must not be consumed", false)
+      end,
+    }
     macro._pending[1] = { p }
     h(nil, { edit = foreign })
     check("interceptor: foreign edit delegated mid-fetch", delegated == 2)
@@ -205,7 +262,16 @@ do
   local uri = "file:///src/x.c"
   local posA, posB = { line = 3, character = 10 }, { line = 7, character = 4 }
   local function edit_at(line, c0, c1)
-    return { changes = { [uri] = { { range = { start = { line = line, character = c0 }, ["end"] = { line = line, character = c1 } }, newText = "X" } } } }
+    return {
+      changes = {
+        [uri] = {
+          {
+            range = { start = { line = line, character = c0 }, ["end"] = { line = line, character = c1 } },
+            newText = "X",
+          },
+        },
+      },
+    }
   end
   local editA, editB = edit_at(3, 8, 12), edit_at(7, 2, 6)
 
@@ -221,8 +287,20 @@ do
   end
   local ok, err = pcall(function()
     local callsA, callsB = 0, 0
-    local A = { uri = uri, pos = posA, on_edit = function() callsA = callsA + 1 end }
-    local B = { uri = uri, pos = posB, on_edit = function() callsB = callsB + 1 end }
+    local A = {
+      uri = uri,
+      pos = posA,
+      on_edit = function()
+        callsA = callsA + 1
+      end,
+    }
+    local B = {
+      uri = uri,
+      pos = posB,
+      on_edit = function()
+        callsB = callsB + 1
+      end,
+    }
     macro._pending[2] = { A, B } -- A is the older fetch, B supersedes it
 
     -- (1) the older fetch is still answered, and the newer one is untouched.
@@ -261,7 +339,7 @@ do
   local first = client.handlers["workspace/applyEdit"]
 
   local foreign_calls = 0
-  client.handlers["workspace/applyEdit"] = function()
+  client.handlers["workspace/applyEdit"] = function(_, _)
     foreign_calls = foreign_calls + 1
     return { applied = true }
   end
@@ -269,7 +347,15 @@ do
   local h = client.handlers["workspace/applyEdit"]
   check("reinstall: a replaced handler is re-wrapped", h ~= first and type(h) == "function")
 
-  h(nil, { edit = { changes = { ["file:///other.c"] = { { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } }, newText = "y" } } } } })
+  h(nil, {
+    edit = {
+      changes = {
+        ["file:///other.c"] = {
+          { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } }, newText = "y" },
+        },
+      },
+    },
+  })
   check("reinstall: the foreign handler is chained as prev", foreign_calls == 1)
 
   macro._install_interceptor(client)
@@ -298,7 +384,11 @@ do
   local range14 = { start = { line = 1, character = 0 }, ["end"] = { line = 4, character = 0 } }
   local padded = { changes = { [uri] = { { range = range14, newText = "\n\n(v + 1)\n\n" } } } }
   local lines = macro._edit_lines(padded, uri)
-  check("edit: blank edge lines trimmed", lines ~= nil and #lines == 1 and lines[1] == "(v + 1)", lines and vim.inspect(lines))
+  check(
+    "edit: blank edge lines trimmed",
+    lines ~= nil and #lines == 1 and lines[1] == "(v + 1)",
+    lines and vim.inspect(lines)
+  )
 end
 
 -- Housekeeping: claims and interceptor bookkeeping for dead client ids are
@@ -319,12 +409,13 @@ end
 do
   local src = "void f(void) { fa->len = READ_ONCE(sqe->len); }"
   local col = src:find("READ_ONCE") - 1
-  local out = macro.replace_in_src(src, 0, col,
-    { " ({ do { } while (0); (*(&x)); })" })
-  check("splice: leading space does not cause a second paren wrap",
-    out:find("( ({", 1, true) == nil and out:find("(({", 1, true) == nil, out)
-  check("splice: the statement expression itself survives",
-    out:find("({ do { } while (0);", 1, true) ~= nil, out)
+  local out = macro.replace_in_src(src, 0, col, { " ({ do { } while (0); (*(&x)); })" })
+  check(
+    "splice: leading space does not cause a second paren wrap",
+    out:find("( ({", 1, true) == nil and out:find("(({", 1, true) == nil,
+    out
+  )
+  check("splice: the statement expression itself survives", out:find("({ do { } while (0);", 1, true) ~= nil, out)
 end
 
 -- And the class, not just the instance: even when a wrap IS added for
@@ -334,8 +425,11 @@ do
   local src = "void f(void) { y = M(a) * 2; }"
   local col = src:find("M%(") - 1
   local out = macro.replace_in_src(src, 0, col, { "(a + 1)" })
-  check("splice: wrapping a parenthesized expansion yields ONE pair",
-    out:find("(a + 1) * 2", 1, true) ~= nil and out:find("((a + 1))", 1, true) == nil, out)
+  check(
+    "splice: wrapping a parenthesized expansion yields ONE pair",
+    out:find("(a + 1) * 2", 1, true) ~= nil and out:find("((a + 1))", 1, true) == nil,
+    out
+  )
 end
 
 -- The macro splice must ride csrc's parse cache. macro.lua carried a
@@ -362,9 +456,11 @@ do
   local col = src:find("M%(") - 1
   macro.replace_in_src(src, 0, col, { "(1 + 0)" })
   vim.treesitter.get_string_parser = real
-  check("splice: rides the shared parse cache (zero caller re-parses for warm text)",
-    made == 0, ("caller parses=%d"):format(made))
+  check(
+    "splice: rides the shared parse cache (zero caller re-parses for warm text)",
+    made == 0,
+    ("caller parses=%d"):format(made)
+  )
 end
 
-print("")
-print(fails == 0 and "ALL MACRO TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("MACRO")

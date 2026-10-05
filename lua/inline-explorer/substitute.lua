@@ -33,16 +33,16 @@ local M = {}
 -- Build the transform. Returns (new_caller_src, err).
 -- mode: "correct" (default, guaranteed to compile) or "readable" (cleaner
 -- output that skips ({...})/goto and may not compile in edge cases).
-function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
-  N = N or 1
-  occ = occ or 1
-  mode = mode or "correct"
-
-  local ir, ctx, err = A.analyze_call(caller_src, callee_src, fname, N, occ)
+local function print_call(caller_src, ir, ctx, err, mode)
   if not ir then
     return nil, err
   end
-  return P.PRINTERS[A.decide(ir, ctx, mode)](caller_src, ir, ctx)
+  return P.PRINTERS[A.decide(ir, ctx, mode or "correct")](caller_src, ir, ctx)
+end
+
+function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
+  local ir, ctx, err = A.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
+  return print_call(caller_src, ir, ctx, err, mode)
 end
 
 -- Test/introspection hook: run the analysis without printing.
@@ -77,30 +77,10 @@ function M._render(caller_src, callee_src, fname, N, occ, printer)
   return p(caller_src, ir, ctx)
 end
 
--- Climb from (row, col) to the innermost enclosing call_expression node.
-local function call_at(root, row, col)
-  local node = root:named_descendant_for_range(row, col, row, col)
-  while node and node:type() ~= "call_expression" do
-    node = node:parent()
-  end
-  return node
-end
-
--- Name of the function called at (row, col), or nil.
-function M.call_name_at(caller_src, row, col)
-  local call = call_at(C.parse(caller_src), row, col)
-  if not call then
-    return nil
-  end
-  local fn = call:field("function")[1]
-  return fn and fn:type() == "identifier" and C.text(fn, caller_src) or nil
-end
-
--- Inline the call under the cursor (row, col are 0-indexed). Resolves the call to
--- an occurrence index and delegates to inline_call.
-function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode)
-  local root = C.parse(caller_src)
-  local call = call_at(root, row, col)
+-- The innermost call at (row, col) and the plain function name it calls;
+-- nil and a reason when there is no call or its target is not a name.
+local function named_call_at(caller_src, row, col)
+  local call = C.ancestor_at(C.parse(caller_src), row, col, "call_expression")
   if not call then
     return nil, "no call under the cursor"
   end
@@ -108,29 +88,26 @@ function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode)
   if not fn or fn:type() ~= "identifier" then
     return nil, "call target is not a plain function name"
   end
-  local fname = C.text(fn, caller_src)
+  return call, C.text(fn, caller_src)
+end
 
-  -- Count occurrences only up to the already-located call: collecting every
-  -- call in the file to number one of them re-paid the whole-file walk
-  -- (half of the measured 72ms on a 22k-line file). Calls before the cursor
-  -- are the only ones that can affect its occurrence index, so the walk
-  -- stops at the located byte.
-  local occ, i = nil, 0
-  local q = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
-  local target_sb = C.sb(call)
-  for _, id in q:iter_captures(root, caller_src) do
-    if C.text(id, caller_src) == fname then
-      i = i + 1
-      if C.sb(id:parent()) == target_sb then
-        occ = i
-        break
-      end
-      if C.sb(id) > target_sb then
-        break -- past the cursor: the located call was not a plain match
-      end
-    end
+-- Name of the function called at (row, col), or nil.
+function M.call_name_at(caller_src, row, col)
+  local call, fname = named_call_at(caller_src, row, col)
+  return call and fname or nil
+end
+
+-- Inline the call under the cursor (row, col are 0-indexed). The located
+-- call node goes straight to the analysis; numbering it as an occurrence
+-- only for analyze_call to walk the file again and find it was a second
+-- and third search for a node already in hand.
+function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode)
+  local call, fname = named_call_at(caller_src, row, col)
+  if not call then
+    return nil, fname
   end
-  return M.inline_call(caller_src, callee_src, fname, N, occ or 1, mode)
+  local ir, ctx, err = A.analyze_call_node(caller_src, callee_src, fname, N or 1, call)
+  return print_call(caller_src, ir, ctx, err, mode)
 end
 
 return M

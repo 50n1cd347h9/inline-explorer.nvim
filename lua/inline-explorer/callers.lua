@@ -57,11 +57,17 @@ local function grep_callers(name, root, cb)
   -- truncation without a second source of truth.
   local shellcmd
   if vim.fn.executable("rg") == 1 then
-    shellcmd = ("rg --vimgrep --word-regexp --max-count 50 %s %s | head -n %d")
-      :format(vim.fn.shellescape(name), vim.fn.shellescape(root), M._grep_max + 1)
+    shellcmd = ("rg --vimgrep --word-regexp --max-count 50 %s %s | head -n %d"):format(
+      vim.fn.shellescape(name),
+      vim.fn.shellescape(root),
+      M._grep_max + 1
+    )
   else
-    shellcmd = ("grep -rnw %s %s | head -n %d")
-      :format(vim.fn.shellescape(name), vim.fn.shellescape(root), M._grep_max + 1)
+    shellcmd = ("grep -rnw %s %s | head -n %d"):format(
+      vim.fn.shellescape(name),
+      vim.fn.shellescape(root),
+      M._grep_max + 1
+    )
   end
   vim.system({ "sh", "-c", shellcmd }, { text = true }, function(out)
     local hits_by_file, n, truncated = {}, 0, false
@@ -80,7 +86,7 @@ local function grep_callers(name, root, cb)
         -- hidden it everywhere rg exists. Find the identifier in the line,
         -- word-bounded, instead of guessing.
         if file and text then
-          local s0 = text:find("%f[%w_]" .. name .. "%f[^%w_]")
+          local s0 = text:find("%f[%w_]" .. vim.pesc(name) .. "%f[^%w_]")
           col = tostring(s0 or 1)
         end
       end
@@ -103,37 +109,20 @@ local function grep_callers(name, root, cb)
           local pok, root_node = pcall(C.parse, src)
           if pok then
             for _, h in ipairs(hits) do
-              local node = root_node:named_descendant_for_range(h.lnum, h.col, h.lnum, h.col)
-              -- climb to the call_expression whose callee is this identifier
-              local is_call = false
-              local nd = node
-              while nd do
-                if nd:type() == "call_expression" then
-                  local fn = nd:field("function")[1]
-                  if fn and C.text(fn, src) == name then
-                    is_call = true
-                  end
-                  break
-                end
-                nd = nd:parent()
-              end
-              if is_call then
+              -- the innermost call_expression must be calling this identifier
+              local call = C.ancestor_at(root_node, h.lnum, h.col, "call_expression")
+              local fn = call and call:field("function")[1]
+              if fn and C.text(fn, src) == name then
                 -- enclosing function name, "?" when there is none
-                local encl = "?"
-                local up = node
-                while up do
-                  if up:type() == "function_definition" then
-                    local fd = C.func_declarator(up:field("declarator")[1])
-                    encl = (fd and C.decl_name(fd:field("declarator")[1], src)) or "?"
-                    break
-                  end
-                  up = up:parent()
-                end
+                local fdef = C.ancestor_at(root_node, h.lnum, h.col, "function_definition")
+                local encl = fdef and C.function_name(fdef, src) or "?"
                 items[#items + 1] = {
                   name = encl,
                   uri = vim.uri_from_fname(file),
-                  range = { start = { line = h.lnum, character = h.col },
-                    ["end"] = { line = h.lnum, character = h.col + #name } },
+                  range = {
+                    start = { line = h.lnum, character = h.col },
+                    ["end"] = { line = h.lnum, character = h.col + #name },
+                  },
                   text = vim.trim(flines[h.lnum + 1] or ""), -- sliced from the read we already did
                 }
               end
@@ -214,9 +203,7 @@ function M._hierarchy(client, target, params, name, root, cb)
     local item = result[1]
     resolver.client_request(client, "callHierarchy/incomingCalls", { item = item }, function(ierr, calls)
       if ierr or not calls or #calls == 0 then
-        return grep_callers(name, root, function(items, source, gerr)
-          finish(items, source, gerr)
-        end)
+        return grep_callers(name, root, finish)
       end
       local items = {}
       for _, call in ipairs(calls) do

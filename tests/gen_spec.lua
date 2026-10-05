@@ -4,22 +4,15 @@
 --   nvim --headless --clean -u NONE -c "luafile tests/gen_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
 local gen = require("tests.lib.gen")
+local C = require("inline-explorer.csrc")
 
-if not pcall(vim.treesitter.get_string_parser, "int x;", "c") then
-  print("SKIP: c parser unavailable")
+if not H.require_c_parser() then
   return
 end
 
-local fails = 0
-local function check(l, ok, d)
-  if ok then
-    print("PASS  " .. l)
-  else
-    fails = fails + 1
-    print("FAIL  " .. l .. (d and ("\n----\n" .. tostring(d) .. "\n----") or ""))
-  end
-end
+local check = H.check
 
 -- Determinism: same seed, same case, same rendering.
 do
@@ -38,8 +31,7 @@ do
     local case = gen.case(gen.rng(seed))
     ctx_seen[case.ctx] = true
     local rc = gen.render(case)
-    local root = vim.treesitter.get_string_parser(rc.program_src, "c"):parse()[1]:root()
-    if not root:has_error() then
+    if not C.parse(rc.program_src):has_error() then
       parse_ok = parse_ok + 1
     end
     -- (row, col) must sit on the callee's name at a call site.
@@ -69,8 +61,7 @@ do
   check("shrink reaches 0 params", #small.params == 0, #small.params)
   check("shrink reaches ctx 1", small.ctx == 1, small.ctx)
   local rc = gen.render(small)
-  local root = vim.treesitter.get_string_parser(rc.program_src, "c"):parse()[1]:root()
-  check("fully shrunk case still renders parseable C", not root:has_error(), rc.program_src)
+  check("fully shrunk case still renders parseable C", not C.parse(rc.program_src):has_error(), rc.program_src)
 end
 
 -- Function-scope name uniqueness: params and top-level locals share the
@@ -108,27 +99,18 @@ end
 
 -- With gcc: original programs must compile AND run (exit 0) for 20 seeds.
 if vim.fn.executable("gcc") == 1 then
-  local tmp = vim.fn.tempname()
-  vim.fn.mkdir(tmp, "p")
+  local cc = require("tests.lib.cc")
+  local tmp = H.tmpdir()
   local bad
   for seed = 1, 20 do
     local rc = gen.render(gen.case(gen.rng(seed)))
-    local cpath, exe = tmp .. "/g" .. seed .. ".c", tmp .. "/g" .. seed .. ".out"
-    local fh = assert(io.open(cpath, "w"))
-    fh:write(rc.program_src)
-    fh:close()
-    local out = vim.fn.system({
-      "gcc", "-std=gnu11", "-Werror=implicit-function-declaration",
-      "-Wno-unused-label", "-Wno-unused-variable", "-Wno-unused-but-set-variable",
-      cpath, "-o", exe,
-    })
-    if vim.v.shell_error ~= 0 then
-      bad = "seed " .. seed .. " compile:\n" .. out .. "\n" .. rc.program_src
+    local out, code = cc.build_run(rc.program_src, tmp .. "/g" .. seed .. ".c", tmp .. "/g" .. seed .. ".out")
+    if out == nil then
+      bad = "seed " .. seed .. " compile:\n" .. code .. "\n" .. rc.program_src
       break
     end
-    vim.fn.system({ exe })
-    if vim.v.shell_error ~= 0 then
-      bad = "seed " .. seed .. " runtime exit " .. vim.v.shell_error
+    if code ~= 0 then
+      bad = "seed " .. seed .. " runtime exit " .. code
       break
     end
   end
@@ -137,5 +119,4 @@ else
   print("SKIP  gcc checks (gcc not found)")
 end
 
-print("")
-print(fails == 0 and "ALL GEN TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("GEN")

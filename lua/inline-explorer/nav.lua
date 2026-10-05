@@ -2,36 +2,37 @@
 -- list every block in the location list, and a breadcrumb of the expansions
 -- the cursor is inside (outermost first) for statuslines.
 local view = require("inline-explorer.view")
+local util = require("inline-explorer.util")
 
 local M = {}
 
 local function notify(msg)
-  vim.notify("[inline-explorer] " .. msg, vim.log.levels.INFO)
+  util.notify(msg, vim.log.levels.INFO)
 end
 
 -- Live blocks as sorted { s, e, name } (0-based rows, extmark-tracked).
 local function blocks(st, bufnr)
-  local out = {}
-  for _, node in ipairs(st.nodes) do
-    local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, view.ns, node.s_mark, {})
-    local e = vim.api.nvim_buf_get_extmark_by_id(bufnr, view.ns, node.e_mark, {})
-    if s[1] and e[1] then
-      out[#out + 1] = { s = s[1], e = e[1], name = node.name }
-    end
-  end
+  local out = view.live_nodes(st, bufnr)
   table.sort(out, function(a, b)
     return a.s < b.s
   end)
   return out
 end
 
-function M.next()
+-- The view state, its buffer, and the cursor row (0-based); nil outside a view.
+local function ctx()
   local st = view.current()
+  if not st then
+    return nil
+  end
+  return st, vim.api.nvim_get_current_buf(), vim.api.nvim_win_get_cursor(0)[1] - 1
+end
+
+function M.next()
+  local st, bufnr, row = ctx()
   if not st then
     return notify("not in a reading view")
   end
-  local bufnr = vim.api.nvim_get_current_buf()
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
   for _, b in ipairs(blocks(st, bufnr)) do
     if b.s > row then
       return vim.api.nvim_win_set_cursor(0, { b.s + 1, 0 })
@@ -41,12 +42,10 @@ function M.next()
 end
 
 function M.prev()
-  local st = view.current()
+  local st, bufnr, row = ctx()
   if not st then
     return notify("not in a reading view")
   end
-  local bufnr = vim.api.nvim_get_current_buf()
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
   local bs = blocks(st, bufnr)
   for i = #bs, 1, -1 do
     if bs[i].s < row then
@@ -58,11 +57,10 @@ end
 
 -- Populate the location list with every expansion block.
 function M.list()
-  local st = view.current()
+  local st, bufnr = ctx()
   if not st then
     return notify("not in a reading view")
   end
-  local bufnr = vim.api.nvim_get_current_buf()
   local items = {}
   for _, b in ipairs(blocks(st, bufnr)) do
     items[#items + 1] = {
@@ -81,12 +79,10 @@ end
 -- Names of the expansions containing the cursor, outermost first, joined
 -- with " > ". Empty string outside a view -- statusline-safe.
 function M.breadcrumb()
-  local st = view.current()
+  local st, bufnr, row = ctx()
   if not st then
     return ""
   end
-  local bufnr = vim.api.nvim_get_current_buf()
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
   local names = {}
   for _, b in ipairs(blocks(st, bufnr)) do
     if row >= b.s and row <= b.e then

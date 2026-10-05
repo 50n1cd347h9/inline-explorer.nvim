@@ -8,6 +8,7 @@
 local callers = require("inline-explorer.callers")
 local trail = require("inline-explorer.trail")
 local select_ui = require("inline-explorer.select")
+local util = require("inline-explorer.util")
 
 local M = {}
 
@@ -23,36 +24,54 @@ local function source_buf()
   return st and st.source_bufnr or cur
 end
 
--- opts_name overrides the word under the cursor (tests, command args).
--- done_cb fires exactly once, after the flow settles (tests need a seam;
--- interactive use passes nothing).
-function M.callers(done_cb, opts_name)
-  local name = opts_name or word_under_cursor()
+-- The prelude both pickers share: a done() that fires done_cb if given,
+-- and the identifier to act on -- nil (after warning and calling done)
+-- when there is none.
+local function begin(done_cb, name)
   local function done()
     if done_cb then
       done_cb()
     end
   end
   if name == "" then
-    vim.notify("[inline-explorer] no identifier under the cursor", vim.log.levels.WARN)
-    return done()
+    util.notify("no identifier under the cursor", vim.log.levels.WARN)
+    done()
+    return nil, done
+  end
+  return name, done
+end
+
+-- opts_name overrides the word under the cursor (tests, command args).
+-- done_cb fires exactly once, after the flow settles (tests need a seam;
+-- interactive use passes nothing).
+function M.callers(done_cb, opts_name)
+  local name, done = begin(done_cb, opts_name or word_under_cursor())
+  if not name then
+    return
   end
   callers.get(name, source_buf(), function(items, source, err)
     if #items == 0 then
       -- Never an empty picker: "0 callers" must not read as "nobody calls
       -- this" -- the index may simply not have finished.
-      vim.notify(("[inline-explorer] no callers of '%s' found%s (the server's index may be incomplete)"):format(
-        name, err and (" -- " .. err) or ""), vim.log.levels.INFO)
+      util.notify(
+        ("no callers of '%s' found%s (the server's index may be incomplete)"):format(
+          name,
+          err and (" -- " .. err) or ""
+        ),
+        vim.log.levels.INFO
+      )
       return done()
     end
-    local title = ("callers of %s — %d [%s]%s"):format(name, #items, source,
-      err and (" (" .. err .. ")") or "")
+    local title = ("callers of %s — %d [%s]%s"):format(name, #items, source, err and (" (" .. err .. ")") or "")
     select_ui.open(items, {
       prompt = title,
       format_item = function(it)
-        return ("%s  %s:%d  │ %s"):format(it.name,
+        return ("%s  %s:%d  │ %s"):format(
+          it.name,
           vim.fn.fnamemodify(vim.uri_to_fname(it.uri), ":t"),
-          it.range.start.line + 1, it.text)
+          it.range.start.line + 1,
+          it.text
+        )
       end,
     }, function(choice)
       if choice then
@@ -64,20 +83,13 @@ function M.callers(done_cb, opts_name)
 end
 
 function M.definition(done_cb)
-  local name = word_under_cursor()
-  local function done()
-    if done_cb then
-      done_cb()
-    end
-  end
-  if name == "" then
-    vim.notify("[inline-explorer] no identifier under the cursor", vim.log.levels.WARN)
-    return done()
+  local name, done = begin(done_cb, word_under_cursor())
+  if not name then
+    return
   end
   require("inline-explorer.resolver").locate(name, source_buf(), function(loc, err)
     if not loc then
-      vim.notify("[inline-explorer] " .. (err or ("no definition found for '" .. name .. "'")),
-        vim.log.levels.INFO)
+      util.notify(err or ("no definition found for '" .. name .. "'"), vim.log.levels.INFO)
       return done()
     end
     trail.goto_location(loc)

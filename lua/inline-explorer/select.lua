@@ -95,9 +95,7 @@ function M.open(items, opts, on_choice)
   local st = { buf = buf, win = win, items = items, on_choice = on_choice, done = false }
   M._state = st
 
-  for _, lhs in ipairs({ "<CR>" }) do
-    vim.keymap.set("n", lhs, M._accept, { buffer = buf, nowait = true })
-  end
+  vim.keymap.set("n", "<CR>", M._accept, { buffer = buf, nowait = true })
   for _, lhs in ipairs({ "<Esc>", "q" }) do
     vim.keymap.set("n", lhs, M._cancel, { buffer = buf, nowait = true })
   end

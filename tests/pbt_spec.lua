@@ -10,47 +10,32 @@
 --   nvim --headless --clean -u NONE -c "luafile tests/pbt_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
+local check = H.check
+local cc = require("tests.lib.cc")
 local gen = require("tests.lib.gen")
 local S = require("inline-explorer.substitute")
+local C = require("inline-explorer.csrc")
 
 if vim.fn.executable("gcc") == 0 then
   print("SKIP: gcc not found")
   return
 end
-if not pcall(vim.treesitter.get_string_parser, "int x;", "c") then
-  print("SKIP: c parser unavailable")
+if not H.require_c_parser() then
   return
 end
 
 local N_CASES = tonumber(os.getenv("IE_PBT_CASES") or "") or 30
 local BASE_SEED = tonumber(os.getenv("IE_PBT_SEED") or "") or 12345
 
-local tmp = vim.fn.tempname()
-vim.fn.mkdir(tmp, "p")
+local tmp = H.tmpdir()
 local n_built = 0
-
-local function writef(path, s)
-  local f = assert(io.open(path, "w"))
-  f:write(s)
-  f:close()
-end
 
 -- Compile and run `src`; returns (stdout, exit_code) or (nil, gcc_output).
 local function build_run(src, tag)
   n_built = n_built + 1
-  local c = tmp .. "/" .. tag .. "_" .. n_built .. ".c"
-  local exe = c:gsub("%.c$", ".out")
-  writef(c, src)
-  local out = vim.fn.system({
-    "gcc", "-std=gnu11", "-Werror=implicit-function-declaration",
-    "-Wno-unused-label", "-Wno-unused-variable", "-Wno-unused-but-set-variable",
-    c, "-o", exe,
-  })
-  if vim.v.shell_error ~= 0 then
-    return nil, out
-  end
-  local stdout = vim.fn.system({ exe })
-  return stdout, vim.v.shell_error
+  local c = tmp .. "/" .. tag .. "_" .. n_built
+  return cc.build_run(src, c .. ".c", c .. ".out")
 end
 
 -- Substitute rc's call in the caller and rebuild the whole program.
@@ -68,14 +53,7 @@ end
 -- rejection in that narrow case is correct given the actual parse tree, not
 -- an inline_call defect. Same exemption as tests/properties_spec.lua.
 local function has_real_call(src, fname)
-  local root = vim.treesitter.get_string_parser(src, "c"):parse()[1]:root()
-  local q = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
-  for _, node in q:iter_captures(root, src) do
-    if vim.treesitter.get_node_text(node, src) == fname then
-      return true
-    end
-  end
-  return false
+  return #C.find_calls(C.parse(src), src, fname, 1) > 0
 end
 
 -- Exemptions taken for the cast-vs-call ambiguity; reported at the end.
@@ -133,7 +111,6 @@ local function violation(case)
   return nil
 end
 
-local fails = 0
 local readable_compiled, readable_total = 0, 0
 local bad, bad_seed
 
@@ -153,7 +130,7 @@ for i = 1, N_CASES do
     -- invocation); override with IE_PBT_DUMP_DIR.
     local dump_dir = os.getenv("IE_PBT_DUMP_DIR") or vim.fn.getcwd()
     local cx = dump_dir .. "/pbt_counterexample_" .. seed .. ".c"
-    writef(cx, rc.program_src)
+    H.writef(cx, rc.program_src)
     print("counterexample (seed=" .. seed .. ") saved to: " .. cx)
     print(rc.callee_src)
     print(rc.caller_src)
@@ -173,10 +150,9 @@ for i = 1, N_CASES do
 end
 
 if bad then
-  fails = fails + 1
-  print("FAIL  differential property @seed=" .. bad_seed .. ": " .. bad)
+  check("differential property @seed=" .. bad_seed .. ": " .. bad, false)
 else
-  print(("PASS  differential property holds for %d cases (gcc builds: %d)"):format(N_CASES, n_built))
+  check(("differential property holds for %d cases (gcc builds: %d)"):format(N_CASES, n_built), true)
 end
 
 -- P-unique, gcc half (moved from the fast layer to keep it gcc-free): the
@@ -193,28 +169,21 @@ do
     local once = S.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
     local twice = once and S.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
     if twice then
-      local path = tmp .. "/uniq" .. i .. ".c"
-      writef(path, rc.callee_src .. "\n" .. twice .. "\n" .. rc.main_src)
-      local out = vim.fn.system({
-        "gcc", "-std=gnu11", "-fsyntax-only", "-Werror=implicit-function-declaration",
-        "-Wno-unused-label", "-Wno-unused-variable", path,
-      })
-      if vim.v.shell_error ~= 0 then
+      local ok, out = cc.syntax_ok(tmp .. "/uniq" .. i .. ".c", rc.callee_src .. "\n" .. twice .. "\n" .. rc.main_src)
+      if not ok then
         ubad, ubad_seed = out, seed
         break
       end
     end
   end
   if ubad then
-    fails = fails + 1
-    print("FAIL  double-inlining uniqueness @seed=" .. ubad_seed .. ":\n" .. ubad)
+    check("double-inlining uniqueness @seed=" .. ubad_seed .. ":", false, ubad)
   else
-    print("PASS  double-inlined programs survive gcc syntax checks (20 cases)")
+    check("double-inlined programs survive gcc syntax checks (20 cases)", true)
   end
 end
 print(("info  readable mode compiled %d/%d (compile-only, never failing)"):format(readable_compiled, readable_total))
 print(("info  cast-vs-call exemptions taken: %d"):format(exempted))
 print(("info  unbuildable originals skipped: %d"):format(skipped_unbuildable))
 
-print("")
-print(fails == 0 and "ALL PBT TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("PBT")

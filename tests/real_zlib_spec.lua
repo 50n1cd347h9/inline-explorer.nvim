@@ -112,10 +112,8 @@ real.run({
     -- A `[=[ ]=]` long bracket, not `[[ ]]`: the sed script's own
     -- `[:space:]]` contains a literal `]]`, which would otherwise close a
     -- level-0 Lua long string early.
-    local ok, out = real.sh(
-      [=[sed -n 's/^CFLAGS[[:space:]]*=[[:space:]]*//p;s/^ZINC[[:space:]]*=[[:space:]]*//p' Makefile]=],
-      dir
-    )
+    local ok, out =
+      real.sh([=[sed -n 's/^CFLAGS[[:space:]]*=[[:space:]]*//p;s/^ZINC[[:space:]]*=[[:space:]]*//p' Makefile]=], dir)
     if not ok then
       return ""
     end

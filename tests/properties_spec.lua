@@ -6,30 +6,19 @@
 --   nvim --headless --clean -u NONE -c "luafile tests/properties_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
 local gen = require("tests.lib.gen")
 local S = require("inline-explorer.substitute")
+local C = require("inline-explorer.csrc")
 
-if not pcall(vim.treesitter.get_string_parser, "int x;", "c") then
-  print("SKIP: c parser unavailable")
+if not H.require_c_parser() then
   return
 end
 
 local N_CASES = tonumber(os.getenv("IE_PROP_CASES") or "") or 300
 local BASE_SEED = tonumber(os.getenv("IE_PBT_SEED") or "") or 12345
 
-local fails = 0
-local function check(l, ok, d)
-  if ok then
-    print("PASS  " .. l)
-  else
-    fails = fails + 1
-    print("FAIL  " .. l .. (d and ("\n----\n" .. tostring(d) .. "\n----") or ""))
-  end
-end
-
-local function has_error(src)
-  return vim.treesitter.get_string_parser(src, "c"):parse()[1]:root():has_error()
-end
+local check = H.check
 
 local function count_calls(src)
   local n = 0
@@ -49,14 +38,7 @@ end
 -- rejection in that narrow case is correct given the actual parse tree, not
 -- an inline_call defect.
 local function has_real_call(src, fname)
-  local root = vim.treesitter.get_string_parser(src, "c"):parse()[1]:root()
-  local q = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
-  for _, node in q:iter_captures(root, src) do
-    if vim.treesitter.get_node_text(node, src) == fname then
-      return true
-    end
-  end
-  return false
+  return #C.find_calls(C.parse(src), src, fname, 1) > 0
 end
 
 -- Exemptions taken by violation() for the cast-vs-call ambiguity; printed at
@@ -78,7 +60,7 @@ local function violation(case, mode)
     end
     return "rejected: " .. tostring(err)
   end
-  if has_error(new) then
+  if C.parse(new):has_error() then
     return "P-parse: transformed source has ERROR nodes"
   end
   if count_calls(new) ~= count_calls(rc.caller_src) - 1 then
@@ -111,14 +93,14 @@ do
       break
     end
   end
-  check(("P-parse/P-count hold for %d cases x 2 modes"):format(N_CASES), bad == nil,
-    bad and (bad .. " @seed=" .. bad_seed .. " mode=" .. bad_mode))
+  check(
+    ("P-parse/P-count hold for %d cases x 2 modes"):format(N_CASES),
+    bad == nil,
+    bad and (bad .. " @seed=" .. bad_seed .. " mode=" .. bad_mode)
+  )
 end
 
--- P-unique: two inlinings with different N never share injected names. A
--- shared name would be a duplicate declaration in one scope -- a SEMANTIC
--- error tree-sitter cannot see -- so when gcc is available the double-inlined
--- program is syntax-checked for real; without gcc only the parse check runs.
+-- P-unique: two inlinings with different N never share injected names.
 -- Parse-only here; the gcc syntax check of the double-inlined program (a
 -- shared injected name is a SEMANTIC duplicate declaration tree-sitter cannot
 -- see) lives in the gcc layer, tests/pbt_spec.lua.
@@ -133,7 +115,7 @@ do
     local once = S.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
     if once then
       local twice = S.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
-      if twice and has_error(twice) then
+      if twice and C.parse(twice):has_error() then
         bad, bad_seed = "second inlining produced ERROR nodes", seed
       end
     end
@@ -141,7 +123,11 @@ do
       break
     end
   end
-  check(("P-unique holds for %d double-inlining cases"):format(n_unique), bad == nil, bad and (bad .. " @seed=" .. bad_seed))
+  check(
+    ("P-unique holds for %d double-inlining cases"):format(n_unique),
+    bad == nil,
+    bad and (bad .. " @seed=" .. bad_seed)
+  )
 end
 
 -- P-reject-safe: bogus inputs return nil + err and never throw.
@@ -201,5 +187,4 @@ do
 end
 
 print(("info  cast-vs-call exemptions taken: %d"):format(exempted))
-print("")
-print(fails == 0 and "ALL PROPERTY TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("PROPERTY")

@@ -9,6 +9,8 @@
 -- to decline (variadic functions, arity it cannot match); it is not allowed
 -- to produce something that breaks.
 local S = require("inline-explorer.substitute")
+local C = require("inline-explorer.csrc")
+local H = require("tests.lib.harness")
 
 local M = {}
 
@@ -36,11 +38,8 @@ local M = {}
 -- `&&` command that actually runs the compiler.
 local LOCALE = "export LC_ALL=C LANG=C; "
 
-local function run(cmd, cwd)
-  local out = vim.fn.system(cmd, nil)
-  if cwd then
-    out = vim.fn.system({ "bash", "-lc", LOCALE .. "cd " .. vim.fn.shellescape(cwd) .. " && " .. table.concat(cmd, " ") })
-  end
+local function run(cmd)
+  local out = vim.fn.system(cmd)
   return vim.v.shell_error == 0, out
 end
 
@@ -54,12 +53,6 @@ local function read(p)
   local s = f:read("*a")
   f:close()
   return s
-end
-
-local function write(p, s)
-  local f = assert(io.open(p, "w"))
-  f:write(s)
-  f:close()
 end
 
 -- Last `n` bytes of `s`, trimmed forward to the nearest following newline
@@ -77,23 +70,6 @@ local function tail(s, n)
   local cut = #s - n + 1
   local nl = s:find("\n", cut, true)
   return nl and s:sub(nl + 1) or s:sub(cut)
-end
-
-local function root_of(s)
-  return vim.treesitter.get_string_parser(s, "c"):parse()[1]:root()
-end
-
-local function text(n, s)
-  local _, _, a, _, _, b = n:range(true)
-  return s:sub(a + 1, b)
-end
-
-local function captures(node, s, q)
-  local o = {}
-  for _, n in vim.treesitter.query.parse("c", q):iter_captures(node, s) do
-    o[#o + 1] = n
-  end
-  return o
 end
 
 -- Given the exact source text gcc's preprocessor would see, return the set
@@ -305,30 +281,30 @@ end
 -- there is a macro invocation, and splicing a function body in is
 -- meaningless).
 local function enumerate(src, surviving)
-  local root = root_of(src)
+  local root = C.parse(src)
   local defs = {}
   local def_count = {}
   local ambiguous = {}
-  for _, nm in ipairs(captures(root, src, "(function_declarator declarator: (identifier) @n)")) do
+  for _, nm in ipairs(C.query_nodes(root, src, "(function_declarator declarator: (identifier) @n)")) do
     local fn = nm
     while fn and fn:type() ~= "function_definition" do
       fn = fn:parent()
     end
     if fn then
-      local name = text(nm, src)
+      local name = C.text(nm, src)
       def_count[name] = (def_count[name] or 0) + 1
       if not defs[name] then
-        defs[name] = text(fn, src)
+        defs[name] = C.text(fn, src)
       end
     end
   end
   local macro_named = {}
-  for _, n in ipairs(captures(
-    root,
-    src,
-    "[(preproc_def name: (identifier) @n) (preproc_function_def name: (identifier) @n)]"
-  )) do
-    macro_named[text(n, src)] = true
+  for _, n in
+    ipairs(
+      C.query_nodes(root, src, "[(preproc_def name: (identifier) @n) (preproc_function_def name: (identifier) @n)]")
+    )
+  do
+    macro_named[C.text(n, src)] = true
   end
   for name, n in pairs(def_count) do
     if n > 1 or macro_named[name] then
@@ -341,8 +317,8 @@ local function enumerate(src, surviving)
   -- the caller apply a single site cap across skipped, dead, and attempted
   -- calls alike, instead of the cap only bounding a subset of the three.
   local sites = {}
-  for _, f in ipairs(captures(root, src, "(call_expression function: (identifier) @f)")) do
-    local name = text(f, src)
+  for _, f in ipairs(C.query_nodes(root, src, "(call_expression function: (identifier) @f)")) do
+    local name = C.text(f, src)
     if defs[name] then
       local r, c = f:range(true)
       local amb = ambiguous[name] or false
@@ -523,7 +499,7 @@ function M.run(cfg)
             accepted = accepted + 1
             occurrence_of[call.name] = (occurrence_of[call.name] or 0) + 1
             local occurrence = occurrence_of[call.name]
-            write(path, new)
+            H.writef(path, new)
             -- The deterministic gate runs BEFORE the project's own
             -- (slow, round-trip) test suite: it is cheap -- one
             -- `-fsyntax-only` pass over a single translation unit -- and
@@ -541,7 +517,8 @@ function M.run(cfg)
             end
             if not gate_ok then
               local full = "[gcc -fsyntax-only] " .. tostring(gate_out)
-              failures[#failures + 1] = { rel, call.name, "[gcc -fsyntax-only] " .. tail(gate_out, 1500), occurrence, full }
+              failures[#failures + 1] =
+                { rel, call.name, "[gcc -fsyntax-only] " .. tail(gate_out, 1500), occurrence, full }
             else
               local vok, vout = cfg.verify(dir)
               if vok then
@@ -561,7 +538,7 @@ function M.run(cfg)
                 failures[#failures + 1] = { rel, call.name, tail(vout, 1500), occurrence, tostring(vout) }
               end
             end
-            write(path, src0)
+            H.writef(path, src0)
           end
         end
       end
@@ -574,8 +551,18 @@ function M.run(cfg)
   -- non-ambiguous sites silently reverted to pre-dead-branch accounting.
   -- Folding the count in is what keeps that reversion from degrading
   -- verification with nothing downstream to catch it.
-  print(("real %s: sites=%d  skipped-ambiguous=%d  dead-branch=%d  engine-accepted=%d  built+passed=%d  unverifiable-files=%d  unverifiable-dead-sites=%d")
-    :format(cfg.name, sites, skipped, dead_branch, accepted, passed, #unverifiable, #unverifiable_dead))
+  print(
+    ("real %s: sites=%d  skipped-ambiguous=%d  dead-branch=%d  engine-accepted=%d  built+passed=%d  unverifiable-files=%d  unverifiable-dead-sites=%d"):format(
+      cfg.name,
+      sites,
+      skipped,
+      dead_branch,
+      accepted,
+      passed,
+      #unverifiable,
+      #unverifiable_dead
+    )
+  )
   if cfg.oracle_note then
     print("note: " .. cfg.oracle_note)
   end
@@ -588,8 +575,13 @@ function M.run(cfg)
   if #unverifiable_dead > 0 then
     print(#unverifiable_dead .. " CALL SITE(S) WHERE DEAD-BRANCH READING WAS OVERRULED (attempted instead):")
     for _, u in ipairs(unverifiable_dead) do
-      print(("  * %s:%d %s -- callee token survives on a neighbouring line (enclosing multi-line macro argument?)")
-        :format(u[1], u[3], u[2]))
+      print(
+        ("  * %s:%d %s -- callee token survives on a neighbouring line (enclosing multi-line macro argument?)"):format(
+          u[1],
+          u[3],
+          u[2]
+        )
+      )
     end
   end
   if #failures > 0 then
@@ -756,13 +748,7 @@ function M.run(cfg)
     end)
     table.sort(actual_collisions)
     table.sort(known_collisions)
-    if
-      #unlisted == 0
-      and #fixed == 0
-      and #wrong_reason == 0
-      and #actual_collisions == 0
-      and #known_collisions == 0
-    then
+    if #unlisted == 0 and #fixed == 0 and #wrong_reason == 0 and #actual_collisions == 0 and #known_collisions == 0 then
       print(("KNOWN-FAILURES PIN OK: exact match, %d pinned failure(s)"):format(#cfg.known_failures))
     else
       print("KNOWN-FAILURES PIN MISMATCH -- FAILURE")

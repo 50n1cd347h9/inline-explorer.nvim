@@ -37,9 +37,7 @@ function M.check()
       health.warn(("%s: no documentSymbol -- falling back to tree-sitter extraction"):format(c.name))
     end
     if c.name == "clangd" then
-      local provider = caps.executeCommandProvider
-      local cmds = (type(provider) == "table" and provider.commands) or {}
-      if vim.tbl_contains(cmds, "clangd.applyTweak") then
+      if require("inline-explorer.macro").supports_tweak(c) then
         health.ok("clangd: applyTweak supported (ExpandMacro path)")
       else
         health.warn("clangd: no applyTweak -- macro expansion uses hover scraping only")
@@ -52,10 +50,12 @@ function M.check()
   if ft ~= "" then
     local lang = vim.treesitter.language.get_lang(ft) or ft
     if pcall(vim.treesitter.language.inspect, lang) then
-      health.ok(("tree-sitter parser for '%s' installed (view highlighting, extraction fallback%s)"):format(
-        lang,
-        lang == "c" and ", inline substitution" or ""
-      ))
+      health.ok(
+        ("tree-sitter parser for '%s' installed (view highlighting, extraction fallback%s)"):format(
+          lang,
+          lang == "c" and ", inline substitution" or ""
+        )
+      )
     else
       health.warn(("no tree-sitter parser for '%s'"):format(lang), {
         ":TSInstall " .. lang,
@@ -66,9 +66,10 @@ function M.check()
 
   -- compile_commands.json (C projects)
   if ft == "c" or ft == "cpp" then
+    local bufname = vim.api.nvim_buf_get_name(bufnr)
     local found = vim.fs.find("compile_commands.json", {
       upward = true,
-      path = vim.api.nvim_buf_get_name(bufnr) ~= "" and vim.fs.dirname(vim.api.nvim_buf_get_name(bufnr)) or nil,
+      path = bufname ~= "" and vim.fs.dirname(bufname) or nil,
     })[1]
     if found then
       health.ok("compile_commands.json found: " .. found)

@@ -110,13 +110,16 @@ function M.generate(dir)
   local main_path = dir .. "/main.c"
   write(main_path, table.concat(main, "\n") .. "\n")
 
-  write(dir .. "/compile_commands.json", vim.json.encode({
-    {
-      directory = dir,
-      file = main_path,
-      arguments = { "cc", "-std=gnu11", "-c", main_path, "-o", dir .. "/main.o" },
-    },
-  }))
+  write(
+    dir .. "/compile_commands.json",
+    vim.json.encode({
+      {
+        directory = dir,
+        file = main_path,
+        arguments = { "cc", "-std=gnu11", "-c", main_path, "-o", dir .. "/main.o" },
+      },
+    })
+  )
 
   return {
     dir = dir,

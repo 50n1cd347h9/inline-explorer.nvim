@@ -2,6 +2,8 @@
 -- defensively at every level, so faithful expansions arrive wrapped in noise
 -- like `(({ ... }))`; the pretty printer's own `(expr)` wrapping can also
 -- double up when the return expression was already parenthesized.
+local C = require("inline-explorer.csrc")
+
 local M = {}
 
 -- Collapse redundant paren nests: every parenthesized_expression whose only
@@ -40,10 +42,8 @@ function M.parens(text)
     if node:type() == "parenthesized_expression" and node:named_child_count() == 1 then
       local child = node:named_child(0)
       if child:type() == "parenthesized_expression" then
-        local _, _, sb = node:range(true)
-        local _, _, _, _, _, eb = node:range(true)
-        cuts[#cuts + 1] = sb -- the '('
-        cuts[#cuts + 1] = eb - 1 -- the ')'
+        cuts[#cuts + 1] = C.sb(node) -- the '('
+        cuts[#cuts + 1] = C.eb(node) - 1 -- the ')'
       end
     end
     for c in node:iter_children() do

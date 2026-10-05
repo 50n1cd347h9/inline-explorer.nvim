@@ -12,6 +12,7 @@
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(here, ":h:h")
 vim.opt.rtp:append(root)
+local H = require("tests.lib.harness")
 
 local bench = require("tests.lib.bench")
 local fixture = require("tests.fixtures.bench.gen")
@@ -42,15 +43,7 @@ local WARMUP = tonumber(os.getenv("IE_BENCH_WARMUP") or "") or 3
 -- never affected by this flag.
 local TIMING_GATE = (os.getenv("IE_BENCH_TIMING_GATE") or "1") ~= "0"
 
-local fails = 0
-local function check(l, ok, d)
-  if ok then
-    print("PASS  " .. l)
-  else
-    fails = fails + 1
-    print("FAIL  " .. l .. (d and ("\n----\n" .. tostring(d) .. "\n----") or ""))
-  end
-end
+local check = H.check
 
 require("inline-explorer").setup({ profile = true })
 profile.logfile = false -- the report is the output; no user log from a bench
@@ -94,7 +87,6 @@ if not indexed then
 end
 
 local vbuf = view.open()
-local st = view.current()
 
 -- ---------------------------------------------------------------------------
 -- Driving helpers
@@ -143,8 +135,11 @@ print("=== structural invariants ===")
 -- 1. One expansion costs exactly one locate and one extract.
 do
   local spans, complete = expand_on(meta.cold[1] .. "%(")
-  check("capture completed within the timeout", complete == true,
-    spans and (bench.names(spans) .. " -- " .. tostring(select(2, bench.assert_complete(spans)))))
+  check(
+    "capture completed within the timeout",
+    complete == true,
+    spans and (bench.names(spans) .. " -- " .. tostring(select(2, bench.assert_complete(spans))))
+  )
   -- Counts the OUTCOME of extraction, not every span the stage emits.
   -- `extract:` also covers the sub-spans that decompose a slow extract --
   -- `extract:bufload` (reading the definition file off disk) and
@@ -154,15 +149,23 @@ do
   -- fire, which is exactly when the extra detail is wanted.
   local function outcomes(sp)
     local n = 0
-    for _, pat in ipairs({ "^extract:local$", "^extract:cold$", "^extract:warm$", "^extract:cached$",
-      "^extract:no%-lsp$", "^extract:no%-capability$" }) do
+    for _, pat in ipairs({
+      "^extract:local$",
+      "^extract:cold$",
+      "^extract:warm$",
+      "^extract:cached$",
+      "^extract:no%-lsp$",
+      "^extract:no%-capability$",
+    }) do
       n = n + bench.count(sp, pat)
     end
     return n
   end
-  check("one expand = one locate + one extract outcome",
+  check(
+    "one expand = one locate + one extract outcome",
     complete and bench.count(spans, "^locate:") == 1 and outcomes(spans) == 1,
-    spans and bench.names(spans))
+    spans and bench.names(spans)
+  )
 end
 
 -- 2. C extraction must never wait for the server. This invariant used to
@@ -176,10 +179,16 @@ end
 do
   local first, first_complete = expand_on(meta.warm[1] .. "%(")
   local second, second_complete = expand_on(meta.warm[2] .. "%(")
-  check("first touch of a header extracts locally, no documentSymbol wait",
-    first_complete and bench.count(first, "^extract:local") == 1, first and bench.names(first))
-  check("second symbol from the same header extracts locally too",
-    second_complete and bench.count(second, "^extract:local") == 1, second and bench.names(second))
+  check(
+    "first touch of a header extracts locally, no documentSymbol wait",
+    first_complete and bench.count(first, "^extract:local") == 1,
+    first and bench.names(first)
+  )
+  check(
+    "second symbol from the same header extracts locally too",
+    second_complete and bench.count(second, "^extract:local") == 1,
+    second and bench.names(second)
+  )
 end
 
 -- 3. Falling back to block-paste must not re-resolve: the inliner already has
@@ -192,19 +201,26 @@ do
   -- symbol, not on a preceding "struct " keyword (which <cword> would read
   -- as the C keyword "struct", not a resolvable name).
   local spans, complete = inline_on(meta.struct_name, { settle_cap_ms = 3000, until_span = "^total:expand" })
-  check("block fallback happened",
-    complete and bench.count(spans, "^total:block%-fallback") == 1, spans and bench.names(spans))
-  check("block fallback costs no second lookup",
+  check(
+    "block fallback happened",
+    complete and bench.count(spans, "^total:block%-fallback") == 1,
+    spans and bench.names(spans)
+  )
+  check(
+    "block fallback costs no second lookup",
     complete and bench.count(spans, "^locate:") == 1 and bench.count(spans, "^extract:") == 1,
-    spans and bench.names(spans))
+    spans and bench.names(spans)
+  )
 end
 
 -- 4. A definition in the file being edited opens nothing new.
 do
   local spans, complete = expand_on(meta.same_file .. "%(3%)")
-  check("same-file definition is never a cold extraction",
+  check(
+    "same-file definition is never a cold extraction",
     complete and bench.count(spans, "^extract:cold") == 0 and bench.count(spans, "^extract:") == 1,
-    spans and bench.names(spans))
+    spans and bench.names(spans)
+  )
 end
 
 -- 5. A macro resolves through the tweak; the hover scrape is a fallback for
@@ -215,10 +231,16 @@ do
   -- idiom as the same-file scenario above, so the cursor lands on the actual
   -- invocation in main() where the ExpandMacro tweak applies.
   local spans, complete = inline_on(meta.macro_call .. "%(4%)")
-  check("macro uses the ExpandMacro tweak",
-    complete and bench.count(spans, "^macro:tweak$") == 1, spans and bench.names(spans))
-  check("macro does not fall back to hover scraping",
-    complete and bench.count(spans, "^macro:hover") == 0, spans and bench.names(spans))
+  check(
+    "macro uses the ExpandMacro tweak",
+    complete and bench.count(spans, "^macro:tweak$") == 1,
+    spans and bench.names(spans)
+  )
+  check(
+    "macro does not fall back to hover scraping",
+    complete and bench.count(spans, "^macro:hover") == 0,
+    spans and bench.names(spans)
+  )
 end
 
 -- ---------------------------------------------------------------------------
@@ -319,8 +341,11 @@ local scenarios = {
     name = "inline:cached",
     action = function()
       local spans, complete = inline_on(meta.fn_call .. "%(", { until_span = "^total:inline%-function" })
-      if complete and bench.count(spans, "^total:inline%-function") == 1
-        and bench.count(spans, "^extract:cached") == 1 then
+      if
+        complete
+        and bench.count(spans, "^total:inline%-function") == 1
+        and bench.count(spans, "^extract:cached") == 1
+      then
         return bench.elapsed_ms(spans)
       end
       return nil
@@ -373,15 +398,19 @@ for _, sc in ipairs(scenarios) do
   end
 end
 if has_excluded_row then
-  print("* excludes inliner.smart's pre-span whole-buffer concat and call_name_at tree-sitter parse"
-    .. " (~0.4ms on this fixture, ~15% of the number; larger on real files) -- these run before the"
-    .. " total: span starts. See bench.lua's elapsed_ms comment.")
+  print(
+    "* excludes inliner.smart's pre-span whole-buffer concat and call_name_at tree-sitter parse"
+      .. " (~0.4ms on this fixture, ~15% of the number; larger on real files) -- these run before the"
+      .. " total: span starts. See bench.lua's elapsed_ms comment."
+  )
 end
 if is_finite(noise) then
   print(("noise floor: %.2fms (p50 gap between two runs of expand:warm)"):format(noise))
 else
-  print("noise floor: unmeasurable (both populations of the calibration scenario produced zero"
-    .. " usable samples this run) -- the harness could not measure its own clock")
+  print(
+    "noise floor: unmeasurable (both populations of the calibration scenario produced zero"
+      .. " usable samples this run) -- the harness could not measure its own clock"
+  )
 end
 
 -- Baseline comparison. The structural invariants above are the pass/fail
@@ -467,10 +496,13 @@ if os.getenv("IE_BENCH_WRITE_BASELINE") == "1" then
     short[#short + 1] = "noise floor unmeasurable this run"
   end
   if #short > 0 then
-    fails = fails + 1
-    print("FAIL  refusing to write a baseline: " .. table.concat(short, "; ")
-      .. " -- a baseline recorded on too few samples (or an unmeasured clock) poisons every"
-      .. " later comparison")
+    check(
+      "refusing to write a baseline: "
+        .. table.concat(short, "; ")
+        .. " -- a baseline recorded on too few samples (or an unmeasured clock) poisons every"
+        .. " later comparison",
+      false
+    )
   else
     -- Record enough to tell what produced these numbers: p50 alone cannot be
     -- audited later. `n` says whether the p50 is worth anything, `mad` says
@@ -509,12 +541,19 @@ if os.getenv("IE_BENCH_WRITE_BASELINE") == "1" then
 elseif vim.fn.filereadable(baseline_path) == 1 then
   local base = vim.json.decode(table.concat(vim.fn.readfile(baseline_path), "\n"))
   print("")
-  print(("=== vs baseline recorded %s (commit %s, nvim %s) ===")
-    :format(tostring(base.recorded), tostring(base.commit or "?"), tostring(base.nvim or "?")))
+  print(
+    ("=== vs baseline recorded %s (commit %s, nvim %s) ==="):format(
+      tostring(base.recorded),
+      tostring(base.commit or "?"),
+      tostring(base.nvim or "?")
+    )
+  )
 
   if not TIMING_GATE then
-    print("WARN  IE_BENCH_TIMING_GATE=0: vs-baseline timing comparisons below cannot fail the run"
-      .. " regardless of noise; only the structural invariants above gate it.")
+    print(
+      "WARN  IE_BENCH_TIMING_GATE=0: vs-baseline timing comparisons below cannot fail the run"
+        .. " regardless of noise; only the structural invariants above gate it."
+    )
   end
 
   local recorded_noise = base.noise_floor_ms or 0
@@ -539,15 +578,23 @@ elseif vim.fn.filereadable(baseline_path) == 1 then
   local noisy = (not is_finite(noise)) or (noise > recorded_noise * 4 and noise >= 1)
   if noisy then
     if not is_finite(noise) then
-      print("WARN  this run's noise floor could not be measured (the calibration scenario produced"
-        .. " zero usable samples in one or both populations); timings below are unreliable")
+      print(
+        "WARN  this run's noise floor could not be measured (the calibration scenario produced"
+          .. " zero usable samples in one or both populations); timings below are unreliable"
+      )
     else
-      print(("WARN  this run is noisy (%.2fms vs %.2fms when recorded); timings below are unreliable")
-        :format(noise, recorded_noise))
+      print(
+        ("WARN  this run is noisy (%.2fms vs %.2fms when recorded); timings below are unreliable"):format(
+          noise,
+          recorded_noise
+        )
+      )
     end
-    print("WARN  timing gate suspended for this run: the harness could not trust its own clock, so"
-      .. " the vs-baseline timing comparisons below are reported as warnings and cannot fail the"
-      .. " run; the structural invariants above still applied and still gate it.")
+    print(
+      "WARN  timing gate suspended for this run: the harness could not trust its own clock, so"
+        .. " the vs-baseline timing comparisons below are reported as warnings and cannot fail the"
+        .. " run; the structural invariants above still applied and still gate it."
+    )
   end
 
   -- Iterate the BASELINE's scenarios, not the measured ones. A scenario that
@@ -571,19 +618,28 @@ elseif vim.fn.filereadable(baseline_path) == 1 then
       -- itself an unreliable draw is worse than not comparing at all, so
       -- this always fails -- it is a baseline-provenance problem, not a
       -- clock-trust one, and is not suspended by `noisy`.
-      fails = fails + 1
-      print(("FAIL  %-18s BASELINE UNTRUSTWORTHY: recorded with %d sample(s), need %d -- re-record"
-        .. " the baseline before comparing")
-        :format(name, b.n or 0, MIN_SAMPLES))
+      check(
+        (
+          "%-18s BASELINE UNTRUSTWORTHY: recorded with %d sample(s), need %d -- re-record"
+          .. " the baseline before comparing"
+        ):format(name, b.n or 0, MIN_SAMPLES),
+        false
+      )
     else
       local s = measured[name] or { n = 0 }
       if s.n < MIN_SAMPLES then
-        fails = fails + 1
-        print(("FAIL  %-18s NOT COMPARED: %d usable sample(s), need %d (baseline p50 %.1fms). %s")
-          :format(name, s.n, MIN_SAMPLES,
+        check(
+          ("%-18s NOT COMPARED: %d usable sample(s), need %d (baseline p50 %.1fms). %s"):format(
+            name,
+            s.n,
+            MIN_SAMPLES,
             b.p50 or 0,
-            s.n == 0 and "The scenario produced nothing -- its action returned nil every rep (incomplete capture, or its span-shape guard never matched)."
-              or "Too few reps completed to form a p50 worth comparing."))
+            s.n == 0
+                and "The scenario produced nothing -- its action returned nil every rep (incomplete capture, or its span-shape guard never matched)."
+              or "Too few reps completed to form a p50 worth comparing."
+          ),
+          false
+        )
       else
         local by_noise = is_finite(noise) and (3 * noise) or 0
         local by_pct, by_floor = b.p50 * PCT_TOLERANCE, MIN_TOLERANCE_MS
@@ -591,14 +647,20 @@ elseif vim.fn.filereadable(baseline_path) == 1 then
         local provenance = tolerance == by_floor and "floor"
           or (by_noise > 0 and tolerance == by_noise and "3xnoise" or ("%d%%"):format(PCT_TOLERANCE * 100))
         local delta = s.p50 - b.p50
-        local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s], n=%d)")
-          :format(name, b.p50, s.p50, delta, tolerance, provenance, s.n)
+        local line = ("%-18s %8.1fms -> %8.1fms  (%+.1fms, tolerance %.1fms [%s], n=%d)"):format(
+          name,
+          b.p50,
+          s.p50,
+          delta,
+          tolerance,
+          provenance,
+          s.n
+        )
         if delta > tolerance then
           if noisy or not TIMING_GATE then
             print("WARN  " .. line)
           else
-            fails = fails + 1
-            print("FAIL  " .. line)
+            check(line, false)
           end
         else
           print("ok    " .. line)
@@ -619,5 +681,4 @@ else
   print("no baseline yet: re-run with IE_BENCH_WRITE_BASELINE=1 to record one")
 end
 
-print("")
-print(fails == 0 and "ALL BENCH TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("BENCH")

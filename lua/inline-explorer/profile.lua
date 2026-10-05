@@ -41,7 +41,8 @@ function M.identify(client)
   M._identified[client.id] = true
   local info = client.server_info or {}
   local cmd = client.config and client.config.cmd
-  local cmdstr = type(cmd) == "table" and table.concat(cmd, " ") or (type(cmd) == "function" and "<in-process>" or tostring(cmd))
+  local cmdstr = type(cmd) == "table" and table.concat(cmd, " ")
+    or (type(cmd) == "function" and "<in-process>" or tostring(cmd))
   local sp = M.start()
   sp("server", ("%s %s | %s"):format(info.name or client.name or "?", info.version or "?", cmdstr))
 end
@@ -66,9 +67,16 @@ local function append(name, ms, detail)
   -- extract:attach at .544 followed by extract:cold at .036. gettimeofday
   -- gives both halves of one reading.
   local sec, usec = vim.uv.gettimeofday()
-  f:write(("%s.%03d #%-4d %-26s %9.1fms%s\n"):format(
-    os.date("%Y-%m-%dT%H:%M:%S", sec), math.floor(usec / 1000), M.action, name, ms,
-    detail and ("  " .. detail) or ""))
+  f:write(
+    ("%s.%03d #%-4d %-26s %9.1fms%s\n"):format(
+      os.date("%Y-%m-%dT%H:%M:%S", sec),
+      math.floor(usec / 1000),
+      M.action,
+      name,
+      ms,
+      detail and ("  " .. detail) or ""
+    )
+  )
   f:close()
 end
 
@@ -139,7 +147,13 @@ function M.report()
   for _, name in ipairs(order) do
     local a = agg[name]
     lines[#lines + 1] = ("%-22s %5d %8.0fms %7.0fms %7.0fms %7.0fms"):format(
-      name, a.n, a.total, a.total / a.n, a.max, a.last)
+      name,
+      a.n,
+      a.total,
+      a.total / a.n,
+      a.max,
+      a.last
+    )
   end
   -- The aggregate answers "which stage costs most across the session"; it
   -- cannot answer "which single call was the 4-second one", which is the
@@ -152,15 +166,13 @@ function M.report()
   table.sort(worst, function(x, y)
     return x.ms > y.ms
   end)
-  if #worst > 0 then
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = ("%-6s %-26s %9s  %s"):format("action", "span", "ms", "detail")
-    lines[#lines + 1] = string.rep("-", 78)
-    for i = 1, math.min(8, #worst) do
-      local e = worst[i]
-      lines[#lines + 1] = ("#%-5d %-26s %8.1fms  %s"):format(
-        e.action or 0, e.name, e.ms, e.detail or "")
-    end
+  -- Never empty: an empty event list returned early above.
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = ("%-6s %-26s %9s  %s"):format("action", "span", "ms", "detail")
+  lines[#lines + 1] = string.rep("-", 78)
+  for i = 1, math.min(8, #worst) do
+    local e = worst[i]
+    lines[#lines + 1] = ("#%-5d %-26s %8.1fms  %s"):format(e.action or 0, e.name, e.ms, e.detail or "")
   end
   if M.logfile then
     lines[#lines + 1] = ""

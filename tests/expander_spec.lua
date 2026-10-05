@@ -4,6 +4,7 @@
 --   nvim --headless --clean -u NONE -c "luafile tests/expander_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
 
 local resolver = require("inline-explorer.resolver")
 local view = require("inline-explorer.view")
@@ -18,15 +19,7 @@ do
 end
 require("inline-explorer.config").setup({})
 
-local fails = 0
-local function check(l, ok, d)
-  if ok then
-    print("PASS  " .. l)
-  else
-    fails = fails + 1
-    print("FAIL  " .. l .. (d and ("\n----\n" .. tostring(d) .. "\n----") or ""))
-  end
-end
+local check = H.check
 
 -- Stub the resolver: cb-style, immediate, no LSP involved.
 resolver.locate = function(name, _, cb)
@@ -90,14 +83,17 @@ do
   local st = view.current()
   check("origin: identity after undo", view.src_line(st, 0) == 0 and view.src_line(st, 3) == 3, vim.inspect(st.origin))
 
-  local col = ("    int r = helper(1);"):find("helper") - 1
   vim.api.nvim_win_set_cursor(0, { 3, col })
   expander.expand()
   vim.wait(1000, function()
     return vim.api.nvim_buf_line_count(vbuf) > 4
   end, 10)
   local inserted = vim.api.nvim_buf_line_count(vbuf) - 4
-  check("origin: spliced rows have no source line", view.src_line(st, 3) == nil and view.src_line(st, 2 + inserted) == nil, vim.inspect(st.origin))
+  check(
+    "origin: spliced rows have no source line",
+    view.src_line(st, 3) == nil and view.src_line(st, 2 + inserted) == nil,
+    vim.inspect(st.origin)
+  )
   check("origin: tail shifted to its old source line", view.src_line(st, 3 + inserted) == 3, vim.inspect(st.origin))
 
   -- Rewrite that only touches the call line: unchanged lines keep their
@@ -107,7 +103,11 @@ do
   view.rewrite(st, vbuf, table.concat(lines_now, "\n"), 2)
   check("rewrite: node survives an unrelated line change", #st.nodes == 1, #st.nodes)
   check("rewrite: changed line loses its origin", view.src_line(st, 2) == nil, vim.inspect(st.origin))
-  check("rewrite: unchanged lines keep origins", view.src_line(st, 0) == 0 and view.src_line(st, 3 + inserted) == 3, vim.inspect(st.origin))
+  check(
+    "rewrite: unchanged lines keep origins",
+    view.src_line(st, 0) == 0 and view.src_line(st, 3 + inserted) == 3,
+    vim.inspect(st.origin)
+  )
 
   -- Restore the original call line so the guard tests below can find `helper`.
   lines_now[3] = "    int r = helper(1);"
@@ -166,20 +166,33 @@ do
   profile.enabled = true
   profile.clear()
 
-  expander.expand({ name = "prefetched_fn", body = { "static int prefetched_fn(void)", "{", "    return 7;", "}" }, label = "function_definition" })
-  check("prefetched body splices without a lookup", located == 0 and vim.api.nvim_buf_line_count(vbuf) > before_lines,
-    ("located=%d lines=%d->%d"):format(located, before_lines, vim.api.nvim_buf_line_count(vbuf)))
-  check("prefetched body is what got spliced",
-    table.concat(vim.api.nvim_buf_get_lines(vbuf, 0, -1, false), "\n"):find("prefetched_fn(void)", 1, true) ~= nil)
+  expander.expand({
+    name = "prefetched_fn",
+    body = { "static int prefetched_fn(void)", "{", "    return 7;", "}" },
+    label = "function_definition",
+  })
+  check(
+    "prefetched body splices without a lookup",
+    located == 0 and vim.api.nvim_buf_line_count(vbuf) > before_lines,
+    ("located=%d lines=%d->%d"):format(located, before_lines, vim.api.nvim_buf_line_count(vbuf))
+  )
+  check(
+    "prefetched body is what got spliced",
+    table.concat(vim.api.nvim_buf_get_lines(vbuf, 0, -1, false), "\n"):find("prefetched_fn(void)", 1, true) ~= nil
+  )
   check("prefetched splice is tracked as a node", #st.nodes >= 1, #st.nodes)
-  check("prefetched expand records a total:expand span", (function()
-    for _, e in ipairs(profile.events) do
-      if e.name == "total:expand" then
-        return true
+  check(
+    "prefetched expand records a total:expand span",
+    (function()
+      for _, e in ipairs(profile.events) do
+        if e.name == "total:expand" then
+          return true
+        end
       end
-    end
-    return false
-  end)(), vim.inspect(profile.events))
+      return false
+    end)(),
+    vim.inspect(profile.events)
+  )
 
   profile.enabled = false
   profile.clear()
@@ -309,5 +322,4 @@ do
   profile.clear()
 end
 
-print("")
-print(fails == 0 and "ALL EXPANDER TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("EXPANDER")

@@ -35,12 +35,12 @@ local function body_text(ir, last_i, extra)
   local edits = {}
   vim.list_extend(edits, ir.body_edits)
   vim.list_extend(edits, extra or {})
-  local rstart = C.sb(ir.stmts[1]) - C.scol(ir.stmts[1])
+  local rstart = C.bol(ir.stmts[1])
   return C.apply_edits(ir.src, rstart, C.eb(ir.stmts[last_i]), edits)
 end
 
 -- Replace the whole target statement with `{ hoist...; modified target }`.
-local function print_wrapped(caller_src, ir, ctx, hoist, replacement)
+local function print_wrapped(caller_src, ctx, hoist, replacement)
   local ttext = C.text(ctx.target, caller_src)
   local off = C.sb(ctx.call) - C.sb(ctx.target)
   local modified = ttext:sub(1, off) .. replacement .. ttext:sub(C.eb(ctx.call) - C.sb(ctx.target) + 1)
@@ -58,9 +58,9 @@ end
 
 -- Insert `hoist` lines above the target statement and swap the call for
 -- `replacement`; wraps in a block when the target is not directly braced.
-local function print_hoisted(caller_src, ir, ctx, hoist, replacement)
+local function print_hoisted(caller_src, ctx, hoist, replacement)
   if not ctx.braced then
-    return print_wrapped(caller_src, ir, ctx, hoist, replacement)
+    return print_wrapped(caller_src, ctx, hoist, replacement)
   end
   local block = {}
   for _, l in ipairs(hoist) do
@@ -85,7 +85,7 @@ local function print_pretty(caller_src, ir, ctx)
   -- The precedence parens double up when the return expression was already
   -- parenthesised; collapse the redundant nest (semantics-preserving).
   local replacement = require("inline-explorer.simplify").parens("(" .. expr_text .. ")")
-  return print_hoisted(caller_src, ir, ctx, hoist, replacement)
+  return print_hoisted(caller_src, ctx, hoist, replacement)
 end
 
 -- Canonical form: GNU statement expression + return->goto. Legal in any
@@ -117,7 +117,7 @@ local function print_readable_multi(caller_src, ir, ctx)
     hoist[#hoist + 1] = ir.ret_type .. " " .. ir.ret_var .. ";"
   end
   vim.list_extend(hoist, C.rebase(body_text(ir, #ir.stmts, return_edits(ir, "assign")), ""))
-  return print_hoisted(caller_src, ir, ctx, hoist, ir.ret_var)
+  return print_hoisted(caller_src, ctx, hoist, ir.ret_var)
 end
 
 M.PRINTERS = {

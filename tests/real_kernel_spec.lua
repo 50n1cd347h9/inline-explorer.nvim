@@ -34,19 +34,12 @@
 -- spec puts it there itself rather than depending on the caller.
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
+local check = H.check
 
 local profile = require("inline-explorer.profile")
 local resolver = require("inline-explorer.resolver")
-
-local fails = 0
-local function check(label, ok, detail)
-  if ok then
-    print("PASS  " .. label)
-  else
-    fails = fails + 1
-    print("FAIL  " .. label .. (detail and ("  " .. tostring(detail)) or ""))
-  end
-end
+local C = require("inline-explorer.csrc")
 
 local K = vim.env.IE_KERNEL_DIR
 local TARGET = vim.env.IE_KERNEL_FILE or "kernel/sched/core.c"
@@ -127,8 +120,12 @@ do
   while vim.uv.hrtime() < deadline do
     local cs = vim.lsp.get_clients({ bufnr = buf })
     if #cs > 0 and cs[1].initialized then
-      local r = cs[1]:request_sync("textDocument/documentSymbol",
-        { textDocument = vim.lsp.util.make_text_document_params(buf) }, 30000, buf)
+      local r = cs[1]:request_sync(
+        "textDocument/documentSymbol",
+        { textDocument = vim.lsp.util.make_text_document_params(buf) },
+        30000,
+        buf
+      )
       if r and r.result then
         ready = true
         break
@@ -151,12 +148,11 @@ local WANT = tonumber(vim.env.IE_KERNEL_SITES or "") or 12
 local names = {}
 do
   local src = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-  local root = vim.treesitter.get_string_parser(src, "c"):parse()[1]:root()
+  local root = C.parse(src)
   local q = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
   local seen = {}
   for _, n in q:iter_captures(root, src) do
-    local _, _, a, _, _, b = n:range(true)
-    local nm = src:sub(a + 1, b)
+    local nm = C.text(n, src)
     if not seen[nm] then
       seen[nm] = true
       names[#names + 1] = nm
@@ -172,11 +168,12 @@ do
   -- 48 callees; several of those were fuzzy mismatches presented as
   -- resolutions.) Functions DEFINED in this file always resolve through
   -- the dynamic index, so they anchor the pool honestly.
-  local qd = vim.treesitter.query.parse("c",
-    "(function_definition declarator: (function_declarator declarator: (identifier) @d))")
+  local qd = vim.treesitter.query.parse(
+    "c",
+    "(function_definition declarator: (function_declarator declarator: (identifier) @d))"
+  )
   for _, n in qd:iter_captures(root, src) do
-    local _, _, a, _, _, b = n:range(true)
-    local nm = src:sub(a + 1, b)
+    local nm = C.text(n, src)
     if not seen[nm] then
       seen[nm] = true
       names[#names + 1] = nm
@@ -230,12 +227,15 @@ for _, nm in ipairs(names) do
   end
 end
 
-check(("resolved at least %d callees in %s"):format(math.min(WANT, 4), TARGET),
-  #resolved >= math.min(WANT, 4), ("resolved=%d of %d tried"):format(#resolved, #names))
+check(
+  ("resolved at least %d callees in %s"):format(math.min(WANT, 4), TARGET),
+  #resolved >= math.min(WANT, 4),
+  ("resolved=%d of %d tried"):format(#resolved, #names)
+)
 
 if #resolved == 0 then
   print("real kernel: nothing resolved; cannot assert the cache invariant")
-  print(fails == 0 and "1 FAILURE(S)" or (fails .. " FAILURE(S)"))
+  print(math.max(H.fails, 1) .. " FAILURE(S)")
   vim.cmd("cq")
   return
 end
@@ -251,11 +251,13 @@ for _, nm in ipairs(resolved) do
     check("repeat fetch of " .. nm .. " still returns a body", false)
   end
 end
-local c = span_counts()
+local counts = span_counts()
 
-check("repeat lookups are served from cache, not the server",
-  c.server == 0 and c.cached > 0,
-  ("cached spans=%d server spans=%d over %d repeat lookups"):format(c.cached, c.server, #resolved))
+check(
+  "repeat lookups are served from cache, not the server",
+  counts.server == 0 and counts.cached > 0,
+  ("cached spans=%d server spans=%d over %d repeat lookups"):format(counts.cached, counts.server, #resolved)
+)
 
 -- Editing the DEFINITION's file must retire the entries rather than serve a
 -- stale body. Deliberately not the source buffer: entries are keyed on the
@@ -286,9 +288,11 @@ do
     vim.api.nvim_buf_set_lines(def_buf, 0, 0, false, { "/* inline-explorer cache invalidation probe */" })
     local _, after_edit = fetch(probe)
     local ce = span_counts()
-    check("an edit to the definition's file retires the cached lookup",
+    check(
+      "an edit to the definition's file retires the cached lookup",
       ce.server > 0,
-      ("probe=%s def=%s cached=%d server=%d"):format(probe, vim.uri_to_fname(def_loc.uri), ce.cached, ce.server))
+      ("probe=%s def=%s cached=%d server=%d"):format(probe, vim.uri_to_fname(def_loc.uri), ce.cached, ce.server)
+    )
     check("the lookup after an edit still returns a body", after_edit ~= nil)
     vim.api.nvim_buf_set_lines(def_buf, 0, 1, false, {})
   end
@@ -316,7 +320,9 @@ do
     lines, label = l, lb
     done = true
   end)
-  vim.wait(60000, function() return done end, 10)
+  vim.wait(60000, function()
+    return done
+  end, 10)
   local via = "direct"
   for _, e in ipairs(profile.events) do
     if e.name == "locate:definition-chase" then
@@ -325,13 +331,20 @@ do
       via = "chase-miss"
     end
   end
-  check("kernel chase: a cross-file name yields a BODY, not a prototype",
-    done and label == "function_definition" and lines ~= nil and #lines > 1
+  check(
+    "kernel chase: a cross-file name yields a BODY, not a prototype",
+    done
+      and label == "function_definition"
+      and lines ~= nil
+      and #lines > 1
       and table.concat(lines, "\n"):find("{", 1, true) ~= nil,
-    ("label=%s n=%s via=%s"):format(tostring(label), lines and #lines, via))
-  check("kernel chase: never a bare declaration",
+    ("label=%s n=%s via=%s"):format(tostring(label), lines and #lines, via)
+  )
+  check(
+    "kernel chase: never a bare declaration",
     done and (lines == nil or table.concat(lines, "\n"):match("^[^{]*;%s*$") == nil),
-    lines and table.concat(lines, "\n"))
+    lines and table.concat(lines, "\n")
+  )
 end
 
 -- The real kfree, end to end against real clangd: declared in slab.h,
@@ -358,8 +371,7 @@ do
     -- Not printed as SKIP: -- CI greps ^SKIP: as failure. This section
     -- being conditional is a coverage statement, and the check records
     -- which way it ran instead of silently passing.
-    check("kernel kfree: SKIPPED -- mm/slub.c not in the compile database (build mm/slub.o to enable)",
-      true, nil)
+    check("kernel kfree: SKIPPED -- mm/slub.c not in the compile database (build mm/slub.o to enable)", true, nil)
   else
     local sb = vim.fn.bufadd(slub)
     vim.fn.bufload(sb)
@@ -371,8 +383,12 @@ do
       if #cs == 0 then
         return false
       end
-      local r = cs[1]:request_sync("textDocument/documentSymbol",
-        { textDocument = { uri = vim.uri_from_bufnr(sb) } }, 30000, sb)
+      local r = cs[1]:request_sync(
+        "textDocument/documentSymbol",
+        { textDocument = { uri = vim.uri_from_bufnr(sb) } },
+        30000,
+        sb
+      )
       return r ~= nil and r.result ~= nil and #r.result > 0
     end, 500)
     resolver.clear_caches()
@@ -381,12 +397,19 @@ do
       lines, label = l, lb
       done = true
     end)
-    vim.wait(60000, function() return done end, 10)
-    check("kernel kfree: the definition body, not the slab.h prototype",
-      done and label == "function_definition" and lines ~= nil and #lines > 5
+    vim.wait(60000, function()
+      return done
+    end, 10)
+    check(
+      "kernel kfree: the definition body, not the slab.h prototype",
+      done
+        and label == "function_definition"
+        and lines ~= nil
+        and #lines > 5
         and (lines[1] or ""):find("kfree", 1, true) ~= nil
         and table.concat(lines, "\n"):find("{", 1, true) ~= nil,
-      ("label=%s n=%s first=%s"):format(tostring(label), lines and #lines, lines and lines[1]))
+      ("label=%s n=%s first=%s"):format(tostring(label), lines and #lines, lines and lines[1])
+    )
   end
 end
 
@@ -414,9 +437,14 @@ do
     items, source = i2, s2
     done = true
   end)
-  vim.wait(60000, function() return done end, 20)
-  check("kernel callers: non-empty from real clangd or labelled grep",
-    done and items ~= nil and #items > 0, ("source=%s n=%s"):format(tostring(source), items and #items))
+  vim.wait(60000, function()
+    return done
+  end, 20)
+  check(
+    "kernel callers: non-empty from real clangd or labelled grep",
+    done and items ~= nil and #items > 0,
+    ("source=%s n=%s"):format(tostring(source), items and #items)
+  )
 
   -- Trail across a real switch: the origin view must come back by identity
   -- WITH ITS EXPANSIONS. The nav spec promises expansion state preserved
@@ -445,34 +473,38 @@ do
   end
   local nodes_before = #(view.state[v0].nodes or {})
   local before = vim.api.nvim_buf_line_count(v0)
-  check("kernel trail: an expansion exists before the switch",
-    nodes_before > 0, nodes_before)
+  check("kernel trail: an expansion exists before the switch", nodes_before > 0, nodes_before)
   if items and #items > 0 then
     trail.goto_location(items[1])
     local v1 = vim.api.nvim_get_current_buf()
     check("kernel trail: switch lands in a view", view.state[v1] ~= nil)
     trail.back()
-    check("kernel trail: back restores the SAME buffer",
-      vim.api.nvim_get_current_buf() == v0)
-    check("kernel trail: the expansion survived the round trip",
-      #(view.state[v0].nodes or {}) == nodes_before
-        and vim.api.nvim_buf_line_count(v0) == before,
-      ("nodes %d->%d lines %d->%d"):format(nodes_before, #(view.state[v0].nodes or {}),
-        before, vim.api.nvim_buf_line_count(v0)))
+    check("kernel trail: back restores the SAME buffer", vim.api.nvim_get_current_buf() == v0)
+    check(
+      "kernel trail: the expansion survived the round trip",
+      #(view.state[v0].nodes or {}) == nodes_before and vim.api.nvim_buf_line_count(v0) == before,
+      ("nodes %d->%d lines %d->%d"):format(
+        nodes_before,
+        #(view.state[v0].nodes or {}),
+        before,
+        vim.api.nvim_buf_line_count(v0)
+      )
+    )
   end
   trail.clear()
 end
 
-print(("\nreal kernel: %s  attach=%.0fms  first p50=%.1fms p90=%.1fms  repeat p50=%.1fms p90=%.1fms  n=%d")
-  :format(TARGET, attach_ms, pct(first_ms, 50), pct(first_ms, 90),
-    pct(second_ms, 50), pct(second_ms, 90), #resolved))
+print(
+  ("\nreal kernel: %s  attach=%.0fms  first p50=%.1fms p90=%.1fms  repeat p50=%.1fms p90=%.1fms  n=%d"):format(
+    TARGET,
+    attach_ms,
+    pct(first_ms, 50),
+    pct(first_ms, 90),
+    pct(second_ms, 50),
+    pct(second_ms, 90),
+    #resolved
+  )
+)
 print("(timings are reported, not asserted -- the pass/fail gate above is span-shaped)")
 
-print("")
-if fails == 0 then
-  print("ALL REAL KERNEL TESTS PASSED")
-  vim.cmd("qa!")
-else
-  print(fails .. " FAILURE(S)")
-  vim.cmd("cq")
-end
+H.finish("REAL KERNEL")

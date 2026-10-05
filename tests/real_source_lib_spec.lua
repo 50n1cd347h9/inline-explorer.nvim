@@ -9,17 +9,10 @@
 --   nvim --headless --clean -u NONE -c "luafile tests/real_source_lib_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
 local real = require("tests.lib.real_source")
 
-local fails = 0
-local function check(l, ok, d)
-  if ok then
-    print("PASS  " .. l)
-  else
-    fails = fails + 1
-    print("FAIL  " .. l .. (d and ("\n----\n" .. tostring(d) .. "\n----") or ""))
-  end
-end
+local check = H.check
 
 -- One-commit local git repo from a list of source lines.
 local function make_synth_repo(lines)
@@ -29,7 +22,9 @@ local function make_synth_repo(lines)
   vim.fn.system({
     "bash",
     "-lc",
-    "cd " .. vim.fn.shellescape(src) .. " && git init -q && git add main.c"
+    "cd "
+      .. vim.fn.shellescape(src)
+      .. " && git init -q && git add main.c"
       .. " && git -c user.email=t@t.example -c user.name=t commit -q -m synth",
   })
   assert(vim.v.shell_error == 0, "failed to init synthetic git repo")
@@ -110,12 +105,21 @@ else
       -- built+passed=2 -- exactly the pre-9d7a5c6 behaviour the reviewer
       -- reproduced (see the fix commit's report for the observed
       -- before/after of this exact test).
-      check("F1: dead-branch counts the one guarded, never-active call site",
-        summary:match("dead%-branch=1%f[%D]") ~= nil, summary)
-      check("F1: engine-accepted counts only the one live call site",
-        summary:match("engine%-accepted=1%f[%D]") ~= nil, summary)
-      check("F1: built+passed counts only the one live call site",
-        summary:match("built%+passed=1%f[%D]") ~= nil, summary)
+      check(
+        "F1: dead-branch counts the one guarded, never-active call site",
+        summary:match("dead%-branch=1%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F1: engine-accepted counts only the one live call site",
+        summary:match("engine%-accepted=1%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F1: built+passed counts only the one live call site",
+        summary:match("built%+passed=1%f[%D]") ~= nil,
+        summary
+      )
       check("F1: sites=2 (one dead, one live; neither ambiguous)", summary:match("sites=2%f[%D]") ~= nil, summary)
     end
   end
@@ -154,12 +158,21 @@ else
     local summary = summary_line(captured, "synth-line-directive")
     check("F3: summary line was printed", summary ~= nil, table.concat(captured, "\n"))
     if summary then
-      check("F3: the #line'd file is not silently miscounted as dead-branch",
-        summary:match("dead%-branch=0%f[%D]") ~= nil, summary)
-      check("F3: the one live call is still attempted (engine-accepted=1)",
-        summary:match("engine%-accepted=1%f[%D]") ~= nil, summary)
-      check("F3: unverifiable-files=1 -- the #line makes the file's check untrustworthy, and says so",
-        summary:match("unverifiable%-files=1%f[%D]") ~= nil, summary)
+      check(
+        "F3: the #line'd file is not silently miscounted as dead-branch",
+        summary:match("dead%-branch=0%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F3: the one live call is still attempted (engine-accepted=1)",
+        summary:match("engine%-accepted=1%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F3: unverifiable-files=1 -- the #line makes the file's check untrustworthy, and says so",
+        summary:match("unverifiable%-files=1%f[%D]") ~= nil,
+        summary
+      )
     end
     local named = false
     for _, l in ipairs(captured) do
@@ -167,7 +180,11 @@ else
         named = true
       end
     end
-    check("F3: the unverifiable file is named with the #line reason, not just counted", named, table.concat(captured, "\n"))
+    check(
+      "F3: the unverifiable file is named with the #line reason, not just counted",
+      named,
+      table.concat(captured, "\n")
+    )
   end
 
   -- ======================================================================
@@ -206,12 +223,21 @@ else
     local summary = summary_line(captured, "synth-cpp-fail")
     check("F4: summary line was printed", summary ~= nil, table.concat(captured, "\n"))
     if summary then
-      check("F4: fails open -- the one call site is still attempted, not dropped",
-        summary:match("engine%-accepted=1%f[%D]") ~= nil, summary)
-      check("F4: built+passed=1 -- the fallback did not break a real transform",
-        summary:match("built%+passed=1%f[%D]") ~= nil, summary)
-      check("F4: unverifiable-files=1 is IN the summary line monitoring greps `^real %s:` actually match",
-        summary:match("unverifiable%-files=1%f[%D]") ~= nil, summary)
+      check(
+        "F4: fails open -- the one call site is still attempted, not dropped",
+        summary:match("engine%-accepted=1%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F4: built+passed=1 -- the fallback did not break a real transform",
+        summary:match("built%+passed=1%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F4: unverifiable-files=1 is IN the summary line monitoring greps `^real %s:` actually match",
+        summary:match("unverifiable%-files=1%f[%D]") ~= nil,
+        summary
+      )
     end
     local named = false
     for _, l in ipairs(captured) do
@@ -264,18 +290,24 @@ else
     if summary then
       -- Before the fix: dead-branch=1, engine-accepted=0 -- the live
       -- helper(5) call silently dropped from the failure-detecting pool.
-      check("F5: the live call is NOT tagged dead-branch",
-        summary:match("dead%-branch=0%f[%D]") ~= nil, summary)
-      check("F5: the live call is still attempted (engine-accepted=1)",
-        summary:match("engine%-accepted=1%f[%D]") ~= nil, summary)
-      check("F5: and it builds + passes (built+passed=1)",
-        summary:match("built%+passed=1%f[%D]") ~= nil, summary)
-      check("F5: sites=1 (the one call, neither ambiguous nor dead)",
-        summary:match("sites=1%f[%D]") ~= nil, summary)
-      check("F5: the file itself is not marked unverifiable (only the site is flagged)",
-        summary:match("unverifiable%-files=0%f[%D]") ~= nil, summary)
-      check("F5: the site-level ambiguity is counted (unverifiable-dead-sites=1)",
-        summary:match("unverifiable%-dead%-sites=1%f[%D]") ~= nil, summary)
+      check("F5: the live call is NOT tagged dead-branch", summary:match("dead%-branch=0%f[%D]") ~= nil, summary)
+      check(
+        "F5: the live call is still attempted (engine-accepted=1)",
+        summary:match("engine%-accepted=1%f[%D]") ~= nil,
+        summary
+      )
+      check("F5: and it builds + passes (built+passed=1)", summary:match("built%+passed=1%f[%D]") ~= nil, summary)
+      check("F5: sites=1 (the one call, neither ambiguous nor dead)", summary:match("sites=1%f[%D]") ~= nil, summary)
+      check(
+        "F5: the file itself is not marked unverifiable (only the site is flagged)",
+        summary:match("unverifiable%-files=0%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F5: the site-level ambiguity is counted (unverifiable-dead-sites=1)",
+        summary:match("unverifiable%-dead%-sites=1%f[%D]") ~= nil,
+        summary
+      )
     end
     local named = false
     for _, l in ipairs(captured) do
@@ -335,19 +367,26 @@ else
     check("F6: summary line was printed", summary ~= nil, table.concat(captured, "\n"))
     if summary then
       check("F6: sites=3 (w(0), w(1), w(2); none ambiguous)", summary:match("sites=3%f[%D]") ~= nil, summary)
-      check("F6: exactly one call (w(2), the nested-#if-0 one) is dead-branch",
-        summary:match("dead%-branch=1%f[%D]") ~= nil, summary)
-      check("F6: the other two (w(0), w(1)) are attempted (engine-accepted=2)",
-        summary:match("engine%-accepted=2%f[%D]") ~= nil, summary)
-      check("F6: and both build + pass (built+passed=2)",
-        summary:match("built%+passed=2%f[%D]") ~= nil, summary)
+      check(
+        "F6: exactly one call (w(2), the nested-#if-0 one) is dead-branch",
+        summary:match("dead%-branch=1%f[%D]") ~= nil,
+        summary
+      )
+      check(
+        "F6: the other two (w(0), w(1)) are attempted (engine-accepted=2)",
+        summary:match("engine%-accepted=2%f[%D]") ~= nil,
+        summary
+      )
+      check("F6: and both build + pass (built+passed=2)", summary:match("built%+passed=2%f[%D]") ~= nil, summary)
       -- The regression: w(2)'s correct dead verdict must NOT be overruled by
       -- w(1)'s sibling, active call to the same name a few lines away.
-      check("F6: w(2)'s dead verdict is NOT overruled (unverifiable-dead-sites=0)",
-        summary:match("unverifiable%-dead%-sites=0%f[%D]") ~= nil, summary)
+      check(
+        "F6: w(2)'s dead verdict is NOT overruled (unverifiable-dead-sites=0)",
+        summary:match("unverifiable%-dead%-sites=0%f[%D]") ~= nil,
+        summary
+      )
     end
   end
 end
 
-print("")
-print(fails == 0 and "ALL REAL SOURCE LIB TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("REAL SOURCE LIB")

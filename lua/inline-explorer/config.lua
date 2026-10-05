@@ -1,3 +1,5 @@
+local util = require("inline-explorer.util")
+
 local M = {}
 
 M.defaults = {
@@ -45,7 +47,7 @@ local function check(opts)
   end
   for k in pairs(opts) do
     if M.defaults[k] == nil then
-      vim.notify(("[inline-explorer] unknown option '%s' (typo?)"):format(k), vim.log.levels.WARN)
+      util.notify(("unknown option '%s' (typo?)"):format(k), vim.log.levels.WARN)
     end
   end
 end

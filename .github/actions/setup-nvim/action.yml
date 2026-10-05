@@ -1,0 +1,10 @@
+name: Install Neovim
+description: Download the pinned Neovim release and put its bin/ on PATH.
+runs:
+  using: composite
+  steps:
+    - name: Install Neovim
+      shell: bash
+      run: |
+        curl -sL https://github.com/neovim/neovim/releases/download/v0.11.3/nvim-linux-x86_64.tar.gz | tar xz
+        echo "$PWD/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"

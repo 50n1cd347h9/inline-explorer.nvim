@@ -12,6 +12,7 @@
 -- a small set of transparent container nodes) and a brace counter remain as
 -- fallbacks when no server range is available.
 local profile = require("inline-explorer.profile")
+local util = require("inline-explorer.util")
 
 local M = {}
 
@@ -67,8 +68,8 @@ function M.client_request(client, method, params, handler, bufnr)
   return client.request(method, params, handler, bufnr)
 end
 
-local function once_with_timeout(cb, on_timeout)
-  return require("inline-explorer.async").once_with_timeout(cb, on_timeout, M._timeout_ms)
+local function once_with_timeout(cb, on_timeout, ms)
+  return require("inline-explorer.async").once_with_timeout(cb, on_timeout, ms or M._timeout_ms)
 end
 
 -- Result caches. The attach cache further down keeps the SERVER from
@@ -142,20 +143,7 @@ end
 
 local function cache_put(cache, key, value, tick, cap)
   cache[key] = { value = value, tick = tick, at = vim.uv.now() }
-  local n, entries = 0, {}
-  for k, e in pairs(cache) do
-    n = n + 1
-    entries[n] = { k = k, at = e.at }
-  end
-  if n <= cap then
-    return
-  end
-  table.sort(entries, function(a, b)
-    return a.at < b.at
-  end)
-  for i = 1, n - cap do
-    cache[entries[i].k] = nil
-  end
+  util.evict_lru(cache, cap)
 end
 
 -- The client set decides what a name can resolve to, so it is part of the
@@ -168,6 +156,30 @@ local function client_key(bufnr)
   end
   table.sort(ids)
   return table.concat(ids, ",")
+end
+
+-- The buffer whose clients answer for `source_bufnr`: itself when valid,
+-- else the current buffer (0).
+local function source_buf(source_bufnr)
+  return (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
+end
+
+local function locate_key(bufnr, name)
+  return client_key(bufnr) .. "\1" .. name
+end
+
+-- The definition file's changedtick (nil when it has none) and its bufnr
+-- (-1 when no buffer exists). Only an existing buffer is consulted;
+-- uri_to_bufnr would create one, and a definition file nobody has opened
+-- cannot have been edited in this session anyway.
+local function def_tick(uri)
+  local b = vim.fn.bufnr(vim.uri_to_fname(uri))
+  return b ~= -1 and tick_of(b) or nil, b
+end
+
+-- "name @ file.c": how spans and messages identify a location.
+local function describe(name, uri)
+  return (name or "?") .. " @ " .. vim.fn.fnamemodify(vim.uri_to_fname(uri), ":t")
 end
 
 -- Deliberately NOT invalidated on LspAttach/LspDetach. That was the first
@@ -184,7 +196,7 @@ end
 -- Ask whichever server is attached to the source buffer where `name` is defined.
 -- Calls cb(location, err) where location = { uri, range, kind, name }.
 function M.locate(name, source_bufnr, cb)
-  local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
+  local bufnr = source_buf(source_bufnr)
   if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
     return cb(nil, "no language server attached to the source buffer")
   end
@@ -203,19 +215,12 @@ function M.locate(name, source_bufnr, cb)
   -- stale range as its reference, `_symbol_range` picks whatever now
   -- contains it, and the wrong body is spliced -- a wrong answer, not a slow
   -- one. The definition file's tick catches exactly that.
-  local key = client_key(bufnr) .. "\1" .. name
-  local function loc_tick(loc)
-    -- Only consult a buffer that already exists; uri_to_bufnr would create
-    -- one, and a definition file nobody has opened cannot have been edited
-    -- in this session anyway.
-    local b = vim.fn.bufnr(vim.uri_to_fname(loc.uri))
-    return b ~= -1 and tick_of(b) or nil
-  end
+  local key = locate_key(bufnr, name)
 
   do
     local e = M._locate_cache[key]
     if e then
-      local now_tick = loc_tick(e.value)
+      local now_tick, b = def_tick(e.value.uri)
       -- An entry recorded before the definition file was loaded carries no
       -- tick, and `extract` loads that file moments later -- so by the next
       -- lookup a tick exists where none was stored. That is a file being
@@ -228,8 +233,7 @@ function M.locate(name, source_bufnr, cb)
       -- indexed when it gave us this range. A buffer with unsaved edits gets
       -- no such benefit and is retired.
       if e.tick == nil and now_tick ~= nil then
-        local b = vim.fn.bufnr(vim.uri_to_fname(e.value.uri))
-        if b ~= -1 and not vim.bo[b].modified then
+        if not vim.bo[b].modified then
           e.tick = now_tick
         end
       end
@@ -245,10 +249,9 @@ function M.locate(name, source_bufnr, cb)
 
   local span = profile.start()
   local finish = once_with_timeout(function(loc, err)
-    span(loc and "locate:ok" or "locate:miss",
-      loc and ("%s @ %s"):format(loc.name or name, vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")) or name)
+    span(loc and "locate:ok" or "locate:miss", loc and describe(loc.name or name, loc.uri) or name)
     if loc then
-      cache_put(M._locate_cache, key, loc, loc_tick(loc), M._locate_cache_n)
+      cache_put(M._locate_cache, key, loc, (def_tick(loc.uri)), M._locate_cache_n)
     end
     cb(loc, err)
   end, function()
@@ -279,8 +282,10 @@ function M.locate(name, source_bufnr, cb)
       end
     end
     if not pick then
-      return finish(nil, ("no symbol named exactly '%s' (closest: %s -- index incomplete?)"):format(
-        name, all[1].name or "?"))
+      return finish(
+        nil,
+        ("no symbol named exactly '%s' (closest: %s -- index incomplete?)"):format(name, all[1].name or "?")
+      )
     end
 
     local loc = pick.location
@@ -358,6 +363,38 @@ function M._symbol_range(symbols, ref_range, name, uri)
   end
   walk(symbols)
   return best, best_label
+end
+
+-- Body lines for `loc` from a buf_request_all documentSymbol reply: the
+-- first client whose symbols contain the definition wins. Shared by the
+-- extract path and its after-timeout retry, which once parsed the reply on
+-- separate copies -- and the retry's lacked the end-exclusive trim, so a
+-- late answer cached one line past the definition. Raises on a malformed
+-- reply; callers pcall.
+local function lines_from_symbols(results, loc, target)
+  local range, label
+  for _, r in pairs(results or {}) do
+    if r.result then
+      range, label = M._symbol_range(r.result, loc.range, loc.name, loc.uri)
+      if range then
+        break
+      end
+    end
+  end
+  if not range then
+    return nil, nil
+  end
+  -- LSP ranges are end-exclusive; end.character == 0 on a line after
+  -- start means that line's content is not actually part of the range.
+  local erow = range["end"].line
+  if range["end"].character == 0 and erow > range.start.line then
+    erow = erow - 1
+  end
+  local ls = vim.api.nvim_buf_get_lines(target, range.start.line, erow + 1, false)
+  if #ls == 0 then
+    return nil, nil
+  end
+  return ls, label
 end
 
 -- Resolve the tree-sitter language for a buffer. A buffer that was only
@@ -451,23 +488,29 @@ local function cache_attachment(target, newly_attached)
   elseif #newly_attached > 0 then
     cache[target] = { ids = newly_attached, at = vim.uv.now() }
   end
-  local entries = {}
-  for b, e in pairs(cache) do
-    entries[#entries + 1] = { b = b, at = e.at }
-  end
-  table.sort(entries, function(a, b)
-    return a.at < b.at
-  end)
-  for i = 1, #entries - M._attach_cache_n do
-    local b = entries[i].b
-    local e = cache[b]
-    cache[b] = nil
+  util.evict_lru(cache, M._attach_cache_n, function(b, e)
     if vim.api.nvim_buf_is_valid(b) and #vim.fn.win_findbuf(b) == 0 then
       for _, id in ipairs(e.ids) do
         pcall(vim.lsp.buf_detach_client, b, id)
       end
     end
+  end)
+end
+
+-- Load `target` and attach `clients` to it, through the LRU attach cache.
+-- Returns the ids this call newly attached (empty when all were already on).
+local function attach_clients(target, clients)
+  vim.fn.bufload(target)
+  local newly_attached = {}
+  for _, c in ipairs(clients) do
+    local pre = c.attached_buffers and c.attached_buffers[target]
+    vim.lsp.buf_attach_client(target, c.id)
+    if not pre then
+      newly_attached[#newly_attached + 1] = c.id
+    end
   end
+  cache_attachment(target, newly_attached)
+  return newly_attached
 end
 
 -- Extract the definition at `loc`. Asks the server attached to `source_bufnr`
@@ -478,8 +521,7 @@ end
 -- once on every path -- possibly synchronously (fallback path).
 function M.extract(loc, source_bufnr, cb)
   local span = profile.start()
-  local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
-  local clients = vim.lsp.get_clients({ bufnr = bufnr })
+  local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
   for _, c in ipairs(clients) do
     profile.identify(c)
   end
@@ -509,10 +551,7 @@ function M.extract(loc, source_bufnr, cb)
   -- answer in the data.
   local function detail()
     local n = vim.api.nvim_buf_is_loaded(target) and vim.api.nvim_buf_line_count(target) or -1
-    return ("%s @ %s%s"):format(
-      loc.name or "?",
-      vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t"),
-      n >= 0 and (" (" .. n .. "L)") or "")
+    return describe(loc.name, loc.uri) .. (n >= 0 and (" (" .. n .. "L)") or "")
   end
 
   -- Reading the definition file off disk is not the same cost as the
@@ -532,8 +571,15 @@ function M.extract(loc, source_bufnr, cb)
   -- will run its ExpandMacro tweak -- so a cache hit skips the
   -- documentSymbol round trip and nothing else. Ordering this way is a
   -- precaution about that dependency, not a fix for an observed break.
-  local ekey = loc.uri .. "\1" .. loc.range.start.line .. ":" .. loc.range.start.character
-    .. "\1" .. loc.range["end"].line .. ":" .. loc.range["end"].character
+  local ekey = loc.uri
+    .. "\1"
+    .. loc.range.start.line
+    .. ":"
+    .. loc.range.start.character
+    .. "\1"
+    .. loc.range["end"].line
+    .. ":"
+    .. loc.range["end"].character
   -- Attachments WE create are cached, not dropped when the request settles:
   -- re-attaching a definition header makes clangd rebuild its whole preamble.
   -- Re-measured 2026-07-30 on linux-6.12 (defconfig, clangd 18.1.3, reading
@@ -549,15 +595,7 @@ function M.extract(loc, source_bufnr, cb)
   -- long session stays bounded without repaying the preamble every keypress.
   -- A buffer the user actually has in a window is never detached.
   local attach_span = profile.start()
-  local newly_attached = {}
-  for _, c in ipairs(clients) do
-    local pre = c.attached_buffers and c.attached_buffers[target]
-    vim.lsp.buf_attach_client(target, c.id)
-    if not pre then
-      newly_attached[#newly_attached + 1] = c.id
-    end
-  end
-  cache_attachment(target, newly_attached)
+  local newly_attached = attach_clients(target, clients)
   if #newly_attached > 0 then
     attach_span("extract:attach", detail())
   end
@@ -640,7 +678,7 @@ function M.extract(loc, source_bufnr, cb)
 
   local timed_out = false
   local budget = #newly_attached > 0 and M._cold_timeout_ms or M._timeout_ms
-  local finish = require("inline-explorer.async").once_with_timeout(function(lines, label)
+  local finish = once_with_timeout(function(lines, label)
     -- A timeout is not a measurement of the server. once_with_timeout routes
     -- its own result through this same callback, so labelling by `stage`
     -- recorded a wedged request as a successful `extract:cold` whose
@@ -684,22 +722,8 @@ function M.extract(loc, source_bufnr, cb)
     do
       local probe = profile.enabled and profile.start() or nil
       vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(res)
-        local lines, label
-        for _, r in pairs(res or {}) do
-          if r.result then
-            local ok2, range, rlabel = pcall(function()
-              local rg, lb = M._symbol_range(r.result, loc.range, loc.name, loc.uri)
-              return rg, lb
-            end)
-            if ok2 and range then
-              local ls = vim.api.nvim_buf_get_lines(target, range.start.line, range["end"].line + 1, false)
-              if #ls > 0 then
-                lines, label = ls, rlabel or kind_label(loc.kind)
-              end
-            end
-          end
-        end
-        if lines then
+        local ok2, lines, label = pcall(lines_from_symbols, res, loc, target)
+        if ok2 and lines then
           local now_tick = tick_of(target)
           if now_tick then
             cache_put(M._extract_cache, ekey, { lines, label }, now_tick, M._extract_cache_n)
@@ -714,38 +738,20 @@ function M.extract(loc, source_bufnr, cb)
     -- user with no way to tell a server that is wedged from one that is
     -- merely building a preamble for a file it has not seen -- and no
     -- reason to believe a second attempt would behave differently.
-    vim.notify(("[inline-explorer] %s: no answer within %dms for %s; extracted locally. Looking again will use the server."):format(
-      loc.name or "?", budget, vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")), vim.log.levels.WARN)
+    util.notify(
+      ("%s: no answer within %dms for %s; extracted locally. Looking again will use the server."):format(
+        loc.name or "?",
+        budget,
+        vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")
+      ),
+      vim.log.levels.WARN
+    )
     return M.extract_sync(loc)
   end, budget)
 
   vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
     -- pcall so a malformed/unexpected response shape can't leave cb unfired.
-    local ok, lines, label = pcall(function()
-      local range, lbl
-      for _, r in pairs(results or {}) do
-        if r.result then
-          range, lbl = M._symbol_range(r.result, loc.range, loc.name, loc.uri)
-          if range then
-            break
-          end
-        end
-      end
-      if not range then
-        return nil, nil
-      end
-      -- LSP ranges are end-exclusive; end.character == 0 on a line after
-      -- start means that line's content is not actually part of the range.
-      local erow = range["end"].line
-      if range["end"].character == 0 and erow > range.start.line then
-        erow = erow - 1
-      end
-      local ls = vim.api.nvim_buf_get_lines(target, range.start.line, erow + 1, false)
-      if #ls == 0 then
-        return nil, nil
-      end
-      return ls, lbl
-    end)
+    local ok, lines, label = pcall(lines_from_symbols, results, loc, target)
     if ok and lines then
       finish(lines, label)
     else
@@ -798,22 +804,12 @@ end
 -- answer requests about a document it has not been handed. Returns the
 -- target bufnr, or nil when there is nothing to attach.
 function M.ensure_attached(uri, source_bufnr)
-  local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
-  local clients = vim.lsp.get_clients({ bufnr = bufnr })
+  local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
   if #clients == 0 then
     return nil
   end
   local target = vim.uri_to_bufnr(uri)
-  vim.fn.bufload(target)
-  local newly_attached = {}
-  for _, c in ipairs(clients) do
-    local pre = c.attached_buffers and c.attached_buffers[target]
-    vim.lsp.buf_attach_client(target, c.id)
-    if not pre then
-      newly_attached[#newly_attached + 1] = c.id
-    end
-  end
-  cache_attachment(target, newly_attached)
+  attach_clients(target, clients)
   return target
 end
 
@@ -864,26 +860,19 @@ function M._chase_definition(loc, cb)
   local pos = M.name_position(target, loc)
 
   local span = profile.start()
-  local answered = false
   -- A miss says WHY. Two rounds of field logs read "chase-miss 220ms" and
   -- discriminated nothing: a server error, an empty answer, the
   -- declaration handed back as its own definition (an index that has never
   -- seen the defining file), and a timeout all collapsed into one word,
   -- and every hypothesis about which it was cost a full round trip to the
   -- machine that has the problem.
-  local function finish(dloc, why)
-    if answered then
-      return
-    end
-    answered = true
-    local d = (loc.name or "?") .. " @ " .. vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")
-    span(dloc and "locate:definition-chase" or "locate:chase-miss",
-      dloc and d or (d .. " (" .. (why or "?") .. ")"))
+  local finish = once_with_timeout(function(dloc, why)
+    local d = describe(loc.name, loc.uri)
+    span(dloc and "locate:definition-chase" or "locate:chase-miss", dloc and d or (d .. " (" .. (why or "?") .. ")"))
     cb(dloc)
-  end
-  vim.defer_fn(function()
-    finish(nil, "timeout")
-  end, M._timeout_ms)
+  end, function()
+    return nil, "timeout"
+  end)
   M.client_request(clients[1], "textDocument/definition", {
     textDocument = { uri = loc.uri },
     position = pos,
@@ -925,11 +914,7 @@ end
 -- rules; a definition file we cannot tick is simply not cached, same as in
 -- locate.
 function M._locate_cache_replace(name, source_bufnr, dloc)
-  local bufnr = (source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr)) and source_bufnr or 0
-  local key = client_key(bufnr) .. "\1" .. name
-  local b = vim.fn.bufnr(vim.uri_to_fname(dloc.uri))
-  local tick = b ~= -1 and tick_of(b) or nil
-  cache_put(M._locate_cache, key, dloc, tick, M._locate_cache_n)
+  cache_put(M._locate_cache, locate_key(source_buf(source_bufnr), name), dloc, (def_tick(dloc.uri)), M._locate_cache_n)
 end
 
 -- Composed lookup: name -> definition body. locate then extract, one

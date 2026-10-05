@@ -1,15 +1,17 @@
 -- Low-level tree-sitter/text helpers for C source: parsing, byte-range
 -- accessors, declarator/type reconstruction, and edit application.
+local util = require("inline-explorer.util")
+
 local M = {}
 
 -- Parsed trees, keyed on the exact source text.
 --
--- One smart-inline over a function parses the SAME caller source three times
--- -- substitute.call_name_at, substitute.inline_in_buffer and
--- canalyze.analyze_call each start from scratch -- and parsing is
--- proportional to the whole file while the user's action concerns one call.
--- Measured on a 25,007-line file: about 61ms per parse, ~236ms for the three
--- together.
+-- One smart-inline over a function asks for the SAME caller source's tree
+-- twice -- substitute.call_name_at, then substitute.inline_in_buffer (three
+-- times before inline_in_buffer handed its call node to the analysis
+-- instead of an occurrence number) -- and parsing is proportional to the
+-- whole file while the user's action concerns one call. Measured on a
+-- 25,007-line file: about 61ms per parse, ~236ms for the three together.
 --
 -- Keying on the text itself makes invalidation exact rather than a policy:
 -- edit the buffer and the string differs, so the entry cannot be reused.
@@ -32,20 +34,7 @@ function M.parse(src)
   local tree = parser:parse()[1]
   local root = tree:root()
   M._parse_cache[src] = { parser = parser, tree = tree, root = root, at = vim.uv.hrtime() }
-
-  local n, entries = 0, {}
-  for k, v in pairs(M._parse_cache) do
-    n = n + 1
-    entries[n] = { k = k, at = v.at }
-  end
-  if n > M._parse_cache_n then
-    table.sort(entries, function(a, b)
-      return a.at < b.at
-    end)
-    for i = 1, n - M._parse_cache_n do
-      M._parse_cache[entries[i].k] = nil
-    end
-  end
+  util.evict_lru(M._parse_cache, M._parse_cache_n)
   return root
 end
 
@@ -58,6 +47,23 @@ function M.eb(node)
 end
 function M.scol(node)
   return (select(2, node:range(true)))
+end
+-- Byte offset of the start of the line `node` starts on.
+function M.bol(node)
+  return M.sb(node) - M.scol(node)
+end
+-- The leading space/tab run of the line `node` starts on.
+function M.line_indent(src, node)
+  return src:match("^[ \t]*", M.bol(node) + 1)
+end
+
+-- The innermost node of type `ty` enclosing (row, col), or nil.
+function M.ancestor_at(root, row, col, ty)
+  local node = root:named_descendant_for_range(row, col, row, col)
+  while node and node:type() ~= ty do
+    node = node:parent()
+  end
+  return node
 end
 
 function M.text(node, src)
@@ -99,7 +105,7 @@ function M.func_declarator(decl)
     if n:type() == "pointer_declarator" then
       n = n:field("declarator")[1]
     elseif n:type() == "parenthesized_declarator" then
-      n = n:field("declarator")[1] or n:named_child(0)
+      n = n:named_child(0) -- no `declarator` field (see decl_name)
     else
       return nil
     end
@@ -114,10 +120,21 @@ end
 -- has already started that falls outside this set is not part of the type
 -- either (e.g. zlib's `ZEXPORT` calling-convention decorator).
 local TYPE_STARTERS = {
-  void = true, char = true, short = true, int = true, long = true,
-  float = true, double = true, signed = true, unsigned = true,
-  ["_Bool"] = true, struct = true, union = true, enum = true,
-  const = true, volatile = true,
+  void = true,
+  char = true,
+  short = true,
+  int = true,
+  long = true,
+  float = true,
+  double = true,
+  signed = true,
+  unsigned = true,
+  ["_Bool"] = true,
+  struct = true,
+  union = true,
+  enum = true,
+  const = true,
+  volatile = true,
 }
 
 -- Project macros known to stand in for a storage-class specifier in front of
@@ -284,8 +301,7 @@ function M.return_type(fdef, src)
     local sib = ty:next_sibling()
     if sib and sib:type() == "ERROR" then
       local sib_text = M.text(sib, src)
-      if has_type_starter(sib_text)
-        or (KNOWN_LEADING_MACROS[base] and not looks_like_bare_decorator(sib_text)) then
+      if has_type_starter(sib_text) or (KNOWN_LEADING_MACROS[base] and not looks_like_bare_decorator(sib_text)) then
         base = base_type_from_run(sib_text)
       end
     end
@@ -309,12 +325,19 @@ function M.return_type(fdef, src)
   return base
 end
 
+-- A function_definition's name and its function_declarator; nil when the
+-- declarator is not a plain (possibly pointer-returning) function.
+function M.function_name(fdef, src)
+  local fd = M.func_declarator(fdef:field("declarator")[1])
+  return fd and M.decl_name(fd:field("declarator")[1], src), fd
+end
+
 function M.find_function_def(root, src, name)
   for i = 0, root:named_child_count() - 1 do
     local c = root:named_child(i)
     if c:type() == "function_definition" then
-      local fd = M.func_declarator(c:field("declarator")[1])
-      if fd and M.decl_name(fd:field("declarator")[1], src) == name then
+      local fname, fd = M.function_name(c, src)
+      if fname == name then
         return c, fd
       end
     end

@@ -17,7 +17,17 @@ local C = require("inline-explorer.csrc")
 local parse = C.parse
 local sb = C.sb
 local eb = C.eb
-local scol = C.scol
+
+-- `lines` without leading and trailing whitespace-only lines (in place).
+local function trim_blank_lines(lines)
+  while lines[1] and lines[1]:match("^%s*$") do
+    table.remove(lines, 1)
+  end
+  while lines[#lines] and lines[#lines]:match("^%s*$") do
+    table.remove(lines)
+  end
+  return lines
+end
 
 -- Flatten LSP Hover.contents (MarkupContent | MarkedString | MarkedString[]).
 local function markup(contents)
@@ -58,26 +68,15 @@ local function expansion_lines(md)
   if not (seen and #after > 0) then
     return nil
   end
-  local out = after
-  while out[1] and out[1]:match("^%s*$") do
-    table.remove(out, 1)
-  end
-  while out[#out] and out[#out]:match("^%s*$") do
-    table.remove(out)
-  end
-  return out
+  return trim_blank_lines(after)
 end
 
-M._markup = markup
 M._expansion_lines = expansion_lines
 
 -- The macro use under (row, col): the whole call_expression for a function-like
 -- macro, else the identifier. Also whether it sits in statement position.
 local function find_invocation(root, row, col)
-  local node = root:named_descendant_for_range(row, col, row, col)
-  while node and node:type() ~= "identifier" do
-    node = node:parent()
-  end
+  local node = C.ancestor_at(root, row, col, "identifier")
   if not node then
     return nil
   end
@@ -102,8 +101,7 @@ function M.replace_in_src(src, row, col, exp_lines)
   if #parts > 1 then
     -- Indent continuation lines to the leading whitespace of the use's line
     -- (NOT everything before the macro, which would repeat `foo = ` on each line).
-    local bol = sb(inv) - scol(inv)
-    local indent = src:sub(bol + 1):match("^[ \t]*")
+    local indent = C.line_indent(src, inv)
     for i = 2, #parts do
       parts[i] = indent .. parts[i]
     end
@@ -117,7 +115,7 @@ function M.replace_in_src(src, row, col, exp_lines)
   -- made a `({...})` arrive "not grouped", earned it a second wrap, and put
   -- `( ({ ... }))` in front of the reader: the exact nest simplify exists
   -- to remove, reintroduced AFTER simplify had already run.
-  exp = exp:gsub("^%s+", ""):gsub("%s+$", "")
+  exp = vim.trim(exp)
   -- Parenthesise in expression context to preserve precedence, unless the
   -- expansion is already a single balanced (...) or ({...}) group.
   local already_grouped = exp:match("^%b()$") ~= nil
@@ -172,13 +170,7 @@ function M._edit_lines(workspace_edit, uri)
   if type(edits) ~= "table" or #edits == 0 or type(edits[1].newText) ~= "string" then
     return nil
   end
-  local out = vim.split(edits[1].newText, "\n", { plain = true })
-  while out[1] and out[1]:match("^%s*$") do
-    table.remove(out, 1)
-  end
-  while out[#out] and out[#out]:match("^%s*$") do
-    table.remove(out)
-  end
+  local out = trim_blank_lines(vim.split(edits[1].newText, "\n", { plain = true }))
   if #out == 0 then
     return nil
   end
@@ -351,7 +343,6 @@ function M._prune_dead_clients()
   for id in pairs(pending) do
     if not vim.lsp.get_client_by_id(id) then
       pending[id] = nil
-      our_handler[id] = nil
     end
   end
   for id in pairs(our_handler) do
@@ -359,6 +350,14 @@ function M._prune_dead_clients()
       our_handler[id] = nil
     end
   end
+end
+
+-- Whether `client` advertises clangd's applyTweak command (ExpandMacro).
+-- Shared with :checkhealth, which reports the same predicate.
+function M.supports_tweak(client)
+  local provider = (client.server_capabilities or {}).executeCommandProvider
+  local cmds = (type(provider) == "table" and type(provider.commands) == "table") and provider.commands or {}
+  return vim.tbl_contains(cmds, "clangd.applyTweak")
 end
 
 -- Fetch the expansion via the ExpandMacro tweak. Calls cb(lines|nil) exactly
@@ -371,9 +370,7 @@ local function fetch_via_tweak(st, row, col, cb)
   if not client then
     return cb(nil)
   end
-  local provider = (client.server_capabilities or {}).executeCommandProvider
-  local cmds = (type(provider) == "table" and type(provider.commands) == "table") and provider.commands or {}
-  if not vim.tbl_contains(cmds, "clangd.applyTweak") then
+  if not M.supports_tweak(client) then
     return cb(nil)
   end
 
@@ -426,9 +423,13 @@ local function fetch_via_tweak(st, row, col, cb)
     -- installed; this only tells it which edit is ours. The claim is APPENDED:
     -- a concurrent fetch on the same client keeps its own claim, so both are
     -- answered and both leave a tombstone behind.
-    claim = { uri = uri, pos = pos, on_edit = function(edit)
-      finish(M._edit_lines(edit, uri))
-    end }
+    claim = {
+      uri = uri,
+      pos = pos,
+      on_edit = function(edit)
+        finish(M._edit_lines(edit, uri))
+      end,
+    }
     local claims = pending[client.id]
     if not claims then
       claims = {}

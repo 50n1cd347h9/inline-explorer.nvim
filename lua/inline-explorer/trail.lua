@@ -10,6 +10,7 @@
 -- Named trail because nav.lua already exists (block navigation inside one
 -- view); this module never touches it.
 local view = require("inline-explorer.view")
+local util = require("inline-explorer.util")
 
 local M = {}
 
@@ -93,7 +94,8 @@ local function push_current()
         break
       end
     end
-    if not still_referenced and e.buf ~= vim.api.nvim_get_current_buf() then
+    -- wipe() spares any buffer on screen, the current one included.
+    if not still_referenced then
       wipe(e.buf)
     end
   end
@@ -114,7 +116,7 @@ end
 function M.goto_location(loc)
   local path = vim.uri_to_fname(loc.uri)
   if vim.fn.filereadable(path) == 0 then
-    vim.notify("[inline-explorer] cannot read " .. path, vim.log.levels.WARN)
+    util.notify("cannot read " .. path, vim.log.levels.WARN)
     return false
   end
 
@@ -138,7 +140,7 @@ end
 local function step(delta, edge_msg)
   local target = M._pos + delta
   if target < 1 or target > #M._stack then
-    vim.notify("[inline-explorer] " .. edge_msg, vim.log.levels.INFO)
+    util.notify(edge_msg, vim.log.levels.INFO)
     return false
   end
   -- Where we are now must be re-enterable from the other direction, so the
@@ -150,7 +152,7 @@ local function step(delta, edge_msg)
     M._stack[M._pos].cursor = vim.api.nvim_win_get_cursor(0)
   end
   if not show(M._stack[target]) then
-    vim.notify("[inline-explorer] that view is gone", vim.log.levels.WARN)
+    util.notify("that view is gone", vim.log.levels.WARN)
     return false
   end
   M._pos = target
@@ -161,11 +163,11 @@ function M.back()
   -- The shown view may sit ABOVE _pos (it was never pushed -- pushing
   -- happens on leaving). Entering back-navigation pushes it so forward can
   -- return to it.
+  -- It is the same push as leaving's, depth cap included; a hand copy here
+  -- once skipped the cap and grew a full stack past it.
   local cur = vim.api.nvim_get_current_buf()
-  if view.state[cur] and (M._stack[M._pos] == nil or M._stack[M._pos].buf ~= cur) then
-    vim.bo[cur].bufhidden = "hide"
-    M._stack[#M._stack + 1] = { buf = cur, cursor = vim.api.nvim_win_get_cursor(0) }
-    M._pos = #M._stack
+  if M._stack[M._pos] == nil or M._stack[M._pos].buf ~= cur then
+    push_current()
   end
   return step(-1, "already at the start of the trail")
 end

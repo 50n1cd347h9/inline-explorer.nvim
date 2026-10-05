@@ -118,7 +118,17 @@ function M.case(r)
       end
       if #tgt > 0 then
         local v = r.pick(tgt)
-        case.stmts[#case.stmts + 1] = "if (" .. iexpr(r, operands, 1) .. ") { " .. v .. " = " .. iexpr(r, operands, 1) .. "; } else { " .. v .. " = " .. iexpr(r, operands, 1) .. "; }"
+        case.stmts[#case.stmts + 1] = "if ("
+          .. iexpr(r, operands, 1)
+          .. ") { "
+          .. v
+          .. " = "
+          .. iexpr(r, operands, 1)
+          .. "; } else { "
+          .. v
+          .. " = "
+          .. iexpr(r, operands, 1)
+          .. "; }"
       end
     elseif kind == 4 then
       local tgt = {}
@@ -129,7 +139,21 @@ function M.case(r)
       end
       if #tgt > 0 then
         -- bounded loop: the (& 7) mask guarantees termination
-        case.stmts[#case.stmts + 1] = "{ int i" .. k .. " = (" .. iexpr(r, operands, 1) .. ") & 7; while (i" .. k .. " > 0) { i" .. k .. " = i" .. k .. " - 1; " .. r.pick(tgt) .. " = " .. r.pick(tgt) .. " + 1; } }"
+        case.stmts[#case.stmts + 1] = "{ int i"
+          .. k
+          .. " = ("
+          .. iexpr(r, operands, 1)
+          .. ") & 7; while (i"
+          .. k
+          .. " > 0) { i"
+          .. k
+          .. " = i"
+          .. k
+          .. " - 1; "
+          .. r.pick(tgt)
+          .. " = "
+          .. r.pick(tgt)
+          .. " + 1; } }"
       end
     elseif kind == 5 then
       case.stmts[#case.stmts + 1] = "if (" .. iexpr(r, operands, 1) .. ") return " .. iexpr(r, operands, 1) .. ";"
@@ -142,7 +166,17 @@ function M.case(r)
       end
       if #tgt > 0 then
         -- self-contained label block: forward goto, function-scoped label
-        case.stmts[#case.stmts + 1] = "{ if (" .. iexpr(r, operands, 1) .. ") goto lab" .. k .. "; " .. r.pick(tgt) .. " = " .. r.pick(tgt) .. " + 1; lab" .. k .. ": ; }"
+        case.stmts[#case.stmts + 1] = "{ if ("
+          .. iexpr(r, operands, 1)
+          .. ") goto lab"
+          .. k
+          .. "; "
+          .. r.pick(tgt)
+          .. " = "
+          .. r.pick(tgt)
+          .. " + 1; lab"
+          .. k
+          .. ": ; }"
       end
     end
   end
@@ -213,7 +247,7 @@ function M.render(case)
   end
 
   local main = {
-    '#include <stdio.h>',
+    "#include <stdio.h>",
     "int main(void)",
     "{",
     "    int inputs[5] = { -3, 0, 1, 2, 7 };",

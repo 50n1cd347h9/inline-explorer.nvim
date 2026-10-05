@@ -10,6 +10,7 @@
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(here, ":h:h")
 vim.opt.rtp:append(root)
+local H = require("tests.lib.harness")
 local S = require("inline-explorer.substitute")
 
 if vim.fn.executable("gcc") == 0 then
@@ -17,38 +18,21 @@ if vim.fn.executable("gcc") == 0 then
   return
 end
 
-local tmp = vim.fn.tempname()
-vim.fn.mkdir(tmp, "p")
-local fails = 0
+local cc = require("tests.lib.cc")
+local tmp = H.tmpdir()
 
-local function writef(path, s)
-  local f = assert(io.open(path, "w"))
-  f:write(s)
-  f:close()
-end
-
+-- gcc -fsyntax-only accepts it. Returns (ok, gcc_output).
 local function compiles(src, name)
-  local p = tmp .. "/" .. name .. ".c"
-  writef(p, src)
-  local out = vim.fn.system({
-    "gcc", "-std=gnu11", "-fsyntax-only", "-Werror=implicit-function-declaration",
-    "-Wno-unused-label", "-Wno-unused-function", "-Wno-unused-variable", p,
-  })
-  return vim.v.shell_error == 0, out
+  return cc.syntax_ok(tmp .. "/" .. name .. ".c", src)
 end
 
+-- It builds and exits 0. Returns (ok, gcc_output_or_empty).
 local function run_ok(src, name)
-  local c, exe = tmp .. "/" .. name .. ".c", tmp .. "/" .. name .. ".out"
-  writef(c, src)
-  local out = vim.fn.system({
-    "gcc", "-std=gnu11", "-Werror=implicit-function-declaration",
-    "-Wno-unused-label", "-Wno-unused-function", c, "-o", exe,
-  })
-  if vim.v.shell_error ~= 0 then
-    return false, out
+  local out, code = cc.build_run(src, tmp .. "/" .. name .. ".c", tmp .. "/" .. name .. ".out")
+  if out == nil then
+    return false, code
   end
-  vim.fn.system({ exe })
-  return vim.v.shell_error == 0, ""
+  return code == 0, ""
 end
 
 local function transform(caller, callee, fname, seq)
@@ -61,14 +45,7 @@ local function transform(caller, callee, fname, seq)
   return src
 end
 
-local function check(label, ok, detail)
-  if ok then
-    print("PASS  " .. label)
-  else
-    fails = fails + 1
-    print("FAIL  " .. label .. (detail ~= nil and ("\n----\n" .. tostring(detail) .. "\n----") or ""))
-  end
-end
+local check = H.check
 
 -- Case 1: simple accessor, value context, pointer param (pretty hoist)
 do
@@ -286,7 +263,11 @@ do
 }]]
   local t = transform(caller, callee, "sign", { { N = 1, mode = "readable" } })
   local main = "int main(void){ return (caller(5)==10 && caller(-5)==-10)?0:1; }\n"
-  check("case11 readable multi-return has no ({...})/goto", not t:find("({", 1, true) and not t:find("goto", 1, true), t)
+  check(
+    "case11 readable multi-return has no ({...})/goto",
+    not t:find("({", 1, true) and not t:find("goto", 1, true),
+    t
+  )
   check("case11 rewrote returns to assignments", t:find("__ie_ret1 =") ~= nil, t)
   check("case11 compiles (readable, multi-return)", (compiles(callee .. "\n" .. t .. main, "c11")))
   check("case11 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c11")))
@@ -517,7 +498,7 @@ do
     return pick(ap, bp, c)[0];
 }]]
   local t = transform(caller, callee, "pick", { { N = 1 } })
-  local main = "int main(void){ return (strcmp(caller(1),\"x\")==0 && strcmp(caller(0),\"y\")==0)?0:1; }\n"
+  local main = 'int main(void){ return (strcmp(caller(1),"x")==0 && strcmp(caller(0),"y")==0)?0:1; }\n'
   local src18 = "#include <string.h>\n" .. callee .. "\n" .. t .. "\n" .. main
   check("case18 result slot keeps pointer depth", t:find("char %*%* ?__ie_ret1;") ~= nil, t)
   check("case18 compiles (char ** return)", (compiles(src18, "c18")), t)
@@ -595,7 +576,11 @@ do
 }]]
   local t = transform(caller, callee, "wrapped", { { N = 1 } })
   local main = "int main(void){ return (caller(3)==6)?0:1; }\n"
-  check("case21 no doubled precedence parens", not t:find("((t + 1))", 1, true) and t:find("(t + 1)", 1, true) ~= nil, t)
+  check(
+    "case21 no doubled precedence parens",
+    not t:find("((t + 1))", 1, true) and t:find("(t + 1)", 1, true) ~= nil,
+    t
+  )
   check("case21 compiles", (compiles(callee .. "\n" .. t .. main, "c21")))
   check("case21 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c21")))
 end
@@ -619,8 +604,11 @@ do
     return r;
 }]]
   local t = transform(caller, callee, "deref", { { N = 1 } })
-  check("case22 colliding param renamed despite an ERROR ancestor",
-    t:find("s__ie1", 1, true) ~= nil and not t:find("int %*s = %(s%);"), t)
+  check(
+    "case22 colliding param renamed despite an ERROR ancestor",
+    t:find("s__ie1", 1, true) ~= nil and not t:find("int %*s = %(s%);"),
+    t
+  )
 
   -- And the same shape without the conditional must be unchanged in kind.
   local plain_caller = [[static int caller(int *s)
@@ -665,8 +653,11 @@ static int caller(int x)
 }
 ]]
   local t = transform(caller, callee, "apply_add", { { N = 1 } })
-  check("case23 renames the call position too, not just the declaration",
-    t:find("add__ie1(x__ie1)", 1, true) ~= nil and not t:find("add(x__ie1)", 1, true), t)
+  check(
+    "case23 renames the call position too, not just the declaration",
+    t:find("add__ie1(x__ie1)", 1, true) ~= nil and not t:find("add(x__ie1)", 1, true),
+    t
+  )
 
   -- Control: the same callee/caller shape without the #ifdef produces
   -- balanced output regardless of scope -- compile it AND run it, so a wrong
@@ -707,8 +698,7 @@ do
 }]]
   local t = transform(caller, callee, "step", { { N = 1 } })
   local main = "int main(void){ return (caller(1)==(2+4+6)*10+3)?0:1; }\n"
-  check("case24 does not duplicate the preceding statement",
-    select(2, t:gsub("hits%+%+;", "")) == 1, t)
+  check("case24 does not duplicate the preceding statement", select(2, t:gsub("hits%+%+;", "")) == 1, t)
   check("case24 compiles", (compiles(callee .. "\n" .. t .. main, "c24")), t)
   check("case24 runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c24")))
 
@@ -751,16 +741,17 @@ do
 }]]
   local main = "int main(void){ return (caller(1)==6050 && caller(-1)==50)?0:1; }\n"
   local t = transform(shadow, callee, "step", { { N = 1 } })
-  check("case25 does not brace-wrap the shadowing declaration",
-    t:find("({", 1, true) ~= nil, t)
+  check("case25 does not brace-wrap the shadowing declaration", t:find("({", 1, true) ~= nil, t)
   check("case25 compiles", (compiles(callee .. "\n" .. t .. main, "c25a")), t)
-  check("case25 runs equal to original (inner v still shadows)",
-    (run_ok(callee .. "\n" .. t .. main, "c25a")), t)
+  check("case25 runs equal to original (inner v still shadows)", (run_ok(callee .. "\n" .. t .. main, "c25a")), t)
 
   local tr = transform(shadow, callee, "step", { { N = 1, mode = "readable" } })
   check("case25 readable compiles", (compiles(callee .. "\n" .. tr .. main, "c25b")), tr)
-  check("case25 readable runs equal (scope beats the no-({...}) promise)",
-    (run_ok(callee .. "\n" .. tr .. main, "c25b")), tr)
+  check(
+    "case25 readable runs equal (scope beats the no-({...}) promise)",
+    (run_ok(callee .. "\n" .. tr .. main, "c25b")),
+    tr
+  )
 
   -- Same shape inside a braced loop body: the declaration shadows an outer
   -- name that the NEXT statement in the same block reads.
@@ -798,11 +789,17 @@ do
 }]]
   local t = transform(caller, callee, "step", { { N = 1 } })
   local main = "int main(void){ return (caller(0)==4 && caller(2)==8)?0:1; }\n"
-  check("case26 setup lands after the mutation, not above the line",
-    (t:find("n%+%+;") or 0) < (t:find("int t =", 1, false) or 0), t)
+  check(
+    "case26 setup lands after the mutation, not above the line",
+    (t:find("n%+%+;") or 0) < (t:find("int t =", 1, false) or 0),
+    t
+  )
   check("case26 compiles", (compiles(callee .. "\n" .. t .. main, "c26")), t)
-  check("case26 runs equal to original (argument read after the mutation)",
-    (run_ok(callee .. "\n" .. t .. main, "c26")), t)
+  check(
+    "case26 runs equal to original (argument read after the mutation)",
+    (run_ok(callee .. "\n" .. t .. main, "c26")),
+    t
+  )
 end
 
 -- Case 27: a declaration STARTS its own line (so the narrow `wrap_unsafe`
@@ -831,8 +828,11 @@ L:
   local t = transform(caller_goto, callee, "step", { { N = 1 } })
   local main = "int main(void){ return (caller(0)==-2)?0:1; }\n"
   check("case27 compiles (declaration after a goto label)", (compiles(callee .. "\n" .. t .. main, "c27a")), t)
-  check("case27 runs equal to original (goto-label local still shadows)",
-    (run_ok(callee .. "\n" .. t .. main, "c27a")), t)
+  check(
+    "case27 runs equal to original (goto-label local still shadows)",
+    (run_ok(callee .. "\n" .. t .. main, "c27a")),
+    t
+  )
 
   local caller_case = [[static int g = 500;
 static int caller(int a)
@@ -848,8 +848,11 @@ static int caller(int a)
   local t2 = transform(caller_case, callee, "step", { { N = 1 } })
   local main2 = "int main(void){ return (caller(0)==-2 && caller(9)==-1)?0:1; }\n"
   check("case27 compiles (declaration after a case label)", (compiles(callee .. "\n" .. t2 .. main2, "c27b")), t2)
-  check("case27 runs equal to original (case-label local still shadows)",
-    (run_ok(callee .. "\n" .. t2 .. main2, "c27b")), t2)
+  check(
+    "case27 runs equal to original (case-label local still shadows)",
+    (run_ok(callee .. "\n" .. t2 .. main2, "c27b")),
+    t2
+  )
 end
 
 -- Case 28: a project-defined macro in type position (zlib's `#define local
@@ -869,8 +872,11 @@ do
     return classify(n) + 5;
 }]]
   local t = transform(caller, callee, "classify", { { N = 1 } })
-  check("case28 result slot keeps the real type, not the macro",
-    t:find("int __ie_ret1;", 1, true) ~= nil and not t:find("local __ie_ret1;", 1, true), t)
+  check(
+    "case28 result slot keeps the real type, not the macro",
+    t:find("int __ie_ret1;", 1, true) ~= nil and not t:find("local __ie_ret1;", 1, true),
+    t
+  )
 
   local prelude = "#define local static\n"
   local main = "int main(void){ return (caller(-3)==4 && caller(0)==5 && caller(9)==6)?0:1; }\n"
@@ -887,14 +893,24 @@ do
   -- check can never pass here regardless of this fix. What this fix removes
   -- is the first diagnostic: assert the implicit-int/`__ie_ret1` complaint is
   -- gone from -pedantic-errors output, not that the whole file is pedantic-clean.
-  check("case28 -pedantic-errors no longer flags the result slot as implicit int",
+  check(
+    "case28 -pedantic-errors no longer flags the result slot as implicit int",
     (function()
       local p = tmp .. "/c28p.c"
-      writef(p, prelude .. callee .. "\n" .. t .. main)
-      local out = vim.fn.system({ "gcc", "-std=gnu11", "-fsyntax-only", "-pedantic-errors",
-        "-Wno-unused-label", "-Wno-unused-variable", p })
+      H.writef(p, prelude .. callee .. "\n" .. t .. main)
+      local out = vim.fn.system({
+        "gcc",
+        "-std=gnu11",
+        "-fsyntax-only",
+        "-pedantic-errors",
+        "-Wno-unused-label",
+        "-Wno-unused-variable",
+        p,
+      })
       return not out:find("__ie_ret1", 1, true)
-    end)(), t)
+    end)(),
+    t
+  )
 end
 
 -- Case 29 (regression: code review of commit 22befb5, finding 1): the removed
@@ -930,8 +946,11 @@ MyType bar(MyType x)
     return bar(n) + 5;
 }]]
   local t = transform(caller, callee_probe, "bar", { { N = 1 } })
-  check("case29 result slot keeps the callee's own type, not an unrelated sibling's",
-    t:find("MyType __ie_ret1;", 1, true) ~= nil and not t:find("int __ie_ret1;", 1, true), t)
+  check(
+    "case29 result slot keeps the callee's own type, not an unrelated sibling's",
+    t:find("MyType __ie_ret1;", 1, true) ~= nil and not t:find("int __ie_ret1;", 1, true),
+    t
+  )
 
   local callee_def = [[typedef long MyType;
 MyType bar(MyType x)
@@ -942,8 +961,11 @@ MyType bar(MyType x)
 }]]
   local main = "int main(void){ long v = caller(1234567890123L); return (v == 1234567890128L) ? 0 : 1; }\n"
   check("case29 compiles", (compiles(callee_def .. "\n" .. t .. main, "c29")), t)
-  check("case29 runs equal to original (long value not truncated to int)",
-    (run_ok(callee_def .. "\n" .. t .. main, "c29")), t)
+  check(
+    "case29 runs equal to original (long value not truncated to int)",
+    (run_ok(callee_def .. "\n" .. t .. main, "c29")),
+    t
+  )
 end
 
 -- Case 30 (regression: code review of commit 22befb5, finding 2): the
@@ -969,8 +991,11 @@ do
     return f(n) + 1;
 }]]
   local t = transform(caller, callee, "f", { { N = 1 } })
-  check("case30 result slot keeps the real typedef, not the decorator macro",
-    t:find("local __ie_ret1;", 1, true) ~= nil and not t:find("WINAPI __ie_ret1;", 1, true), t)
+  check(
+    "case30 result slot keeps the real typedef, not the decorator macro",
+    t:find("local __ie_ret1;", 1, true) ~= nil and not t:find("WINAPI __ie_ret1;", 1, true),
+    t
+  )
 
   local prelude = "typedef long local;\n#define WINAPI\n"
   local main = "int main(void){ return (caller(0)==1 && caller(5)==6) ? 0 : 1; }\n"
@@ -1005,14 +1030,46 @@ do
     return f(n);
 }]]
   local t = transform(caller, callee, "f", { { N = 1 } })
-  check("case31 result slot keeps the real ALL-CAPS typedef, not a decorator guess",
-    t:find("DWORD __ie_ret1;", 1, true) ~= nil and not t:find("local __ie_ret1;", 1, true), t)
+  check(
+    "case31 result slot keeps the real ALL-CAPS typedef, not a decorator guess",
+    t:find("DWORD __ie_ret1;", 1, true) ~= nil and not t:find("local __ie_ret1;", 1, true),
+    t
+  )
 
   local prelude = "typedef unsigned long DWORD;\n#define local static\n"
   local main = "int main(void){ return (caller(1) == 5000000000L) ? 0 : 1; }\n"
   check("case31 compiles", (compiles(prelude .. callee .. "\n" .. t .. main, "c31")), t)
-  check("case31 runs equal to original (DWORD-typed return value not truncated)",
-    (run_ok(prelude .. callee .. "\n" .. t .. main, "c31")))
+  check(
+    "case31 runs equal to original (DWORD-typed return value not truncated)",
+    (run_ok(prelude .. callee .. "\n" .. t .. main, "c31"))
+  )
+end
+
+-- Case 32: case4's collision rename for every declarator shape. The callee's
+-- own declaration query only matched plain identifiers and init_declarators,
+-- so an uninitialized `int *t;` or `int t[2];` (a pointer/array declarator
+-- sitting directly under the declaration) was never renamed and came out as
+-- a redeclaration of the caller's parameter `t` -- a compile error.
+do
+  local shapes = {
+    { "ptr", "int *t;", "int v = x * 2; t = &v; return *t + 1;" },
+    { "array", "int t[2];", "t[0] = x * 2; return t[0] + 1;" },
+    { "ptr-array", "int *t[1];", "int v = x * 2; t[0] = &v; return *t[0] + 1;" },
+  }
+  local caller = [[static int caller(int t)
+{
+    int r = g(t);
+    return r;
+}]]
+  local main = "int main(void){ return (caller(10)==21)?0:1; }\n"
+  for _, sh in ipairs(shapes) do
+    local callee = ("static int g(int x)\n{\n    %s\n    %s\n}"):format(sh[2], sh[3])
+    local t = transform(caller, callee, "g", { { N = 1 } })
+    local label = "case32 " .. sh[1]
+    check(label .. " renamed the colliding local", t:find("t__ie1", 1, true) ~= nil, t)
+    check(label .. " compiles", (compiles(callee .. "\n" .. t .. main, "c32" .. sh[1])), t)
+    check(label .. " runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c32" .. sh[1])))
+  end
 end
 
 -- The parse cache: a second parse of the same source must not re-parse, and
@@ -1044,18 +1101,19 @@ do
 
   C.parse(src_b)
   check("parse cache: a different source is parsed", parses == 2, parses)
-  check("parse cache: the first source is still usable after another",
-    C.parse(src_a) == r1 and parses == 2, parses)
+  check("parse cache: the first source is still usable after another", C.parse(src_a) == r1 and parses == 2, parses)
 
   -- Nodes from a cached root must still be usable: a root kept without its
   -- tree would hand back nodes whose tree had been collected.
   collectgarbage("collect")
   collectgarbage("collect")
-  local root = C.parse(src_a)
-  local calls = C.find_calls(root, src_a, "f")
-  check("parse cache: nodes from a cached root survive a collection",
+  local cached_root = C.parse(src_a)
+  local calls = C.find_calls(cached_root, src_a, "f")
+  check(
+    "parse cache: nodes from a cached root survive a collection",
     #calls == 1 and C.text(calls[1]:field("function")[1], src_a) == "f",
-    ("#calls=%d"):format(#calls))
+    ("#calls=%d"):format(#calls)
+  )
 
   -- Capacity is honoured rather than growing without bound.
   local saved = C._parse_cache_n
@@ -1065,7 +1123,9 @@ do
     C.parse(("int f%d(void) { return %d; }\n"):format(i, i))
   end
   local n = 0
-  for _ in pairs(C._parse_cache) do n = n + 1 end
+  for _ in pairs(C._parse_cache) do
+    n = n + 1
+  end
   check("parse cache: bounded by its capacity", n <= 2, ("entries=%d"):format(n))
   C._parse_cache_n = saved
   C._parse_cache = {}
@@ -1073,5 +1133,4 @@ do
   vim.treesitter.get_string_parser = real
 end
 
-print("")
-print(fails == 0 and "ALL SUBSTITUTE TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("SUBSTITUTE")

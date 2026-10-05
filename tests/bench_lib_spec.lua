@@ -2,18 +2,11 @@
 --   nvim --headless --clean -u NONE -c "luafile tests/bench_lib_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
+local H = require("tests.lib.harness")
 local bench = require("tests.lib.bench")
 local profile = require("inline-explorer.profile")
 
-local fails = 0
-local function check(l, ok, d)
-  if ok then
-    print("PASS  " .. l)
-  else
-    fails = fails + 1
-    print("FAIL  " .. l .. (d and ("\n----\n" .. tostring(d) .. "\n----") or ""))
-  end
-end
+local check = H.check
 
 -- stats: percentiles, not means. 1..10 has mean 5.5 but p50 5.
 do
@@ -83,30 +76,45 @@ do
     { name = "total:block-fallback", ms = 500, at = 7000 },
     { name = "total:expand", ms = 5, at = 7000 },
   }
-  check("elapsed_ms: sums the total: spans (both phases), 500 + 5",
-    bench.elapsed_ms(spans) == 505, bench.elapsed_ms(spans))
-  check("elapsed_ms: is not the last total: span's own (far smaller) ms",
+  check(
+    "elapsed_ms: sums the total: spans (both phases), 500 + 5",
+    bench.elapsed_ms(spans) == 505,
+    bench.elapsed_ms(spans)
+  )
+  check(
+    "elapsed_ms: is not the last total: span's own (far smaller) ms",
     bench.elapsed_ms(spans) ~= bench.total_ms(spans) and bench.total_ms(spans) == 5,
-    ("elapsed=%s total_ms=%s"):format(tostring(bench.elapsed_ms(spans)), tostring(bench.total_ms(spans))))
-  check("elapsed_ms: does not double-count spans nested inside a total:",
-    bench.elapsed_ms(spans) < 505 + 120, bench.elapsed_ms(spans))
+    ("elapsed=%s total_ms=%s"):format(tostring(bench.elapsed_ms(spans)), tostring(bench.total_ms(spans)))
+  )
+  check(
+    "elapsed_ms: does not double-count spans nested inside a total:",
+    bench.elapsed_ms(spans) < 505 + 120,
+    bench.elapsed_ms(spans)
+  )
   -- Identical `at` values throughout: a derivation that read the timestamps
   -- would return 0 (or the first span's own ms) here rather than 505.
-  check("elapsed_ms: does not read the `at` timestamps at all",
-    bench.elapsed_ms(spans) == 505 and spans[1].at == spans[#spans].at, bench.elapsed_ms(spans))
+  check(
+    "elapsed_ms: does not read the `at` timestamps at all",
+    bench.elapsed_ms(spans) == 505 and spans[1].at == spans[#spans].at,
+    bench.elapsed_ms(spans)
+  )
   -- A single-phase action: the one total: span IS the latency, so elapsed_ms
   -- and total_ms agree.
   local single = { { name = "locate:ok", ms = 9, at = 7000 }, { name = "total:expand", ms = 33, at = 7000 } }
-  check("elapsed_ms: single-phase action agrees with total_ms",
-    bench.elapsed_ms(single) == 33 and bench.total_ms(single) == 33, bench.elapsed_ms(single))
-  check("elapsed_ms: empty list is safe and returns nil",
-    bench.elapsed_ms({}) == nil, bench.elapsed_ms({}))
+  check(
+    "elapsed_ms: single-phase action agrees with total_ms",
+    bench.elapsed_ms(single) == 33 and bench.total_ms(single) == 33,
+    bench.elapsed_ms(single)
+  )
+  check("elapsed_ms: empty list is safe and returns nil", bench.elapsed_ms({}) == nil, bench.elapsed_ms({}))
   -- No total: span at all (an incomplete capture) must be nil, not 0 -- a
   -- rep that never finished must be skipped by bench.run, not recorded as
   -- an impossibly fast sample.
-  check("elapsed_ms: nil (not 0) when no total: span was recorded",
+  check(
+    "elapsed_ms: nil (not 0) when no total: span was recorded",
     bench.elapsed_ms({ { name = "locate:ok", ms = 9, at = 7000 } }) == nil,
-    tostring(bench.elapsed_ms({ { name = "locate:ok", ms = 9, at = 7000 } })))
+    tostring(bench.elapsed_ms({ { name = "locate:ok", ms = 9, at = 7000 } }))
+  )
 end
 
 -- capture: collects the spans a call produced, waiting for the total: span.
@@ -125,7 +133,11 @@ do
   check("capture: excludes earlier spans", bench.count(spans, "^stale") == 0, bench.names(spans))
   check("capture: count by pattern", bench.count(spans, "^extract:") == 1, bench.names(spans))
   check("capture: total_ms reads the total: span", type(bench.total_ms(spans)) == "number", vim.inspect(spans))
-  check("capture: names joins for diagnostics", bench.names(spans):find("total:expand", 1, true) ~= nil, bench.names(spans))
+  check(
+    "capture: names joins for diagnostics",
+    bench.names(spans):find("total:expand", 1, true) ~= nil,
+    bench.names(spans)
+  )
 
   -- complete: true for a normal action whose last span is a total: one, and
   -- assert_complete agrees with a nil reason.
@@ -213,7 +225,11 @@ do
     profile.start()("total:expand")
   end, 1000)
   check("capture: exactly this call's spans even with a full ring", #ring_spans == 3, bench.names(ring_spans))
-  check("capture: extract count survives a full ring", bench.count(ring_spans, "^extract:") == 1, bench.names(ring_spans))
+  check(
+    "capture: extract count survives a full ring",
+    bench.count(ring_spans, "^extract:") == 1,
+    bench.names(ring_spans)
+  )
   local has_filler = false
   for _, s in ipairs(ring_spans) do
     if s.name == "filler" then
@@ -236,7 +252,11 @@ do
     end, 40)
   end, 1000)
   check("capture: waits out a straggler span scheduled past total:", #q_spans == 4, bench.names(q_spans))
-  check("capture: the straggler span itself is present", bench.count(q_spans, "^extract:late") == 1, bench.names(q_spans))
+  check(
+    "capture: the straggler span itself is present",
+    bench.count(q_spans, "^extract:late") == 1,
+    bench.names(q_spans)
+  )
 
   -- Settle floor: the settle wait must never observe for less time than the
   -- flat 120ms wait it replaced, so a span deferred to ~90ms (comfortably
@@ -268,8 +288,11 @@ do
         profile.start()("total:expand")
       end, 600)
     end, 1000)
-    check("capture: default settle_cap_ms does NOT catch a phase deferred ~600ms out",
-      #default_spans == 1 and bench.count(default_spans, "^total:expand") == 0, bench.names(default_spans))
+    check(
+      "capture: default settle_cap_ms does NOT catch a phase deferred ~600ms out",
+      #default_spans == 1 and bench.count(default_spans, "^total:expand") == 0,
+      bench.names(default_spans)
+    )
 
     -- Drain the straggler total:expand that the previous capture's clear()
     -- did not wait for, so it cannot leak into the next capture below.
@@ -284,10 +307,16 @@ do
         profile.start()("total:expand")
       end, 600)
     end, 2000, { settle_cap_ms = 3000 })
-    check("capture: settle_cap_ms = 3000 catches a phase deferred ~600ms out",
-      #capped_spans == 2 and bench.count(capped_spans, "^total:expand") == 1, bench.names(capped_spans))
-    check("capture: with the larger cap, the action reports complete",
-      capped_spans[#capped_spans] and capped_spans[#capped_spans].name:find("^total:") ~= nil, bench.names(capped_spans))
+    check(
+      "capture: settle_cap_ms = 3000 catches a phase deferred ~600ms out",
+      #capped_spans == 2 and bench.count(capped_spans, "^total:expand") == 1,
+      bench.names(capped_spans)
+    )
+    check(
+      "capture: with the larger cap, the action reports complete",
+      capped_spans[#capped_spans] and capped_spans[#capped_spans].name:find("^total:") ~= nil,
+      bench.names(capped_spans)
+    )
   end
 
   -- until_span: the caller declares its own action's terminal span so the
@@ -298,16 +327,17 @@ do
     -- passes, until_span should match immediately -- wall time should land
     -- near the floor, nowhere close to the generous 3000ms cap given here.
     local start = vim.uv.now()
-    local spans, complete = bench.capture(function()
+    local until_spans, until_complete = bench.capture(function()
       profile.start()("total:expand")
     end, 1000, { settle_cap_ms = 3000, until_span = "^total:expand" })
     local elapsed = vim.uv.now() - start
-    check("until_span: a matching terminal span exits well under settle_cap_ms",
-      elapsed < 1000, elapsed)
-    check("until_span: still respects the 120ms floor even on early exit",
-      elapsed >= 120, elapsed)
-    check("until_span: the terminal span is still present in the result",
-      complete == true and bench.count(spans, "^total:expand") == 1, bench.names(spans))
+    check("until_span: a matching terminal span exits well under settle_cap_ms", elapsed < 1000, elapsed)
+    check("until_span: still respects the 120ms floor even on early exit", elapsed >= 120, elapsed)
+    check(
+      "until_span: the terminal span is still present in the result",
+      until_complete == true and bench.count(until_spans, "^total:expand") == 1,
+      bench.names(until_spans)
+    )
 
     -- A pattern that never matches must wait out the full settle_cap_ms --
     -- until_span is caller-declared, not a promise that capture can detect
@@ -317,10 +347,12 @@ do
       profile.start()("total:block-fallback")
     end, 1000, { settle_cap_ms = 500, until_span = "^total:expand" })
     local elapsed2 = vim.uv.now() - start2
-    check("until_span: a pattern that never matches waits out the full cap",
-      elapsed2 >= 500, elapsed2)
-    check("until_span: no total:expand span appears when it never matched",
-      bench.count(never_spans, "^total:expand") == 0, bench.names(never_spans))
+    check("until_span: a pattern that never matches waits out the full cap", elapsed2 >= 500, elapsed2)
+    check(
+      "until_span: no total:expand span appears when it never matched",
+      bench.count(never_spans, "^total:expand") == 0,
+      bench.names(never_spans)
+    )
   end
 
   profile.enabled = false
@@ -334,17 +366,24 @@ do
   local meta = fixture.generate(dir)
 
   check("fixture: main.c written", vim.fn.filereadable(meta.main) == 1, meta.main)
-  check("fixture: heavy chain written",
-    vim.fn.filereadable(dir .. "/heavy_0.h") == 1 and vim.fn.filereadable(dir .. "/heavy_" .. (fixture.HEAVY_DEPTH - 1) .. ".h") == 1)
-  check("fixture: enough distinct cold headers for a full run",
-    #meta.cold >= 18 and vim.fn.filereadable(dir .. "/c1.h") == 1, #meta.cold)
+  check(
+    "fixture: heavy chain written",
+    vim.fn.filereadable(dir .. "/heavy_0.h") == 1
+      and vim.fn.filereadable(dir .. "/heavy_" .. (fixture.HEAVY_DEPTH - 1) .. ".h") == 1
+  )
+  check(
+    "fixture: enough distinct cold headers for a full run",
+    #meta.cold >= 18 and vim.fn.filereadable(dir .. "/c1.h") == 1,
+    #meta.cold
+  )
   check("fixture: enough warm symbols in one header", #meta.warm >= 18, #meta.warm)
 
   local main = table.concat(vim.fn.readfile(meta.main), "\n")
-  check("fixture: one call site per cold symbol on its own line",
-    main:find("acc %+= " .. meta.cold[1] .. "%(") ~= nil and main:find("acc %+= " .. meta.cold[18] .. "%(") ~= nil)
-  check("fixture: one call site per warm symbol on its own line",
-    main:find("acc %+= " .. meta.warm[18] .. "%(") ~= nil)
+  check(
+    "fixture: one call site per cold symbol on its own line",
+    main:find("acc %+= " .. meta.cold[1] .. "%(") ~= nil and main:find("acc %+= " .. meta.cold[18] .. "%(") ~= nil
+  )
+  check("fixture: one call site per warm symbol on its own line", main:find("acc %+= " .. meta.warm[18] .. "%(") ~= nil)
   check("fixture: same-file definition present", main:find("static int " .. meta.same_file .. "%(") ~= nil)
   check("fixture: macro use present", main:find(meta.macro_call .. "%(") ~= nil)
   check("fixture: struct for the non-inlinable path", main:find("struct " .. meta.struct_name) ~= nil)
@@ -356,8 +395,10 @@ do
   -- Generation is deterministic: same input, same bytes.
   local dir2 = vim.fn.tempname()
   fixture.generate(dir2)
-  check("fixture: generation is deterministic",
-    table.concat(vim.fn.readfile(dir .. "/c1.h"), "\n") == table.concat(vim.fn.readfile(dir2 .. "/c1.h"), "\n"))
+  check(
+    "fixture: generation is deterministic",
+    table.concat(vim.fn.readfile(dir .. "/c1.h"), "\n") == table.concat(vim.fn.readfile(dir2 .. "/c1.h"), "\n")
+  )
 end
 
 -- The log's own timestamps must be monotonic within an action. They were not:
@@ -367,7 +408,6 @@ end
 -- it only appears in the file, not in the in-memory events -- so the check
 -- reads the file back.
 do
-  local profile = require("inline-explorer.profile")
   local was, wasfile = profile.enabled, profile.logfile
   local tmp = vim.fn.tempname()
   profile.enabled, profile.logfile = true, tmp
@@ -382,7 +422,8 @@ do
   for i = 1, 12 do
     local s = profile.start()
     local t = vim.uv.hrtime()
-    while (vim.uv.hrtime() - t) / 1e6 < 120 do end
+    while (vim.uv.hrtime() - t) / 1e6 < 120 do
+    end
     s("probe:" .. i)
   end
   local stamps, bad = {}, nil
@@ -398,12 +439,14 @@ do
       break
     end
   end
-  check("profile log timestamps never run backwards", #stamps >= 12 and bad == nil,
-    bad or ("stamps=%d"):format(#stamps))
+  check(
+    "profile log timestamps never run backwards",
+    #stamps >= 12 and bad == nil,
+    bad or ("stamps=%d"):format(#stamps)
+  )
   profile.enabled, profile.logfile = was, wasfile
   profile.clear()
   vim.fn.delete(tmp)
 end
 
-print("")
-print(fails == 0 and "ALL BENCH LIB TESTS PASSED" or (fails .. " FAILURE(S)"))
+H.finish("BENCH LIB")

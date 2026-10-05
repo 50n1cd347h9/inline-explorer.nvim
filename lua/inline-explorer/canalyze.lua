@@ -43,7 +43,7 @@ function M.enclosing_scope(call, src)
     (declaration declarator: (_) @d)
   ]]
   for _, d in ipairs(C.query_nodes(scope, src, q)) do
-    local nm = d:type() == "identifier" and C.text(d, src) or C.decl_name(d, src)
+    local nm = C.decl_name(d, src)
     if nm then
       set[nm] = true
     end
@@ -125,11 +125,12 @@ function M.analyze_callee(callee_src, fname, N, scope)
   end
   for _, s in ipairs(stmts) do
     if s:type() == "declaration" then
-      for _, d in ipairs(C.query_nodes(s, callee_src, "(init_declarator declarator: (_) @d)")) do
+      -- Every declarator shape, as enclosing_scope collects them: an
+      -- uninitialized `int *p;` or `int a[2];` sits directly under the
+      -- declaration as a pointer/array declarator, and missing it left the
+      -- name unrenamed -- a redeclaration when the caller had it in scope.
+      for _, d in ipairs(C.query_nodes(s, callee_src, "(declaration declarator: (_) @d)")) do
         maybe_rename(C.decl_name(d, callee_src))
-      end
-      for _, d in ipairs(C.query_nodes(s, callee_src, "(declaration declarator: (identifier) @d)")) do
-        maybe_rename(C.text(d, callee_src))
       end
     end
   end
@@ -217,7 +218,7 @@ function M.analyze_context(caller_src, call)
       n = n:parent()
     end
   end
-  local stmt_bol = C.sb(target) - C.scol(target)
+  local stmt_bol = C.bol(target)
   local prefix = caller_src:sub(stmt_bol + 1, C.sb(target))
   -- Indentation is the leading space/tab run (form feed and vertical tab are C
   -- whitespace too, but are not treated as indentation here). Anything else on
@@ -295,7 +296,11 @@ function M.analyze_call(caller_src, callee_src, fname, N, occ)
   if not call then
     return nil, nil, "call to '" .. fname .. "' not found"
   end
+  return M.analyze_call_node(caller_src, callee_src, fname, N, call)
+end
 
+-- analyze_call for a call node already located (the cursor's).
+function M.analyze_call_node(caller_src, callee_src, fname, N, call)
   local ir, err = M.analyze_callee(callee_src, fname, N, M.enclosing_scope(call, caller_src))
   if not ir then
     return nil, nil, err

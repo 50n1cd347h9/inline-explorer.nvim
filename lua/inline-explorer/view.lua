@@ -1,5 +1,7 @@
 -- View: a read-only copy of the source file where expansions are inserted as
 -- real (cursor-navigable) text, so they can be expanded again in turn.
+local util = require("inline-explorer.util")
+
 local M = {}
 
 M.ns = vim.api.nvim_create_namespace("inline_explorer")
@@ -17,7 +19,7 @@ function M.open(src)
     src = vim.api.nvim_get_current_buf()
   end
   if M.state[src] then
-    vim.notify("[inline-explorer] already in a reading view", vim.log.levels.INFO)
+    util.notify("already in a reading view", vim.log.levels.INFO)
     return
   end
 
@@ -87,20 +89,25 @@ function M.open(src)
   local trail = require("inline-explorer.trail")
   local pick = require("inline-explorer.pick")
   if km.callers then
-    vim.keymap.set("n", km.callers, function() pick.callers() end,
-      { buffer = view, desc = "Inline Explorer: callers of the function under the cursor" })
+    vim.keymap.set("n", km.callers, function()
+      pick.callers()
+    end, { buffer = view, desc = "Inline Explorer: callers of the function under the cursor" })
   end
   if km.goto_def then
-    vim.keymap.set("n", km.goto_def, function() pick.definition() end,
-      { buffer = view, desc = "Inline Explorer: jump the view to the definition" })
+    vim.keymap.set("n", km.goto_def, function()
+      pick.definition()
+    end, { buffer = view, desc = "Inline Explorer: jump the view to the definition" })
   end
   if km.trail_back then
-    vim.keymap.set("n", km.trail_back, trail.back,
-      { buffer = view, desc = "Inline Explorer: back along the trail" })
+    vim.keymap.set("n", km.trail_back, trail.back, { buffer = view, desc = "Inline Explorer: back along the trail" })
   end
   if km.trail_forward then
-    vim.keymap.set("n", km.trail_forward, trail.forward,
-      { buffer = view, desc = "Inline Explorer: forward along the trail" })
+    vim.keymap.set(
+      "n",
+      km.trail_forward,
+      trail.forward,
+      { buffer = view, desc = "Inline Explorer: forward along the trail" }
+    )
   end
   return view
 end
@@ -109,7 +116,7 @@ end
 function M.close()
   local view = vim.api.nvim_get_current_buf()
   if not M.state[view] then
-    vim.notify("[inline-explorer] not in a reading view", vim.log.levels.WARN)
+    util.notify("not in a reading view", vim.log.levels.WARN)
     return
   end
   -- Closing the view ends the journey: every stacked view goes with it.
@@ -125,11 +132,47 @@ end
 
 -- Source line (0-based) a view line originates from, or nil for inserted text.
 function M.src_line(st, row)
-  local o = st.origin and st.origin[row + 1]
-  if o == false or o == nil then
-    return nil
+  return st.origin[row + 1] or nil
+end
+
+-- Expansion blocks whose extmarks are both still alive, as { name, s, e }
+-- (0-based rows), in st.nodes order.
+function M.live_nodes(st, bufnr)
+  local out = {}
+  for _, node in ipairs(st.nodes) do
+    local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.s_mark, {})
+    local e = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.e_mark, {})
+    if s[1] and e[1] then
+      out[#out + 1] = { name = node.name, s = s[1], e = e[1] }
+    end
   end
-  return o
+  return out
+end
+
+-- The view is nomodifiable; every write goes through here.
+function M.set_lines(bufnr, s, e, lines)
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, s, e, false, lines)
+  vim.bo[bufnr].modifiable = false
+end
+
+-- Forget every expansion block: extmarks, manual folds, and the node list.
+function M.reset_marks(st, bufnr)
+  vim.api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
+  pcall(vim.cmd, "silent! normal! zE")
+  st.nodes = {}
+end
+
+-- Track rows s..e (0-based) as expansion block `name`, folded and open.
+-- The fold commands act on the current window, which shows `bufnr`.
+function M.add_node(st, bufnr, name, s, e)
+  st.nodes[#st.nodes + 1] = {
+    name = name,
+    s_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, s, 0, {}),
+    e_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, e, 0, {}),
+  }
+  pcall(vim.cmd, string.format("%d,%dfold", s + 1, e + 1))
+  pcall(vim.cmd, string.format("%d,%dfoldopen", s + 1, e + 1))
 end
 
 -- Diff old vs new text into map[old_row_0] = new_row_0 for lines that
@@ -208,25 +251,18 @@ function M.rewrite(st, bufnr, new_src, row)
   local rowmap = M._remap_rows(old_src, new_src)
 
   local surviving = {}
-  for _, node in ipairs(st.nodes) do
-    local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.s_mark, {})
-    local e = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.e_mark, {})
-    if s[1] and e[1] and rowmap[s[1]] and rowmap[e[1]] then
-      surviving[#surviving + 1] = { name = node.name, s = rowmap[s[1]], e = rowmap[e[1]] }
+  for _, node in ipairs(M.live_nodes(st, bufnr)) do
+    if rowmap[node.s] and rowmap[node.e] then
+      surviving[#surviving + 1] = { name = node.name, s = rowmap[node.s], e = rowmap[node.e] }
     end
   end
-  vim.api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
 
   local new_origin = {}
-  if st.origin then
-    for old_row, new_row in pairs(rowmap) do
-      new_origin[new_row + 1] = st.origin[old_row + 1]
-    end
+  for old_row, new_row in pairs(rowmap) do
+    new_origin[new_row + 1] = st.origin[old_row + 1]
   end
 
-  vim.bo[bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(new_src, "\n", { plain = true }))
-  vim.bo[bufnr].modifiable = false
+  M.set_lines(bufnr, 0, -1, vim.split(new_src, "\n", { plain = true }))
   local n = vim.api.nvim_buf_line_count(bufnr)
   for i = 1, n do
     if new_origin[i] == nil then
@@ -235,16 +271,9 @@ function M.rewrite(st, bufnr, new_src, row)
   end
   st.origin = new_origin
 
-  pcall(vim.cmd, "silent! normal! zE")
-  st.nodes = {}
+  M.reset_marks(st, bufnr)
   for _, node in ipairs(surviving) do
-    st.nodes[#st.nodes + 1] = {
-      name = node.name,
-      s_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, node.s, 0, {}),
-      e_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, node.e, 0, {}),
-    }
-    pcall(vim.cmd, string.format("%d,%dfold", node.s + 1, node.e + 1))
-    pcall(vim.cmd, string.format("%d,%dfoldopen", node.s + 1, node.e + 1))
+    M.add_node(st, bufnr, node.name, node.s, node.e)
   end
 
   pcall(vim.api.nvim_win_set_cursor, 0, { math.min((row or 0) + 1, n), 0 })

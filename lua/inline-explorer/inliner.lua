@@ -8,6 +8,7 @@ local macro = require("inline-explorer.macro")
 local expander = require("inline-explorer.expander")
 local view = require("inline-explorer.view")
 local config = require("inline-explorer.config")
+local util = require("inline-explorer.util")
 
 local M = {}
 
@@ -19,7 +20,7 @@ end
 function M.smart()
   local st = view.current()
   if not st then
-    vim.notify("[inline-explorer] open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
+    util.notify("open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
     return
   end
   if vim.bo.filetype ~= "c" or not has_c_parser() then
@@ -37,11 +38,11 @@ function M.smart()
     ident = vim.fn.expand("<cword>")
   end
   if not ident or ident == "" then
-    return vim.notify("[inline-explorer] nothing under the cursor", vim.log.levels.WARN)
+    return util.notify("nothing under the cursor", vim.log.levels.WARN)
   end
 
   if not view.begin_fetch(st) then
-    return vim.notify("[inline-explorer] a lookup is already in flight", vim.log.levels.INFO)
+    return util.notify("a lookup is already in flight", vim.log.levels.INFO)
   end
 
   local profile = require("inline-explorer.profile")
@@ -73,60 +74,60 @@ function M.smart()
     return "substitute:rejected-other"
   end
 
-  resolver.fetch(ident, st.source_bufnr, function(lines, label, err)
+  resolver.fetch(ident, st.source_bufnr, function(lines, label)
     if not lines then
-      local _ = err -- expand re-resolves and reports if the name is unknown
-      return block_fallback()
+      return block_fallback() -- expand re-resolves and reports if the name is unknown
     end
-    do
-      local prefetched = { name = ident, body = lines, label = label }
-      if fname and label == "function_definition" then
-        local N = (st.subst_n or 0) + 1
-        -- substitute covers parse, analysis (including enclosing_scope's
-        -- whole-translation-unit walk) and printing. Kept as one span
-        -- deliberately -- splitting it further would need the boundary
-        -- inside substitute itself -- but it now says which callee and how
-        -- big the caller was, which is what distinguishes a slow site from
-        -- a slow engine.
-        local sspan = profile.start()
-        local ok, new, serr = pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines or {}, "\n"), N, config.options.mode)
-        sspan(ok and new and "substitute:ok" or reject_stage(ok and serr or new),
-          ("%s (caller %dL)"):format(ident, vim.api.nvim_buf_line_count(st.source_bufnr)))
-        if ok and new then
-          return vim.schedule(function()
-            view.end_fetch(st)
-            st.subst_n = N
-            view.rewrite(st, bufnr, new, row)
-            total("total:inline-function", ident)
-          end)
-        end
-        return block_fallback(prefetched) -- e.g. variadic function
-      end
-
-      -- Not a confirmed function (macro, or heuristic-extracted from a header):
-      -- try an in-place macro expansion via clangd (tweak, then hover); block-paste
-      -- only if that yields nothing (so a plain function-signature hover never gets
-      -- spliced). The clangd query runs against the ORIGINAL file, so map the
-      -- view row back to its source line; inserted text has no source position
-      -- and skips straight to the fallback.
-      macro.fetch_expansion(st, view.src_line(st, row), col, function(exp)
-        if not exp or #exp == 0 then
-          return block_fallback(prefetched)
-        end
-        vim.schedule(function()
-          local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
-          if ok and new then
-            view.end_fetch(st)
-            view.rewrite(st, bufnr, new, row)
-            total("total:inline-macro", ident)
-          else
-            total("total:macro-splice-failed")
-            view.end_fetch(st)
-            expander.expand(prefetched)
-          end
+    local prefetched = { name = ident, body = lines, label = label }
+    if fname and label == "function_definition" then
+      local N = (st.subst_n or 0) + 1
+      -- substitute covers parse, analysis (including enclosing_scope's
+      -- whole-translation-unit walk) and printing. Kept as one span
+      -- deliberately -- splitting it further would need the boundary
+      -- inside substitute itself -- but it now says which callee and how
+      -- big the caller was, which is what distinguishes a slow site from
+      -- a slow engine.
+      local sspan = profile.start()
+      local ok, new, serr =
+        pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines, "\n"), N, config.options.mode)
+      sspan(
+        ok and new and "substitute:ok" or reject_stage(ok and serr or new),
+        ("%s (caller %dL)"):format(ident, vim.api.nvim_buf_line_count(st.source_bufnr))
+      )
+      if ok and new then
+        return vim.schedule(function()
+          view.end_fetch(st)
+          st.subst_n = N
+          view.rewrite(st, bufnr, new, row)
+          total("total:inline-function", ident)
         end)
-      end)
+      end
+      return block_fallback(prefetched) -- e.g. variadic function
     end
+
+    -- Not a confirmed function (macro, or heuristic-extracted from a header):
+    -- try an in-place macro expansion via clangd (tweak, then hover); block-paste
+    -- only if that yields nothing (so a plain function-signature hover never gets
+    -- spliced). The clangd query runs against the ORIGINAL file, so map the
+    -- view row back to its source line; inserted text has no source position
+    -- and skips straight to the fallback.
+    macro.fetch_expansion(st, view.src_line(st, row), col, function(exp)
+      if not exp or #exp == 0 then
+        return block_fallback(prefetched)
+      end
+      vim.schedule(function()
+        local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
+        if ok and new then
+          view.end_fetch(st)
+          view.rewrite(st, bufnr, new, row)
+          total("total:inline-macro", ident)
+        else
+          total("total:macro-splice-failed")
+          view.end_fetch(st)
+          expander.expand(prefetched)
+        end
+      end)
+    end)
   end)
 end
 
