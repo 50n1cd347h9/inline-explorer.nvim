@@ -72,9 +72,15 @@ vim.wait(200, function()
 end, 50)
 check("recursion guard blocks re-expansion", vim.api.nvim_buf_line_count(vbuf) == before)
 
--- Undo restores the pre-expansion snapshot.
+-- Undo takes the expansion back; redo brings it back as a block -- the
+-- snapshot undo this replaced dropped every block on undo and redo alike,
+-- so the breadcrumb, the recursion guard and the folds forgot it.
 require("inline-explorer.history").undo()
 check("undo restores the original view", vim.api.nvim_buf_line_count(vbuf) == 4)
+require("inline-explorer.history").redo()
+check("redo brings the expansion back", vim.api.nvim_buf_line_count(vbuf) == before)
+check("redo brings it back as a tracked block", #view.current().nodes == 1, #view.current().nodes)
+require("inline-explorer.history").undo()
 
 -- Line-origin bookkeeping: after undo the map is identity again; a splice
 -- marks the inserted rows as origin-less and shifts the tail; a rewrite keeps
@@ -107,6 +113,21 @@ do
     "rewrite: unchanged lines keep origins",
     view.src_line(st, 0) == 0 and view.src_line(st, 3 + inserted) == 3,
     vim.inspect(st.origin)
+  )
+
+  -- Undoing the rewrite gives the changed line its origin back; redoing it
+  -- takes it away again. The block survives both.
+  require("inline-explorer.history").undo()
+  check("undo of a rewrite restores the line's origin", view.src_line(st, 2) == 2, view.src_line(st, 2))
+  check("undo of a rewrite keeps the block", #st.nodes == 1, #st.nodes)
+  require("inline-explorer.history").redo()
+  check("redo of a rewrite drops the origin again", view.src_line(st, 2) == nil, view.src_line(st, 2))
+  check("redo of a rewrite keeps the block", #st.nodes == 1, #st.nodes)
+
+  -- A rewrite replaces only the lines that differ.
+  check(
+    "rewrite: the text is exactly the new source",
+    table.concat(vim.api.nvim_buf_get_lines(vbuf, 0, -1, false), "\n") == table.concat(lines_now, "\n")
   )
 
   -- Restore the original call line so the guard tests below can find `helper`.

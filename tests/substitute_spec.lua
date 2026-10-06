@@ -1072,13 +1072,57 @@ do
   end
 end
 
+-- A buffer's own tree stands in for parsing the caller text. The inliner
+-- hands over the view's tree (kept parsed by its highlighter); the result
+-- must be the same as parsing the string, and the caller text must not be
+-- string-parsed at all -- on a large file that parse is the cost.
+do
+  local C = require("inline-explorer.csrc")
+  local callee = [[static int g(int x)
+{
+    return x * 2;
+}]]
+  local caller = [[static int caller(int t)
+{
+    int a = g(t);
+    int b = g(a);
+    return b;
+}]]
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(caller, "\n", { plain = true }))
+  local root = vim.treesitter.get_parser(buf, "c"):parse()[1]:root()
+  local col = ("    int b = g(a);"):find("g%(") - 1
+
+  local from_string = S.inline_in_buffer(caller, 3, col, callee, 1)
+  local real = vim.treesitter.get_string_parser
+  local parsed = {}
+  vim.treesitter.get_string_parser = function(text, ...)
+    parsed[#parsed + 1] = text
+    return real(text, ...)
+  end
+  C._parse_cache = {}
+  local from_tree = S.inline_in_buffer(caller, 3, col, callee, 1, nil, root)
+  local name_from_tree = S.call_name_at(caller, 3, col, root)
+  vim.treesitter.get_string_parser = real
+  check("buffer tree: same transform as parsing the text", from_tree ~= nil and from_tree == from_string, from_tree)
+  check("buffer tree: call_name_at finds the call", name_from_tree == "g", name_from_tree)
+  check(
+    "buffer tree: the caller text is never string-parsed",
+    not vim.tbl_contains(parsed, caller),
+    ("%d string parses"):format(#parsed)
+  )
+  vim.api.nvim_buf_delete(buf, { force = true })
+end
+
 -- The parse cache: a second parse of the same source must not re-parse, and
 -- a different source must not be answered from the first. Counted by
 -- instrumenting the tree-sitter entry point rather than by timing -- a cache
--- that merely got lucky would pass a timing assertion. One smart-inline over
--- a function parses the same caller source three times (call_name_at,
--- inline_in_buffer, analyze_call), which on a 15,005-line file measured
--- 154.0ms without the cache against 40.6ms with it.
+-- that merely got lucky would pass a timing assertion. Smart-inline used to
+-- parse the same caller source three times (call_name_at, inline_in_buffer,
+-- analyze_call), which on a 15,005-line file measured 154.0ms without the
+-- cache against 40.6ms with it; it now hands over the view's own tree, and
+-- the cache serves string callers -- the real-source and property suites,
+-- which inline hundreds of sites in one text.
 do
   local C = require("inline-explorer.csrc")
   local real = vim.treesitter.get_string_parser

@@ -30,19 +30,11 @@ local function trim_blank_lines(lines)
   return lines
 end
 
--- Flatten LSP Hover.contents (MarkupContent | MarkedString | MarkedString[]).
-local function markup(contents)
-  if type(contents) ~= "table" then
-    return contents or ""
-  end
-  if contents.value then
-    return contents.value
-  end
-  local parts = {}
-  for _, c in ipairs(contents) do
-    parts[#parts + 1] = type(c) == "table" and (c.value or "") or c
-  end
-  return table.concat(parts, "\n")
+-- Hover.contents (MarkupContent | MarkedString | MarkedString[]) as one
+-- markdown string; language-tagged MarkedStrings come back fenced, which
+-- is the shape expansion_lines reads.
+local function hover_markdown(contents)
+  return table.concat(vim.lsp.util.convert_input_to_markdown_lines(contents), "\n")
 end
 
 -- Extract the expansion from clangd's macro hover markdown. clangd puts the
@@ -73,6 +65,7 @@ local function expansion_lines(md)
 end
 
 M._expansion_lines = expansion_lines
+M._hover_markdown = hover_markdown
 
 -- The macro use under (row, col): the whole call_expression for a function-like
 -- macro, else the identifier. Also whether it sits in statement position.
@@ -90,8 +83,8 @@ local function find_invocation(root, row, col)
 end
 
 -- Replace the macro use under the cursor with `exp_lines`. Returns new_src, err.
-function M.replace_in_src(src, row, col, exp_lines)
-  local inv, stmt_ctx = find_invocation(parse(src), row, col)
+function M.replace_in_src(src, row, col, exp_lines, root)
+  local inv, stmt_ctx = find_invocation(root or parse(src), row, col)
   if not inv then
     return nil, "no macro use under the cursor"
   end
@@ -482,7 +475,7 @@ local function fetch_via_hover(st, row, col, cb)
     local md
     for _, r in pairs(results or {}) do
       if r.result and r.result.contents then
-        md = markup(r.result.contents)
+        md = hover_markdown(r.result.contents)
         break
       end
     end

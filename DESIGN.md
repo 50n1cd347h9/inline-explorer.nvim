@@ -125,8 +125,9 @@ The smart `ei` action splices that expansion **in place** of the macro use (the
 same fetch→replace path as functions, with the fetch preferring the tweak and
 falling back to hover only if it's unavailable); explicit `ee` block-pastes the
 macro definition instead. There is no separate macro command. The query
-(codeAction or hover) runs against the original source: the view keeps a
-per-line origin map (updated across splices, rewrites and undo), so the cursor
+(codeAction or hover) runs against the original source: every source line
+carries an extmark naming its row (Neovim moves it with splices, invalidates
+it when a rewrite replaces the line, and restores it on undo), so the cursor
 position is translated to the exact file line however far prior expansions
 have shifted things; a macro use on inserted text has no origin and falls back
 to block expansion. The `ExpandMacro` tweak path implements exactly the

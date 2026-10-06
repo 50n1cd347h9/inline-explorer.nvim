@@ -116,20 +116,21 @@ do
   )
 end
 
--- Undo snapshots are capped: full-buffer copies measured 10.1 MB after 50
--- expansions of a 10k-line view before the cap existed.
+-- Undo is Neovim's own, and loading the copy is not part of it: undo in a
+-- fresh view has nothing to take back, so the file's text cannot be undone
+-- away. (The snapshot undo this replaced kept a full copy of the buffer
+-- per expansion -- 10.1 MB after 50 expansions of a 10k-line view.)
 do
   local history = require("inline-explorer.history")
   vim.cmd.edit(paths[2])
   local v = view.open()
-  local st = view.state[v]
-  local saved = history._cap
-  history._cap = 5
-  for _ = 1, 12 do
-    history.snapshot(st, v)
-  end
-  check("undo cap: depth bounded by the cap", #st.undo <= 5, #st.undo)
-  history._cap = saved
+  local before = vim.api.nvim_buf_get_lines(v, 0, -1, false)
+  history.undo()
+  check(
+    "undo in a fresh view leaves the file's text",
+    vim.deep_equal(vim.api.nvim_buf_get_lines(v, 0, -1, false), before),
+    vim.api.nvim_buf_get_lines(v, 0, -1, false)
+  )
   view.close()
 end
 

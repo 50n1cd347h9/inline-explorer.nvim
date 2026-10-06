@@ -5,8 +5,20 @@ local util = require("inline-explorer.util")
 local M = {}
 
 M.ns = vim.api.nvim_create_namespace("inline_explorer")
+-- One extmark per line of the source, id = source row + 1, placed when the
+-- view opens. Neovim moves them with every edit, invalidates the ones on
+-- lines that get replaced, and restores them on undo -- which is exactly
+-- "which source line is this view line", with no bookkeeping of our own.
+M.origin_ns = vim.api.nvim_create_namespace("inline_explorer_origin")
 
--- view_bufnr -> { source_bufnr, nodes = { { name, s_mark, e_mark }, ... } }
+-- view_bufnr -> {
+--   bufnr, source_bufnr,
+--   nodes = { { name, s_mark, e_mark }, ... }  -- live expansion blocks
+--   nodes_at = { [undo seq] = { { name, s, e }, ... } }
+-- }
+-- Undo is Neovim's own (see history.lua). It restores the text and the
+-- origin marks, but a block's marks do not come back on redo, so the
+-- blocks are recorded per undo state and rebuilt from there.
 M.state = {}
 
 -- Open a reading view and switch to it. `src` selects the source buffer;
@@ -29,7 +41,13 @@ function M.open(src)
   local cursor = vim.api.nvim_win_get_cursor(0)
 
   local view = vim.api.nvim_create_buf(false, true)
+  -- Loading the copy is not an undoable change: undo stops at the file.
+  vim.bo[view].undolevels = -1
   vim.api.nvim_buf_set_lines(view, 0, -1, false, lines)
+  vim.bo[view].undolevels = 1000
+  for i = 0, #lines - 1 do
+    vim.api.nvim_buf_set_extmark(view, M.origin_ns, i, 0, { id = i + 1, invalidate = true })
+  end
   vim.bo[view].filetype = ft
   vim.bo[view].buftype = "nofile"
   vim.bo[view].bufhidden = "wipe"
@@ -42,18 +60,11 @@ function M.open(src)
   local lang = vim.treesitter.language.get_lang(ft) or ft
   pcall(vim.treesitter.start, view, lang)
 
-  -- origin[view_row + 1] = source row (0-based) the line came from, or false
-  -- for inserted text. Kept current across splices, rewrites and undo, so a
-  -- view position can be mapped back to the real file at any depth.
-  local origin = {}
-  for i = 1, #lines do
-    origin[i] = i - 1
-  end
-  M.state[view] = { source_bufnr = src, nodes = {}, undo = {}, redo = {}, origin = origin }
+  M.state[view] = { bufnr = view, source_bufnr = src, nodes = {}, nodes_at = { [0] = {} } }
   -- The state entry dies with the buffer. Without this, a view abandoned
-  -- by a plain buffer switch (bufhidden=wipe) left its entry -- origin
-  -- array plus undo snapshots -- in M.state forever: close() requires the
-  -- view to be current, and the trail's sweep skipped invalid buffers.
+  -- by a plain buffer switch (bufhidden=wipe) left its entry in M.state
+  -- forever: close() requires the view to be current, and the trail's
+  -- sweep skipped invalid buffers.
   vim.api.nvim_create_autocmd("BufWipeout", {
     buffer = view,
     once = true,
@@ -132,23 +143,45 @@ function M.current()
   return M.state[vim.api.nvim_get_current_buf()]
 end
 
--- Source line (0-based) a view line originates from, or nil for inserted text.
+-- Source line (0-based) a view line originates from, or nil for inserted
+-- or rewritten text.
 function M.src_line(st, row)
-  return st.origin[row + 1] or nil
+  local marks = vim.api.nvim_buf_get_extmarks(st.bufnr, M.origin_ns, { row, 0 }, { row, -1 }, { details = true })
+  for _, m in ipairs(marks) do
+    if not m[4].invalid then
+      return m[1] - 1
+    end
+  end
+  return nil
 end
 
--- Expansion blocks whose extmarks are both still alive, as { name, s, e }
--- (0-based rows), in st.nodes order.
+-- Expansion blocks whose extmarks are both still valid, as { name, s, e }
+-- (0-based rows), in st.nodes order. A block whose first or last line was
+-- replaced has an invalid mark.
+local function node_range(bufnr, node)
+  local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.s_mark, { details = true })
+  local e = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.e_mark, { details = true })
+  if s[1] and e[1] and not s[3].invalid and not e[3].invalid then
+    return s[1], e[1]
+  end
+end
+
 function M.live_nodes(st, bufnr)
   local out = {}
   for _, node in ipairs(st.nodes) do
-    local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.s_mark, {})
-    local e = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.e_mark, {})
-    if s[1] and e[1] then
-      out[#out + 1] = { name = node.name, s = s[1], e = e[1] }
+    local s, e = node_range(bufnr, node)
+    if s then
+      out[#out + 1] = { name = node.name, s = s, e = e }
     end
   end
   return out
+end
+
+-- The undo state `bufnr` is in (undotree() of that buffer).
+local function undo_seq(bufnr)
+  return vim.api.nvim_buf_call(bufnr, function()
+    return vim.fn.undotree().seq_cur
+  end)
 end
 
 -- The view is nomodifiable; every write goes through here.
@@ -165,44 +198,48 @@ function M.reset_marks(st, bufnr)
   st.nodes = {}
 end
 
+local function fold_open(s, e)
+  pcall(vim.cmd, string.format("%d,%dfold", s + 1, e + 1))
+  pcall(vim.cmd, string.format("%d,%dfoldopen", s + 1, e + 1))
+end
+
 -- Track rows s..e (0-based) as expansion block `name`, folded and open.
 -- The fold commands act on the current window, which shows `bufnr`.
 function M.add_node(st, bufnr, name, s, e)
   st.nodes[#st.nodes + 1] = {
     name = name,
-    s_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, s, 0, {}),
-    e_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, e, 0, {}),
+    s_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, s, 0, { invalidate = true }),
+    e_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, e, 0, { invalidate = true }),
   }
-  pcall(vim.cmd, string.format("%d,%dfold", s + 1, e + 1))
-  pcall(vim.cmd, string.format("%d,%dfoldopen", s + 1, e + 1))
+  fold_open(s, e)
 end
 
--- Diff old vs new text into map[old_row_0] = new_row_0 for lines that
--- survived unchanged (changed/inserted lines are absent).
-function M._remap_rows(old_src, new_src)
-  local hunks = vim.diff(old_src, new_src, { result_type = "indices" }) or {}
-  local map = {}
-  local old_n = #vim.split(old_src, "\n", { plain = true })
-  local new_n = #vim.split(new_src, "\n", { plain = true })
-  local oi, ni = 1, 1
-  for _, h in ipairs(hunks) do
-    local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
-    -- count == 0 means "insertion after line start", so the first affected
-    -- line is start + 1 in that buffer.
-    local a_start = ca > 0 and sa or sa + 1
-    local b_start = cb > 0 and sb or sb + 1
-    while oi < a_start and ni < b_start do
-      map[oi - 1] = ni - 1
-      oi, ni = oi + 1, ni + 1
+-- One undoable change to the view: `fn` edits it (set_lines, add_node).
+-- Starts a new undo step first -- edits made from separate callbacks would
+-- otherwise join the previous one -- and afterwards records the blocks
+-- that are live in the resulting undo state.
+function M.change(st, bufnr, fn)
+  vim.bo[bufnr].undolevels = vim.bo[bufnr].undolevels -- closes the previous undo step
+  fn()
+  local nodes, live = {}, {}
+  for _, node in ipairs(st.nodes) do
+    local s, e = node_range(bufnr, node)
+    if s then
+      nodes[#nodes + 1] = node
+      live[#live + 1] = { name = node.name, s = s, e = e }
     end
-    oi = a_start + ca
-    ni = b_start + cb
   end
-  while oi <= old_n and ni <= new_n do
-    map[oi - 1] = ni - 1
-    oi, ni = oi + 1, ni + 1
+  st.nodes = nodes
+  st.nodes_at[undo_seq(bufnr)] = live
+end
+
+-- After undo/redo: rebuild the blocks recorded for the undo state the
+-- buffer is now in.
+function M.restore_nodes(st, bufnr)
+  M.reset_marks(st, bufnr)
+  for _, node in ipairs(st.nodes_at[undo_seq(bufnr)] or {}) do
+    M.add_node(st, bufnr, node.name, node.s, node.e)
   end
-  return map
 end
 
 -- Re-entrancy guard: one resolver round trip per view at a time, so two quick
@@ -240,44 +277,31 @@ function M.end_fetch(st)
   st.fetch_started = nil
 end
 
--- Replace the whole view buffer with `new_src` (used by in-place transforms).
--- Snapshots for undo first. Lines that survive the rewrite unchanged (per
--- vim.diff) keep their origin bookkeeping, and block-expansion nodes whose
--- endpoints both survive are re-anchored with their folds re-created instead
--- of being dropped wholesale.
+-- Turn the view's text into `new_src` (used by in-place transforms) by
+-- replacing only the lines that differ, bottom-up so earlier hunks keep
+-- their row numbers. Untouched lines keep their extmarks: their origin,
+-- and the blocks around them. A block whose first or last line is
+-- replaced is dropped.
 function M.rewrite(st, bufnr, new_src, row)
   local span = require("inline-explorer.profile").start()
-  require("inline-explorer.history").snapshot(st, bufnr)
-
   local old_src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  local rowmap = M._remap_rows(old_src, new_src)
-
-  local surviving = {}
+  local new_lines = vim.split(new_src, "\n", { plain = true })
+  local hunks = vim.diff(old_src .. "\n", new_src .. "\n", { result_type = "indices" }) or {}
+  M.change(st, bufnr, function()
+    for i = #hunks, 1, -1 do
+      local sa, ca, sb, cb = unpack(hunks[i])
+      -- A count of 0 means "insert after line start".
+      local first = ca > 0 and sa - 1 or sa
+      M.set_lines(bufnr, first, first + ca, vim.list_slice(new_lines, sb, sb + cb - 1))
+    end
+  end)
+  -- Manual folds do not follow line replacements reliably; rebuild them
+  -- for the blocks that survived.
+  pcall(vim.cmd, "silent! normal! zE")
   for _, node in ipairs(M.live_nodes(st, bufnr)) do
-    if rowmap[node.s] and rowmap[node.e] then
-      surviving[#surviving + 1] = { name = node.name, s = rowmap[node.s], e = rowmap[node.e] }
-    end
+    fold_open(node.s, node.e)
   end
-
-  local new_origin = {}
-  for old_row, new_row in pairs(rowmap) do
-    new_origin[new_row + 1] = st.origin[old_row + 1]
-  end
-
-  M.set_lines(bufnr, 0, -1, vim.split(new_src, "\n", { plain = true }))
   local n = vim.api.nvim_buf_line_count(bufnr)
-  for i = 1, n do
-    if new_origin[i] == nil then
-      new_origin[i] = false
-    end
-  end
-  st.origin = new_origin
-
-  M.reset_marks(st, bufnr)
-  for _, node in ipairs(surviving) do
-    M.add_node(st, bufnr, node.name, node.s, node.e)
-  end
-
   pcall(vim.api.nvim_win_set_cursor, 0, { math.min((row or 0) + 1, n), 0 })
   span("rewrite")
 end

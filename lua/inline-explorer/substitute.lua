@@ -79,8 +79,10 @@ end
 
 -- The innermost call at (row, col) and the plain function name it calls;
 -- nil and a reason when there is no call or its target is not a name.
-local function named_call_at(caller_src, row, col)
-  local call = C.ancestor_at(C.parse(caller_src), row, col, "call_expression")
+-- `root`, when given, is caller_src's tree already (a buffer's own parse);
+-- otherwise caller_src is parsed.
+local function named_call_at(caller_src, row, col, root)
+  local call = C.ancestor_at(root or C.parse(caller_src), row, col, "call_expression")
   if not call then
     return nil, "no call under the cursor"
   end
@@ -92,8 +94,8 @@ local function named_call_at(caller_src, row, col)
 end
 
 -- Name of the function called at (row, col), or nil.
-function M.call_name_at(caller_src, row, col)
-  local call, fname = named_call_at(caller_src, row, col)
+function M.call_name_at(caller_src, row, col, root)
+  local call, fname = named_call_at(caller_src, row, col, root)
   return call and fname or nil
 end
 
@@ -101,8 +103,8 @@ end
 -- call node goes straight to the analysis; numbering it as an occurrence
 -- only for analyze_call to walk the file again and find it was a second
 -- and third search for a node already in hand.
-function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode)
-  local call, fname = named_call_at(caller_src, row, col)
+function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)
+  local call, fname = named_call_at(caller_src, row, col, root)
   if not call then
     return nil, fname
   end

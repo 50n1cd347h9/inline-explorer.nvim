@@ -31,8 +31,15 @@ function M.smart()
   local cur = vim.api.nvim_win_get_cursor(0)
   local row, col = cur[1] - 1, cur[2]
   local src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  -- The view's own tree for that text: the highlighter keeps it parsed,
+  -- incrementally, so nothing re-parses the whole file per keypress. Nil
+  -- (and a string parse downstream) if the buffer has no c parser.
+  local ok_root, root = pcall(function()
+    return vim.treesitter.get_parser(bufnr, "c"):parse()[1]:root()
+  end)
+  root = ok_root and root or nil
 
-  local fname = substitute.call_name_at(src, row, col) -- non-nil only on a call
+  local fname = substitute.call_name_at(src, row, col, root) -- non-nil only on a call
   local ident = fname
   if not ident or ident == "" then
     ident = vim.fn.expand("<cword>")
@@ -89,7 +96,7 @@ function M.smart()
       -- a slow engine.
       local sspan = profile.start()
       local ok, new, serr =
-        pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines, "\n"), N, config.options.mode)
+        pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines, "\n"), N, config.options.mode, root)
       sspan(
         ok and new and "substitute:ok" or reject_stage(ok and serr or new),
         ("%s (caller %dL)"):format(ident, vim.api.nvim_buf_line_count(st.source_bufnr))
@@ -116,7 +123,7 @@ function M.smart()
         return block_fallback(prefetched)
       end
       vim.schedule(function()
-        local ok, new = pcall(macro.replace_in_src, src, row, col, exp)
+        local ok, new = pcall(macro.replace_in_src, src, row, col, exp, root)
         if ok and new then
           view.end_fetch(st)
           view.rewrite(st, bufnr, new, row)

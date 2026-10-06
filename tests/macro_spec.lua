@@ -45,6 +45,33 @@ do
   check("function-signature hover -> nil (not spliced as a macro)", macro._expansion_lines(sig) == nil)
 end
 
+-- Every shape Hover.contents may take reaches expansion_lines as markdown it
+-- can read: MarkupContent (what clangd sends), a bare MarkedString, and a
+-- MarkedString[] whose code parts carry a language.
+do
+  local function expansion(contents)
+    local e = macro._expansion_lines(macro._hover_markdown(contents))
+    return e and table.concat(e, "\n")
+  end
+  check(
+    "hover contents: MarkupContent",
+    expansion({ kind = "markdown", value = hover_blocks }) == "(0x3U << 0)",
+    macro._hover_markdown({ kind = "markdown", value = hover_blocks })
+  )
+  check("hover contents: MarkedString", expansion(hover_blocks) == "(0x3U << 0)")
+  local parts = {
+    "### macro `MASK`",
+    { language = "c", value = "#define MASK (0x3U << 0)" },
+    "Expands to",
+    { language = "c", value = "(0x3U << 0)" },
+  }
+  check(
+    "hover contents: MarkedString[] with languages",
+    expansion(parts) == "(0x3U << 0)",
+    macro._hover_markdown(parts)
+  )
+end
+
 -- Object-like macro in expression context -> parenthesised value.
 do
   local src = "int f(int x) { return x & MASK; }"

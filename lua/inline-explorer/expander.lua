@@ -41,15 +41,10 @@ local function insert(st, bufnr, lnum, name, body, label)
     out[#out + 1] = pad .. "/* ^ " .. name .. " */"
   end
 
-  require("inline-explorer.history").snapshot(st, bufnr)
-  view.set_lines(bufnr, lnum + 1, lnum + 1, out)
-
-  -- Origin bookkeeping: spliced lines have no position in the source file.
-  for _ = 1, #out do
-    table.insert(st.origin, lnum + 2, false)
-  end
-
-  view.add_node(st, bufnr, name, lnum + 1, lnum + #out)
+  view.change(st, bufnr, function()
+    view.set_lines(bufnr, lnum + 1, lnum + 1, out)
+    view.add_node(st, bufnr, name, lnum + 1, lnum + #out)
+  end)
 end
 
 -- Block-expand the symbol under the cursor.
