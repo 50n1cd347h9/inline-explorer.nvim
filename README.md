@@ -3,7 +3,7 @@
 Read large codebases by **expanding definitions where they are used**. Press
 a key on a function call, type or macro and its definition appears below
 the line; move into it and expand again, as deep as you like. No
-window-hopping, no floating windows, and your files are never modified.
+window-hopping, and your files are never modified.
 
 Built for the Linux kernel, but works with any language server that
 supports `workspace/symbol` (clangd, ts_ls, pyright, rust-analyzer, gopls,
@@ -50,8 +50,6 @@ Otherwise call `require("inline-explorer").setup()`. Set `vim.g.mapleader`
 1. `<leader>eo` opens the **reading view**, a read-only copy of the file.
 2. On a function call, `<leader>ee` expands its definition below the line.
 3. Move into the definition and expand again to go deeper.
-4. `<leader>ec` folds an expansion, `u` / `<C-r>` undo and redo,
-   `<leader>eq` closes the view.
 
 | Keymap            | Command                        | Action |
 | ----------------- | ------------------------------ | ------ |
@@ -64,14 +62,15 @@ Otherwise call `require("inline-explorer").setup()`. Set `vim.g.mapleader`
 | `<leader>el`      | `:InlineExplorerList`          | List expansions in the location list |
 | `gd`              |                                | Open the definition in its own view |
 | `<leader>eu`      | `:InlineExplorerCallers`       | Pick a caller and go there |
-| `<C-o>` / `<C-i>` | `:InlineExplorerTrail`         | Back / forward between views |
+| `<C-o>` / `<C-i>` |                                | Back / forward between views |
+|                   | `:InlineExplorerTrail`         | List the visited views |
 | `<leader>eq`      | `:InlineExplorerClose`         | Close the reading view |
 |                   | `:InlineExplorerToggleMode`    | Switch inline mode (`correct` / `readable`) |
 |                   | `:InlineExplorerProfile`       | Latency profiling |
 
-The `<leader>e` maps are global; the rest exist only inside a reading view.
-`u` / `<C-r>` undo expansions and inline substitutions one at a time and
-never touch your file's own undo history.
+`<leader>eo`, `ee`, `ei`, `ec` and `eq` are global; the other maps exist
+only inside a reading view. Undo there never touches your file's own undo
+history.
 
 For the statusline, `require("inline-explorer").breadcrumb()` returns the
 expansions around the cursor (`do_work > helper`):
@@ -82,9 +81,8 @@ vim.o.statusline = "%f %{v:lua.require'inline-explorer'.breadcrumb()} %=%l:%c"
 
 ### Navigating
 
-`gd` opens the definition under the cursor in its own view, and `<leader>eu`
-picks one of the function's callers. `<C-o>` / `<C-i>` go back and forward;
-the last 8 views keep their expansions. Callers come from the language
+The last 8 views you visited keep their expansions as you move with
+`<C-o>` / `<C-i>`. Callers come from the language
 server (`[lsp]`) or, if it cannot list them, from `rg`/`grep` confirmed by
 tree-sitter (`[grep]`, which cannot tell same-named `static` functions
 apart).
@@ -100,20 +98,14 @@ struct ct *p = per_cpu_ptr(CT, cpu);
 return snap != (p->state & MASK);
 ```
 
-Parameters become typed locals; simple functions are spliced like this,
-others become a GNU statement expression `({ ... })`; clashing names get a
-`__ieN` suffix. Calls that cannot be inlined (variadic functions) fall back
-to `<leader>ee`.
+Calls that cannot be inlined (variadic functions) fall back to
+`<leader>ee`.
 
 The `mode` option sets the style:
 
 - **`correct`** (default): always compiles and behaves like the original.
 - **`readable`**: avoids `({ ... })` and `goto`, but functions with early
   returns or labels may no longer compile or behave the same.
-
-The engine is verified by inlining every eligible call in
-[cJSON](https://github.com/DaveGamble/cJSON) and
-[zlib](https://github.com/madler/zlib) and running their test suites.
 
 ## Macros
 
@@ -173,8 +165,7 @@ Start with `:checkhealth inline-explorer`.
 | Keymaps do nothing, commands work | Set `vim.g.mapleader` before `setup()` runs |
 | `no language server attached ...` | Check `:checkhealth lsp` |
 | `no symbol named 'x'` | The server's index lacks it; for C, check `compile_commands.json` |
-| `no answer within ...; extracted locally` | A slow first open of a header; the next look uses the server |
-| The view has no colors | `:TSInstall <lang>` |
+| `no answer within ...; extracted locally` | The server was slow on the definition's file; looking again uses it |
 
 If expansions feel slow, `:InlineExplorerProfile on`, expand a few things,
 then `:InlineExplorerProfile` for a report (`open` shows the full log).
@@ -187,8 +178,9 @@ Please attach the log to performance reports.
   may be the wrong one.
 - No semantic highlighting in the view; tree-sitter is used instead.
 - Mutual recursion (`a` → `b` → `a`) is not detected; direct recursion is.
-- Inline substitution is C only. An expansion whose first or last line it
-  rewrites is dropped. Some calls are still rejected or do not compile, e.g.
+- Inline substitution is C only. Inlining on the first or last line of an
+  expansion stops it being tracked as a block (no fold, `]e` or
+  breadcrumb). Some calls are still rejected or do not compile, e.g.
   a callee using a helper defined later in the file, or a `va_list`
   parameter.
 
