@@ -14,6 +14,7 @@ local M = {}
 -- path and re-parsed it uncached here -- measured at 33-42ms on a
 -- 13k-line kernel file against ~0ms for the cache hit.
 local C = require("inline-explorer.csrc")
+local util = require("inline-explorer.util")
 local parse = C.parse
 local sb = C.sb
 local eb = C.eb
@@ -360,6 +361,14 @@ function M.supports_tweak(client)
   return vim.tbl_contains(cmds, "clangd.applyTweak")
 end
 
+-- The LSP position of byte column `col` on source line `row`, in
+-- `client`'s position encoding (the cursor counts bytes; the server counts
+-- in whatever units it negotiated).
+local function source_position(st, row, col, client)
+  local line = vim.api.nvim_buf_get_lines(st.source_bufnr, row, row + 1, false)[1] or ""
+  return { line = row, character = util.lsp_col(line, col, client.offset_encoding) }
+end
+
 -- Fetch the expansion via the ExpandMacro tweak. Calls cb(lines|nil) exactly
 -- once: on success with the applyEdit's newText lines, on any failure -- no
 -- clangd, no tweak support, no action at this position, request error, or
@@ -377,7 +386,7 @@ local function fetch_via_tweak(st, row, col, cb)
   install_interceptor(client)
 
   local uri = vim.uri_from_bufnr(st.source_bufnr)
-  local pos = { line = row, character = col }
+  local pos = source_position(st, row, col, client)
 
   -- Exactly-once guard shared by the success path, every error path, and the
   -- timeout. Instead of removing the interception it downgrades THIS fetch's own
@@ -461,12 +470,13 @@ end
 local function fetch_via_hover(st, row, col, cb)
   -- Filter by the source buffer: buf_request_all never invokes its handler
   -- when the buffer has no attached clients, which would starve cb entirely.
-  if #vim.lsp.get_clients({ bufnr = st.source_bufnr, name = "clangd" }) == 0 then
+  local client = vim.lsp.get_clients({ bufnr = st.source_bufnr, name = "clangd" })[1]
+  if not client then
     return cb(nil)
   end
   local params = {
     textDocument = { uri = vim.uri_from_bufnr(st.source_bufnr) },
-    position = { line = row, character = col },
+    position = source_position(st, row, col, client),
   }
   vim.lsp.buf_request_all(st.source_bufnr, "textDocument/hover", params, function(results)
     local md

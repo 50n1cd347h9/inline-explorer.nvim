@@ -133,7 +133,10 @@ function M.goto_location(loc)
   local target = view_of(sb) or view.open(sb)
   vim.api.nvim_set_current_buf(target)
   vim.bo[target].bufhidden = "hide" -- stacked or shown, it must survive switches
-  pcall(vim.api.nvim_win_set_cursor, 0, { loc.range.start.line + 1, loc.range.start.character })
+  -- An LSP location counts in its server's encoding; the cursor in bytes.
+  local row = loc.range.start.line
+  local line = vim.api.nvim_buf_get_lines(sb, row, row + 1, false)[1] or ""
+  pcall(vim.api.nvim_win_set_cursor, 0, { row + 1, util.byte_col(line, loc.range.start.character, loc.encoding) })
   return true
 end
 

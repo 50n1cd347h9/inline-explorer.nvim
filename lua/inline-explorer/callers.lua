@@ -172,7 +172,7 @@ function M.get(name, bufnr, cb)
     end
     local params = {
       textDocument = { uri = loc.uri },
-      position = resolver.name_position(target, loc),
+      position = resolver.name_position(target, loc, clients[1].offset_encoding),
     }
     M._hierarchy(clients[1], target, params, name, root, cb)
   end)
@@ -214,6 +214,7 @@ function M._hierarchy(client, target, params, name, root, cb)
             name = from.name or "?",
             uri = from.uri,
             range = r,
+            encoding = client.offset_encoding, -- the range is in the server's units
             text = line_text(path, r.start.line),
           }
         end

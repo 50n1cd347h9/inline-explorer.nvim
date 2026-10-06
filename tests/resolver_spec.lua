@@ -937,4 +937,49 @@ do
   end
 end
 
+-- Position encodings. LSP `character` counts in the encoding negotiated
+-- with the server (utf-16 unless it says otherwise; clangd says utf-8);
+-- cursor columns and tree-sitter count bytes. Every check below sits on a
+-- line with a multibyte character before the position, where the two
+-- differ -- on plain ASCII they agree, which is how the missing conversion
+-- went unnoticed.
+do
+  local util = require("inline-explorer.util")
+  local line = "/* é */ x" -- 'x' is byte 9, utf-16/utf-32 index 8
+  check("encoding: utf-16 character -> byte", util.byte_col(line, 8, "utf-16") == 9, util.byte_col(line, 8, "utf-16"))
+  check("encoding: byte -> utf-16 character", util.lsp_col(line, 9, "utf-16") == 8, util.lsp_col(line, 9, "utf-16"))
+  check("encoding: utf-32 counts é as one", util.byte_col(line, 8, "utf-32") == 9, util.byte_col(line, 8, "utf-32"))
+  check(
+    "encoding: utf-8 and nil are bytes already",
+    util.byte_col(line, 9, "utf-8") == 9 and util.lsp_col(line, 9, nil) == 9
+  )
+
+  local epath = vim.fn.tempname() .. ".c"
+  H.writef(epath, "/* éééééééééééé */ static int g(void) { return 2; }\nint h(void);\n")
+  local eline = "/* éééééééééééé */ static int g(void) { return 2; }"
+  local s_byte = assert(eline:find("static", 1, true)) - 1
+  local s_u16 = util.lsp_col(eline, s_byte, "utf-16")
+  local uri = vim.uri_from_fname(epath)
+  local lines, label = resolver.extract_sync({
+    uri = uri,
+    range = range(0, s_u16, 0, s_u16 + 6),
+    name = "g",
+    encoding = "utf-16",
+  })
+  check(
+    "encoding: extract_sync finds the definition from a utf-16 position",
+    label == "function_definition" and lines and lines[1]:find("static int g", 1, true) ~= nil,
+    { label = label, lines = lines }
+  )
+
+  local tbuf = vim.uri_to_bufnr(uri)
+  vim.fn.bufload(tbuf)
+  vim.api.nvim_buf_set_lines(tbuf, 1, 2, false, { "/* é */ int target_fn(void);" })
+  local loc = { uri = uri, range = range(1, 0, 1, 27), name = "target_fn" }
+  local p16 = resolver.name_position(tbuf, loc, "utf-16")
+  local p8 = resolver.name_position(tbuf, loc, "utf-8")
+  check("encoding: name_position answers in the server's units (utf-16)", p16.character == 12, p16)
+  check("encoding: name_position answers in the server's units (utf-8)", p8.character == 13, p8)
+end
+
 H.finish("RESOLVER")

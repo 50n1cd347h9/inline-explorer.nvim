@@ -322,4 +322,34 @@ do
   profile.clear()
 end
 
+-- The view's fold settings belong to the view. Set with plain vim.wo they
+-- acted like `:set` -- the global value changed too, so every window
+-- opened afterwards, and every buffer shown in one, lost the user's own
+-- foldmethod (indent/expr folding silently became manual).
+do
+  vim.cmd("enew")
+  local src = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(src, 0, -1, false, { "int f(void)", "{", "    return 1;", "}" })
+  vim.o.foldmethod = "indent"
+  local v = view.open()
+  check("fold options: the view itself folds manually", vim.wo.foldmethod == "manual", vim.wo.foldmethod)
+  check("fold options: the global foldmethod is untouched", vim.go.foldmethod == "indent", vim.go.foldmethod)
+  vim.api.nvim_set_current_buf(src)
+  check(
+    "fold options: the source buffer keeps its foldmethod in the same window",
+    vim.wo.foldmethod == "indent",
+    vim.wo.foldmethod
+  )
+  vim.cmd("new")
+  check(
+    "fold options: a window opened afterwards keeps the user's foldmethod",
+    vim.wo.foldmethod == "indent",
+    vim.wo.foldmethod
+  )
+  vim.cmd("close")
+  -- Leaving the view wiped it (bufhidden=wipe); nothing to close.
+  check("fold options: the abandoned view is gone", not vim.api.nvim_buf_is_valid(v))
+  vim.o.foldmethod = "manual"
+end
+
 H.finish("EXPANDER")

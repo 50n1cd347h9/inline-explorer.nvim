@@ -133,4 +133,23 @@ do
   view.close()
 end
 
+-- A location from a server counts columns in its position encoding; the
+-- cursor counts bytes. With a multibyte character before the target the
+-- two differ, and the raw utf-16 index put the cursor one byte early.
+do
+  trail.clear()
+  local mpath = dir .. "/multibyte.c"
+  H.writef(mpath, "/* é */ int target(void) { return 0; }\n")
+  vim.cmd.edit(paths[1])
+  view.open()
+  trail.goto_location({
+    uri = vim.uri_from_fname(mpath),
+    range = { start = { line = 0, character = 12 }, ["end"] = { line = 0, character = 18 } },
+    encoding = "utf-16", -- 't' of target: utf-16 index 12, byte 13
+  })
+  local c = vim.api.nvim_win_get_cursor(0)
+  check("goto: a utf-16 column lands on the right byte", c[1] == 1 and c[2] == 13, c)
+  trail.clear()
+end
+
 H.finish("TRAIL")

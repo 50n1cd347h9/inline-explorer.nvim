@@ -63,8 +63,10 @@ function M.open(src)
   })
 
   vim.api.nvim_set_current_buf(view)
-  vim.wo.foldmethod = "manual"
-  vim.wo.foldenable = true
+  -- Local to the view in this window (`:setlocal`). Plain vim.wo acts like
+  -- `:set` and changed the user's global foldmethod too.
+  vim.wo[0][0].foldmethod = "manual"
+  vim.wo[0][0].foldenable = true
   pcall(vim.api.nvim_win_set_cursor, 0, cursor)
 
   -- Buffer-local undo/redo, so `u`/`<C-r>` only rebind inside the view.

@@ -258,10 +258,14 @@ function M.locate(name, source_bufnr, cb)
     return nil, "workspace/symbol timed out (server busy or stuck?)"
   end)
   vim.lsp.buf_request_all(bufnr, "workspace/symbol", { query = name }, function(results)
-    local all = {}
-    for _, r in pairs(results or {}) do
+    -- Each symbol remembers its server's position encoding: the range is
+    -- in that server's units, not in bytes (see util.byte_col).
+    local all, encoding_of = {}, {}
+    for client_id, r in pairs(results or {}) do
+      local client = vim.lsp.get_client_by_id(client_id)
       for _, s in ipairs(r.result or {}) do
         all[#all + 1] = s
+        encoding_of[s] = client and client.offset_encoding
       end
     end
     if #all == 0 then
@@ -289,7 +293,7 @@ function M.locate(name, source_bufnr, cb)
     end
 
     local loc = pick.location
-    finish({ uri = loc.uri, range = loc.range, kind = pick.kind, name = pick.name }, nil)
+    finish({ uri = loc.uri, range = loc.range, kind = pick.kind, name = pick.name, encoding = encoding_of[pick] }, nil)
   end)
 end
 
@@ -441,7 +445,8 @@ function M.extract_sync(loc)
   local bufnr = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(bufnr)
   local srow = loc.range.start.line
-  local scol = loc.range.start.character
+  local sline = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
+  local scol = util.byte_col(sline, loc.range.start.character, loc.encoding)
 
   -- `.h` headers are often detected as C++ while only the C parser is installed,
   -- so try the detected language, then fall back to C / C++.
@@ -816,20 +821,22 @@ end
 -- The position of `loc.name` inside its own declaration, word-bounded --
 -- range.start can sit on `void`, and a request positioned on a keyword
 -- answers for nothing (the chase learned this from a field log; callers
--- inherited the same rule).
-function M.name_position(target, loc)
-  local pos = loc.range.start
+-- inherited the same rule). In `encoding`, the units of the server the
+-- position is sent to.
+function M.name_position(target, loc, encoding)
+  local from = loc.range.start.line
+  local lines = vim.api.nvim_buf_get_lines(target, from, from + 4, false)
   if loc.name then
-    local from = loc.range.start.line
-    local lines = vim.api.nvim_buf_get_lines(target, from, from + 4, false)
     for i, l in ipairs(lines) do
       local s0 = l:find("%f[%w_]" .. vim.pesc(loc.name) .. "%f[^%w_]")
       if s0 then
-        return { line = from + i - 1, character = s0 - 1 }
+        return { line = from + i - 1, character = util.lsp_col(l, s0 - 1, encoding) }
       end
     end
   end
-  return pos
+  local l = lines[1] or ""
+  local byte = util.byte_col(l, loc.range.start.character, loc.encoding)
+  return { line = from, character = util.lsp_col(l, byte, encoding) }
 end
 
 -- Chase a declaration to its definition, once. workspace/symbol answers
@@ -857,7 +864,8 @@ function M._chase_definition(loc, cb)
   -- Find the name, word-bounded, in the declaration's first lines and aim
   -- there; range.start stays as the fallback when the name is not textual
   -- on those lines (unlikely, but a miss then is honest).
-  local pos = M.name_position(target, loc)
+  local encoding = clients[1].offset_encoding
+  local pos = M.name_position(target, loc, encoding)
 
   local span = profile.start()
   -- A miss says WHY. Two rounds of field logs read "chase-miss 220ms" and
@@ -904,7 +912,7 @@ function M._chase_definition(loc, cb)
     if uri == loc.uri and range.start.line == pos.line then
       return finish(nil, "self -- the index does not know the defining file (compile_commands.json missing?)")
     end
-    finish({ uri = uri, range = range, kind = loc.kind, name = loc.name })
+    finish({ uri = uri, range = range, kind = loc.kind, name = loc.name, encoding = encoding })
   end, target)
 end
 
