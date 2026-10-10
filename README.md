@@ -41,9 +41,12 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
 { "50n1cd347h9/inline-explorer.nvim", opts = {} }
 ```
 
-Otherwise call `require("inline-explorer").setup()`. Set `vim.g.mapleader`
-**before** `setup()` runs, since the keymaps use `<leader>`. Then run
-`:checkhealth inline-explorer` in a file you want to read.
+Otherwise call `require("inline-explorer").setup()`.
+
+The keymaps use `<leader>`, which is read **when `setup()` runs**: set
+`vim.g.mapleader` first (see [Configuration](#configuration)).
+
+Then run `:checkhealth inline-explorer` in a file you want to read.
 
 ## Usage
 
@@ -119,6 +122,10 @@ use.
 Defaults; pass only what you change. Set a keymap to `false` to disable it.
 
 ```lua
+-- <leader> for the keymaps below, e.g. Space. Set it at the top of init.lua,
+-- before your plugin manager loads anything; Neovim's default is `\`.
+vim.g.mapleader = " "
+
 require("inline-explorer").setup({
   keymaps = {
     substitute = "<leader>ei",
