@@ -25,13 +25,15 @@ lua_ls, ...).
 With [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
+vim.g.mapleader = " " -- before lazy.nvim loads: the keymaps use <leader>
+
 { "50n1cd347h9/inline-explorer.nvim", opts = {} }
 ```
 
 Otherwise call `require("inline-explorer").setup()`.
 
-The keymaps use `<leader>`, which is read **when `setup()` runs**: set
-`vim.g.mapleader` first (see [Configuration](#configuration)).
+`<leader>` is read **when `setup()` runs**, so set `vim.g.mapleader` before
+it (Neovim's default is `\`).
 
 Then run `:checkhealth inline-explorer` in a file you want to read.
 
