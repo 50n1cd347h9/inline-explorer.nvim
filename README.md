@@ -11,19 +11,6 @@ lua_ls, ...).
 
 ![Expanding a call inline, then expanding again inside the body, in the Linux kernel](assets/inline-explorer-demo.gif)
 
-```
-ret = do_work(x);
-  /* v do_work (function_definition) */
-  static int do_work(int x)
-  {
-      return helper(x) + 1;
-        /* v helper (function_definition) */
-        static int helper(int x) { return x << 1; }
-        /* ^ helper */
-  }
-  /* ^ do_work */
-```
-
 ## Requirements
 
 - Neovim 0.10+
@@ -75,48 +62,6 @@ Then run `:checkhealth inline-explorer` in a file you want to read.
 only inside a reading view. Undo there never touches your file's own undo
 history.
 
-For the statusline, `require("inline-explorer").breadcrumb()` returns the
-expansions around the cursor (`do_work > helper`):
-
-```lua
-vim.o.statusline = "%f %{v:lua.require'inline-explorer'.breadcrumb()} %=%l:%c"
-```
-
-### Navigating
-
-The last 8 views you visited keep their expansions as you move with
-`<C-o>` / `<C-i>`. Callers come from the language
-server (`[lsp]`) or, if it cannot list them, from `rg`/`grep` confirmed by
-tree-sitter (`[grep]`, which cannot tell same-named `static` functions
-apart).
-
-## Inline substitution (C)
-
-`<leader>ei` **rewrites the call into what the function body does**, as a
-compiler would. Given `return snap != acquire(c);`:
-
-```c
-int cpu = (c);
-struct ct *p = per_cpu_ptr(CT, cpu);
-return snap != (p->state & MASK);
-```
-
-Calls that cannot be inlined (variadic functions) fall back to
-`<leader>ee`.
-
-The `mode` option sets the style:
-
-- **`correct`** (default): always compiles and behaves like the original.
-- **`readable`**: avoids `({ ... })` and `goto`, but functions with early
-  returns or labels may no longer compile or behave the same.
-
-## Macros
-
-`<leader>ei` replaces a macro use with the expansion **your running clangd**
-computes, so include paths and `#ifdef` state apply. Inside an expanded
-block it falls back to `<leader>ee`, which shows the `#define` below the
-use.
-
 ## Configuration
 
 Defaults; pass only what you change. Set a keymap to `false` to disable it.
@@ -150,6 +95,39 @@ require("inline-explorer").setup({
 })
 ```
 
+For the statusline, `require("inline-explorer").breadcrumb()` returns the
+expansions around the cursor (`do_work > helper`):
+
+```lua
+vim.o.statusline = "%f %{v:lua.require'inline-explorer'.breadcrumb()} %=%l:%c"
+```
+
+### Navigating
+
+The last 8 views you visited keep their expansions as you move with
+`<C-o>` / `<C-i>`. Callers come from the language
+server (`[lsp]`) or, if it cannot list them, from `rg`/`grep` confirmed by
+tree-sitter (`[grep]`, which cannot tell same-named `static` functions
+apart).
+
+## Inline substitution (C)
+
+`<leader>ei` **rewrites the call into what the function body does**, as a
+compiler would.
+
+```c
+return snap != acquire(c);
+```
+
+```c
+int cpu = (c);
+struct ct *p = per_cpu_ptr(CT, cpu);
+return snap != (p->state & MASK);
+```
+
+Calls that cannot be inlined (variadic functions) fall back to
+`<leader>ee`.
+
 ## Cross-compiled kernels (Buildroot)
 
 1. Generate `compile_commands.json` in `output/build/linux-<version>` with
@@ -178,18 +156,6 @@ If expansions feel slow, `:InlineExplorerProfile on`, expand a few things,
 then `:InlineExplorerProfile` for a report (`open` shows the full log).
 Please attach the log to performance reports.
 
-## Known limitations
-
-- Definitions are looked up **by name**, so with several same-named
-  definitions (e.g. `static` functions in different files) the first match
-  may be the wrong one.
-- No semantic highlighting in the view; tree-sitter is used instead.
-- Mutual recursion (`a` → `b` → `a`) is not detected; direct recursion is.
-- Inline substitution is C only. Inlining on the first or last line of an
-  expansion stops it being tracked as a block (no fold, `]e` or
-  breadcrumb). Some calls are still rejected or do not compile, e.g.
-  a callee using a helper defined later in the file, or a `va_list`
-  parameter.
 
 ## Contributing
 
