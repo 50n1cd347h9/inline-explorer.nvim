@@ -39,22 +39,20 @@ Then run `:checkhealth inline-explorer` in a file you want to read.
 
 ## Usage
 
-1. `<leader>eo` opens the **reading view**, a read-only copy of the file.
+1. `<leader>eo` opens the **reading view**.
 2. On a function call, `<leader>ee` expands its definition below the line.
 3. Move into the definition and expand again to go deeper.
 
-| Keymap            | Command                        | Action |
+| Keymap (deault)          | Command                        | Action |
 | ----------------- | ------------------------------ | ------ |
 | `<leader>eo`      | `:InlineExplorerOpen`          | Open a reading view |
 | `<leader>ee`      | `:InlineExplorerExpand`        | Expand the definition below the line |
 | `<leader>ei`      | `:InlineExplorerInline`        | C: inline the call or expand the macro in place |
 | `<leader>ec`      | (`za`)                         | Fold / unfold the expansion |
-| `u` / `<C-r>`     |                                | Undo / redo |
 | `]e` / `[e`       | `:InlineExplorerNext` / `Prev` | Next / previous expansion |
 | `<leader>el`      | `:InlineExplorerList`          | List expansions in the location list |
 | `gd`              |                                | Open the definition in its own view |
 | `<leader>eu`      | `:InlineExplorerCallers`       | Pick a caller and go there |
-| `<C-o>` / `<C-i>` |                                | Back / forward between views |
 |                   | `:InlineExplorerTrail`         | List the visited views |
 | `<leader>eq`      | `:InlineExplorerClose`         | Close the reading view |
 |                   | `:InlineExplorerToggleMode`    | Switch inline mode (`correct` / `readable`) |
@@ -103,14 +101,6 @@ expansions around the cursor (`do_work > helper`):
 ```lua
 vim.o.statusline = "%f %{v:lua.require'inline-explorer'.breadcrumb()} %=%l:%c"
 ```
-
-## Navigating
-
-The last 8 views you visited keep their expansions as you move with
-`<C-o>` / `<C-i>`. Callers come from the language
-server (`[lsp]`) or, if it cannot list them, from `rg`/`grep` confirmed by
-tree-sitter (`[grep]`, which cannot tell same-named `static` functions
-apart).
 
 ## Inline substitution (C)
 
