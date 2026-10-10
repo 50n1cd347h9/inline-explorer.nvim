@@ -104,7 +104,7 @@ expansions around the cursor (`do_work > helper`):
 vim.o.statusline = "%f %{v:lua.require'inline-explorer'.breadcrumb()} %=%l:%c"
 ```
 
-### Navigating
+## Navigating
 
 The last 8 views you visited keep their expansions as you move with
 `<C-o>` / `<C-i>`. Callers come from the language
@@ -157,7 +157,6 @@ Start with `:checkhealth inline-explorer`.
 If expansions feel slow, `:InlineExplorerProfile on`, expand a few things,
 then `:InlineExplorerProfile` for a report (`open` shows the full log).
 Please attach the log to performance reports.
-
 
 ## Contributing
 
