@@ -132,7 +132,7 @@ do
   check("collision: rename planned", p.ir.rename.t == "t__ie1", p.ir.rename)
 end
 
--- Tab-indented caller -> unit is a tab.
+-- Tab-indented caller -> ctx.indent_unit is a tab.
 do
   local p = assert(S._probe("static int caller(int n)\n{\n\treturn acc(n) + 1;\n}", simple_callee, "acc"))
   check("tab caller: ctx.indent_unit is tab", p.ctx.indent_unit == "\t", p.ctx.indent_unit)

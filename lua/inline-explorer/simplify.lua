@@ -9,25 +9,27 @@ local M = {}
 -- Collapse redundant paren nests: every parenthesized_expression whose only
 -- named child is itself a parenthesized_expression loses its outer pair
 -- (`((X))` -> `(X)`), which is always semantics-preserving in C. The fragment
--- is parsed inside a function-body wrapper so both expressions and statements
--- get expression context; on any parse error the text is returned untouched
--- (simplification must never be able to corrupt a splice).
+-- is parsed inside a dummy function body, either as the right-hand side of an
+-- assignment (an expression) or on its own (a statement). If neither parses
+-- without errors, the text is returned untouched, so simplification can never
+-- corrupt a splice.
 function M.parens(text)
-  -- A bare expression needs an assignment + semicolon to be a valid statement;
-  -- a statement fragment (do-while, ...) needs neither. Try both wrappers and
-  -- take the first that parses clean.
+  -- The expression wrapper comes first, then the statement wrapper (for a
+  -- do-while and the like). The first one that parses cleanly is used.
   local wrappers = {
     { pre = "void __ie_w(void) {\n__ie_sink =\n", post = "\n;\n}\n" },
     { pre = "void __ie_w(void) {\n", post = "\n}\n" },
   }
-  local wrapped, prefix, postfix, root
+  local chosen, wrapped, root
   for _, w in ipairs(wrappers) do
-    local cand = w.pre .. text .. w.post
-    local ok, parser = pcall(vim.treesitter.get_string_parser, cand, "c")
+    local candidate = w.pre .. text .. w.post
+    local ok, parser = pcall(vim.treesitter.get_string_parser, candidate, "c")
     if ok and parser then
       local r = parser:parse()[1]:root()
       if not r:has_error() then
-        wrapped, prefix, postfix, root = cand, w.pre, w.post, r
+        chosen = w
+        wrapped = candidate
+        root = r
         break
       end
     end
@@ -36,14 +38,15 @@ function M.parens(text)
     return text
   end
 
-  -- Byte positions (0-based, within `wrapped`) of paren pairs to drop.
+  -- Byte positions (0-based, within `wrapped`) of the parens to drop.
   local cuts = {}
   local function walk(node)
     if node:type() == "parenthesized_expression" and node:named_child_count() == 1 then
       local child = node:named_child(0)
       if child:type() == "parenthesized_expression" then
-        cuts[#cuts + 1] = csrc.start_byte(node) -- the '('
-        cuts[#cuts + 1] = csrc.end_byte(node) - 1 -- the ')'
+        -- The outer '(' is node's first byte, and the outer ')' its last.
+        cuts[#cuts + 1] = csrc.start_byte(node)
+        cuts[#cuts + 1] = csrc.end_byte(node) - 1
       end
     end
     for c in node:iter_children() do
@@ -55,15 +58,18 @@ function M.parens(text)
     return text
   end
 
+  -- Cut back to front, so each deletion leaves the positions still to cut
+  -- where they were. out:sub(1, pos) is the text before 0-based `pos`, and
+  -- out:sub(pos + 2) the text after it.
   table.sort(cuts, function(a, b)
     return a > b
   end)
   local out = wrapped
-  for _, byte in ipairs(cuts) do
-    out = out:sub(1, byte) .. out:sub(byte + 2)
+  for _, pos in ipairs(cuts) do
+    out = out:sub(1, pos) .. out:sub(pos + 2)
   end
-  -- Unwrap: strip the wrapper prefix and postfix.
-  return out:sub(#prefix + 1, #out - #postfix)
+  -- Strip the wrapper again.
+  return out:sub(#chosen.pre + 1, #out - #chosen.post)
 end
 
 return M

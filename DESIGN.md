@@ -67,8 +67,10 @@ Mechanism:
   decay to pointers), so a NULL/`0` argument keeps the right pointer type;
   `__auto_type` is a fallback for exotic declarators (e.g. function pointers).
   This preserves call-by-value.
-- Straight-line single-return functions render as a *pretty hoist* (setup lifted
-  above the call statement, return expression spliced in, parenthesised).
+- A callee whose only `return` is its last statement and carries a value
+  renders as a *pretty hoist* (setup lifted above the call statement, return
+  expression spliced in, parenthesised) when the call runs unconditionally;
+  readable mode uses it either way.
 - Everything else renders as a GNU statement expression `({ ... })` with each
   `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and the
   reconstructed declared return type as `__ie_retN`'s value slot. This makes

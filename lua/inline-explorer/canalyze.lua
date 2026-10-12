@@ -1,26 +1,17 @@
--- Analysis layer: resolves the callee into a small IR, the call site into
--- a ctx, and decide() picks a printer -- the single judgement point of the
--- whole engine. Layout is left entirely to inline-explorer.cprint.
+-- Analysis layer: resolves the callee into a small IR and the call site into
+-- a ctx, and decide() picks the printer from them. Every judgement the engine
+-- makes is here; layout is left entirely to inline-explorer.cprint.
 local csrc = require("inline-explorer.csrc")
 
 local M = {}
 
--- Declarator identifier names visible where the call sits.
---
--- Normally that is the caller's enclosing function. When tree-sitter cannot
--- build one -- a preprocessor conditional straddling braces turns the region
--- into an ERROR node, which is ordinary kernel style -- there is no
--- function_definition ancestor to scope by. Returning nothing there would
--- switch collision renaming off silently, and a callee parameter sharing a
--- name with a caller variable would be emitted as `T name = (name);`, whose
--- initialiser C resolves to the new, uninitialised local. So fall back to the
--- whole translation unit: this narrows that common silent defect at the cost
--- of renaming more aggressively than strictly necessary. That trade is only
--- safe because the rename pass below is total over the callee body -- every
--- occurrence of a renamed name, call position included, is renamed with it,
--- so a name the callee declares consistently means the callee's own
--- declaration everywhere it appears, never a stale reference to whatever it
--- shadowed.
+-- Returns the set of names declared in the caller's enclosing function (its
+-- parameters and locals), which the callee's names are checked against for
+-- collisions. Without an enclosing function_definition (an #ifdef straddling
+-- braces can turn it into an ERROR node), every name declared in the
+-- translation unit is collected instead. A missed collision compiles to
+-- wrong code, such as a binding `int x = (x);` that reads the new,
+-- uninitialised x, while an extra rename is harmless (see plan_body_edits).
 function M.names_in_scope(call, src)
   local scope = call
   while scope and scope:type() ~= "function_definition" do
@@ -30,13 +21,10 @@ function M.names_in_scope(call, src)
     end
     scope = parent
   end
-  local set = {}
-  -- One combined query, one walk. Three separate iter_captures passes over
-  -- the same scope measured 71.3ms against 26.9ms combined (p50/11, 20k-line
-  -- file, whole-TU fallback scope) -- 2.65x for a semantically identical
-  -- match set, since tree-sitter matches all of a query's patterns in a
-  -- single traversal. The declaration pattern still covers array/pointer
-  -- declarators, not just plain identifiers.
+  local names = {}
+  -- One query with three patterns, so `scope` is walked once. The `(_)`
+  -- declarator also matches pointer and array declarators, and decl_name
+  -- extracts the identifier from them.
   local q = [[
     (parameter_declaration declarator: (_) @d)
     (init_declarator declarator: (_) @d)
@@ -45,51 +33,19 @@ function M.names_in_scope(call, src)
   for _, d in ipairs(csrc.query_nodes(scope, src, q)) do
     local nm = csrc.decl_name(d, src)
     if nm then
-      set[nm] = true
+      names[nm] = true
     end
   end
-  return set
+  return names
 end
 
--- Innermost enclosing statement (or declaration) that contains the call.
--- A `for`-loop's initializer/condition/update clauses are grammatically a
--- `declaration`/expression directly parented by `for_statement`, not a
--- standalone statement in a statement list -- if the climb lands on one of
--- those, keep climbing to the `for_statement` itself so it is treated as a
--- loop header (see analyze_context's `unconditional`), not as an ordinary
--- statement to hoist above. The for's unbraced `body` child IS a legitimate
--- statement target and must still be returned as-is.
-local function enclosing_statement(call)
-  local n = call
-  while n do
-    local t = n:type()
-    if t:match("_statement$") or t == "declaration" then
-      local parent = n:parent()
-      if parent and parent:type() == "for_statement" and parent:field("body")[1] ~= n then
-        n = parent -- for-header clause: keep climbing, re-check the for_statement itself
-      else
-        return n
-      end
-    else
-      n = n:parent()
-    end
-  end
-  return call
-end
-
--- ---------------------------------------------------------------------------
--- Analysis: resolve the callee into a small IR and the call site into a ctx,
--- so that a single decision point picks one of three "dumb" printers. The
--- printers do layout only; every judgement lives in analyze_* / decide.
--- ---------------------------------------------------------------------------
-
--- Names hoisted into the caller scope -- the callee's parameters and its
--- top-level body locals -- that would collide with a name the caller
--- already has in `scope`, each mapped to name__ieN.
-local function plan_renames(params, stmts, callee_src, scope, N)
+-- Returns renames for the names hoisted into the caller (the callee's
+-- parameters and top-level locals) that collide with caller_names, as
+-- name -> name__ieN.
+local function plan_renames(params, stmts, callee_src, caller_names, N)
   local rename = {}
   local function maybe_rename(nm)
-    if nm and scope[nm] then
+    if nm and caller_names[nm] then
       rename[nm] = nm .. "__ie" .. N
     end
   end
@@ -98,10 +54,9 @@ local function plan_renames(params, stmts, callee_src, scope, N)
   end
   for _, s in ipairs(stmts) do
     if s:type() == "declaration" then
-      -- Every declarator shape, as names_in_scope collects them: an
-      -- uninitialized `int *p;` or `int a[2];` sits directly under the
-      -- declaration as a pointer/array declarator, and missing it left the
-      -- name unrenamed -- a redeclaration when the caller had it in scope.
+      -- Match every declarator shape, as names_in_scope does: `int *p;` and
+      -- `int a[2];` put a pointer or array declarator directly under the
+      -- declaration.
       for _, d in ipairs(csrc.query_nodes(s, callee_src, "(declaration declarator: (_) @d)")) do
         maybe_rename(csrc.decl_name(d, callee_src))
       end
@@ -110,10 +65,13 @@ local function plan_renames(params, stmts, callee_src, scope, N)
   return rename
 end
 
--- Body edits on callee_src (absolute bytes): label suffixing + collision
--- renames. Disjoint from the return edits the printers make.
+-- Returns edits on callee_src, each { start_byte, end_byte, replacement },
+-- that suffix the body's labels and apply `rename`. They never overlap the
+-- edits cprint makes to `return` keywords and semicolons.
 local function plan_body_edits(body, callee_src, rename, N)
   local edits = {}
+  -- Labels have function scope, so a second expansion into the same caller
+  -- would otherwise define them again.
   local function suffix_label(n)
     edits[#edits + 1] = { csrc.start_byte(n), csrc.end_byte(n), csrc.text(n, callee_src) .. "__ie" .. N }
   end
@@ -124,13 +82,11 @@ local function plan_body_edits(body, callee_src, rename, N)
     suffix_label(n)
   end
   if next(rename) then
+    -- rename's keys are names the callee declares itself, so in its body
+    -- every occurrence refers to that declaration and is renamed with it,
+    -- `name(...)` in call position included.
     for _, id in ipairs(csrc.query_nodes(body, callee_src, "(identifier) @i")) do
       local r = rename[csrc.text(id, callee_src)]
-      -- rename's keys are names the callee itself declares (its params and
-      -- top-level body locals), so a renamed name shadows any same-named
-      -- caller-scope function -- every occurrence in the body, including
-      -- `name(...)` in call position, refers to the callee's own
-      -- declaration and must be renamed along with it.
       if r then
         edits[#edits + 1] = { csrc.start_byte(id), csrc.end_byte(id), r }
       end
@@ -139,27 +95,38 @@ local function plan_body_edits(body, callee_src, rename, N)
   return edits
 end
 
--- IR: everything the printers need to know about the callee.
---   params/rename   parameter list and planned collision renames (name__ieN)
---   stmts/returns   body statement nodes and return_statement nodes
---   body_edits      label-suffix + rename edits on callee_src (absolute bytes)
---   ret_type        reconstructed declared return type text
---   has_value       whether returns carry an expression
---   simple          straight-line body with a single trailing return
---   ret_var/end_label  injected names, unique per expansion id N
---   binds           bound-parameter lines, populated by inline_call after the
---                   arity check (nil in _probe results)
-function M.analyze_callee(callee_src, fname, N, scope)
-  local fdef, fd = csrc.find_function_def(csrc.parse(callee_src), callee_src, fname)
-  if not fdef then
+-- Analyse fname's definition in callee_src. caller_names is the set from
+-- names_in_scope, and N the expansion id. Returns the IR, or nil and a
+-- reason. The IR holds everything the printers need to know about the
+-- callee:
+--   src         callee_src, which the nodes and byte offsets below refer to
+--   params      the parameters, as csrc.get_params returns them
+--   rename      collision renames for parameters and top-level locals,
+--               name -> name__ieN
+--   stmts       the body's top-level statement nodes
+--   returns     every return_statement node in the body
+--   body_edits  the label-suffix and rename edits on src (see plan_body_edits)
+--   ret_type    the declared return type, reconstructed as text
+--   has_value   whether the returns carry a value (judged by the first one;
+--               false when there is none)
+--   simple      exactly one return, which is the last top-level statement
+--               and has a value
+--   ret_var     the variable that holds the result, __ie_retN
+--   end_label   the label the returns jump to, __ie_endN
+--   binds       one binding line per parameter, `T name = (arg);`. It is set
+--               by analyze_call_node after the arity check, so _probe results
+--               have none.
+function M.analyze_callee(callee_src, fname, N, caller_names)
+  local fn_def, fn_declarator = csrc.find_function_def(csrc.parse(callee_src), callee_src, fname)
+  if not fn_def then
     return nil, "definition of '" .. fname .. "' not found"
   end
-  local params, variadic = csrc.get_params(fd, callee_src)
+  local params, variadic = csrc.get_params(fn_declarator, callee_src)
   if variadic then
     return nil, "cannot inline variadic function '" .. fname .. "'"
   end
 
-  local body = fdef:field("body")[1]
+  local body = fn_def:field("body")[1]
   local stmts = {}
   for i = 0, body:named_child_count() - 1 do
     stmts[#stmts + 1] = body:named_child(i)
@@ -169,7 +136,7 @@ function M.analyze_callee(callee_src, fname, N, scope)
   end
   local returns = csrc.query_nodes(body, callee_src, "(return_statement) @r")
 
-  local rename = plan_renames(params, stmts, callee_src, scope, N)
+  local rename = plan_renames(params, stmts, callee_src, caller_names, N)
   local body_edits = plan_body_edits(body, callee_src, rename, N)
 
   local last = stmts[#stmts]
@@ -180,7 +147,7 @@ function M.analyze_callee(callee_src, fname, N, scope)
     stmts = stmts,
     returns = returns,
     body_edits = body_edits,
-    ret_type = csrc.return_type(fdef, callee_src),
+    ret_type = csrc.return_type(fn_def, callee_src),
     has_value = returns[1] ~= nil and returns[1]:named_child_count() > 0,
     simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0,
     ret_var = "__ie_ret" .. N,
@@ -188,8 +155,32 @@ function M.analyze_callee(callee_src, fname, N, scope)
   }
 end
 
--- Whether binary expression `n` is a `&&` or `||`: its right operand runs
--- only sometimes.
+-- Returns the innermost statement or declaration that contains the call, or
+-- the call itself when nothing does. The clauses of a for header do not
+-- count: in `for (int i = f(x); ...)` the initializer is a `declaration`
+-- whose parent is the for_statement, so the climb goes on to the
+-- for_statement, a loop header (see is_unconditional). The for's unbraced
+-- body is a real statement and is returned as it is.
+local function enclosing_statement(call)
+  local n = call
+  while n do
+    local node_type = n:type()
+    if node_type:match("_statement$") or node_type == "declaration" then
+      local parent = n:parent()
+      if parent and parent:type() == "for_statement" and parent:field("body")[1] ~= n then
+        n = parent -- a for-header clause: check the for_statement itself next
+      else
+        return n
+      end
+    else
+      n = n:parent()
+    end
+  end
+  return call
+end
+
+-- Returns whether binary expression `n` is a `&&` or `||`, whose right
+-- operand runs only sometimes.
 local function short_circuits(n, src)
   for i = 0, n:child_count() - 1 do
     local ch = n:child(i)
@@ -200,21 +191,21 @@ local function short_circuits(n, src)
   return false
 end
 
--- Whether the call runs whenever its statement `target` does: `target` is
--- a plain statement (not a loop or if header), and no ?: arm or &&/||
--- lies between the call and it.
+-- Returns whether the call runs whenever its statement `target` does:
+-- `target` is a plain statement (not a loop or if header), and no ?: arm or
+-- &&/|| lies between the call and it.
 local function is_unconditional(call, target, caller_src)
-  local t = target:type()
-  if t ~= "return_statement" and t ~= "expression_statement" and t ~= "declaration" then
+  local target_type = target:type()
+  if target_type ~= "return_statement" and target_type ~= "expression_statement" and target_type ~= "declaration" then
     return false
   end
   local n = call
   while n and n ~= target do
-    local ty = n:type()
-    if ty == "conditional_expression" then
+    local node_type = n:type()
+    if node_type == "conditional_expression" then
       return false
     end
-    if ty == "binary_expression" and short_circuits(n, caller_src) then
+    if node_type == "binary_expression" and short_circuits(n, caller_src) then
       return false
     end
     n = n:parent()
@@ -222,58 +213,47 @@ local function is_unconditional(call, target, caller_src)
   return true
 end
 
--- ctx: everything the printers need to know about the call site.
---   can_insert_above  lines may be inserted directly above the enclosing
---                   statement: it sits directly inside a {} block AND starts
---                   its own line. If not, hoisting printers wrap the statement
---                   in a block instead -- a declaration cannot follow an
---                   unbraced if body, and after a bare label (goto or case) a
---                   declaration is a constraint violation gcc accepts by
---                   default and diagnoses only under -Wpedantic; a statement
---                   sharing its line has nothing to insert above but its
---                   neighbour's line.
---   wrap_unsafe     wrapping would change meaning, so no hoisting printer may
---                   run at all: the target is a declaration that cannot be
---                   hoisted above, either because it does not start its own
---                   line or because its parent is not a compound_statement
---                   (it follows a bare label instead), and a declaration's
---                   scope is the block it sits in, so enclosing it in one
---                   hides the declared name from the rest of the block (see
---                   decide).
---   unconditional   the call is reached unconditionally in a plain statement
---                   (not in a loop/if header, ?: arm, or after &&/||)
---   stmt_bol/indent/unit  layout facts; the source's tabs/spaces are preserved
+-- Analyse the call site. Returns the ctx, which holds everything the printers
+-- need to know about it:
+--   call              the call_expression node
+--   target            the statement or declaration that contains the call
+--                     (see enclosing_statement)
+--   can_insert_above  hoisted lines can go on new lines directly above the
+--                     target. If not, the hoisting printers wrap the target
+--                     in a new block instead.
+--   wrap_unsafe       the target is a declaration that lines cannot be
+--                     inserted above, so it must not be wrapped (see decide)
+--   unconditional     the call runs whenever the target does
+--                     (see is_unconditional)
+--   stmt_bol          the byte offset of the start of the target's line
+--   indent            the leading spaces and tabs of that line
+--   indent_unit       one level of indentation: a tab if indent has one,
+--                     else four spaces
 function M.analyze_context(caller_src, call)
   local target = enclosing_statement(call)
-  local t = target:type()
+  local target_type = target:type()
   local unconditional = is_unconditional(call, target, caller_src)
   local stmt_bol = csrc.line_start_byte(target)
+  -- prefix is the text from the start of the target's line up to the target.
   local prefix = caller_src:sub(stmt_bol + 1, csrc.start_byte(target))
-  -- Indentation is the leading space/tab run (form feed and vertical tab are C
-  -- whitespace too, but are not treated as indentation here). Anything else on
-  -- the line before the statement -- `hits++; f(x);`, `case 1: f(x);`,
-  -- `else f(x);` -- is code, and `indent` taking only space and tab is what
-  -- stops it being copied onto every hoisted line. That copy was a real defect
-  -- for `hits++; f(x);`, where it compiled and re-ran the increment once per
-  -- hoisted line; for the label and `else` shapes the parent is a
-  -- case_statement / if_statement, so `can_insert_above` was already false and the
-  -- wrapping printer handled them.
-  --
-  -- `starts_line` is the separate half, and it only bites when the parent IS a
-  -- compound_statement: a statement sharing its line has no line of its own to
-  -- insert above, and inserting at the line's start would put the hoisted
-  -- setup BEFORE the neighbouring statement -- reading an argument the
-  -- neighbour goes on to mutate. So it is not a hoist target: treat it like an
-  -- unbraced body and let the wrapping printer replace it in place.
-  local starts_line = prefix:match("^[ \t]*$") ~= nil
+  -- Only the leading spaces and tabs are indentation. Anything else before
+  -- the target on its line (`hits++;`, `case 1:`, `else`) is code, which must
+  -- not be copied onto every hoisted line.
   local indent = prefix:match("^[ \t]*")
-  local parent_t = target:parent() and target:parent():type()
-  local can_insert_above = starts_line and parent_t == "compound_statement"
+  -- Lines can go directly above the target only if it starts its own line;
+  -- otherwise they would also land above, and run before, the code ahead of
+  -- it on that line. The target must also sit directly in a {} block: lines
+  -- inserted above an unbraced if body would become that body, and C does
+  -- not allow a declaration directly after a label (gcc only diagnoses it
+  -- under -Wpedantic).
+  local starts_line = prefix:match("^[ \t]*$") ~= nil
+  local parent_type = target:parent() and target:parent():type()
+  local can_insert_above = starts_line and parent_type == "compound_statement"
   return {
     call = call,
     target = target,
     can_insert_above = can_insert_above,
-    wrap_unsafe = t == "declaration" and not can_insert_above,
+    wrap_unsafe = target_type == "declaration" and not can_insert_above,
     unconditional = unconditional,
     stmt_bol = stmt_bol,
     indent = indent,
@@ -281,26 +261,20 @@ function M.analyze_context(caller_src, call)
   }
 end
 
--- The single decision point: which printer renders this expansion.
---   pretty          simple callee, and hoisting is provably safe (or the user
---                   asked for readable output, which tolerates the risk)
---   readable_multi  readable mode for everything else: no ({...})/goto, may
---                   not preserve semantics (documented trade-off)
---   canonical       the always-correct GNU statement expression + goto form
+-- Returns the name of the printer that renders the expansion. In correct
+-- mode it is "pretty" for a simple callee (see the IR) whose call runs
+-- unconditionally, and "canonical" (a GNU statement expression with goto,
+-- valid in any expression context) otherwise. Readable mode avoids ({...})
+-- and goto: it picks "pretty" for any simple callee and "readable_multi" for
+-- the rest, and its output may not compile or keep the callee's meaning
+-- (early returns, labels, short-circuits).
 function M.decide(ir, ctx, mode)
-  -- Both hoisting printers fall back to wrapping the target in a block when it
-  -- is not `can_insert_above`, and that is scope-neutral for a statement but not for a
-  -- declaration: the declared name would become local to the new block and the
-  -- rest of the enclosing block would see whatever it shadowed instead --
-  -- compiling silently, running differently. The canonical printer splices
-  -- `({ ... })` where the call was and never moves the declaration, so it is
-  -- the only safe rendering -- and canonical form is not just `({...})`: it
-  -- always rewrites every `return` via `goto __ie_endN;` / `__ie_endN:;` to
-  -- reach the result, regardless of how many returns the callee has. This
-  -- holds in readable mode too: readable's contract is that it never emits
-  -- `({...})` OR `goto`, and this is its one exception, suspending the whole
-  -- no-statement-expression-and-no-goto guarantee for this one case, because
-  -- the alternative is wrong rather than merely ugly.
+  -- A declaration that lines cannot be inserted above would be wrapped in a
+  -- new block, which changes its scope: the rest of the enclosing block would
+  -- see whatever it shadowed rather than the declaration. Canonical splices
+  -- ({...}) in place of the call and leaves the declaration where it is. This
+  -- applies in readable mode too: it is the one case where readable output
+  -- contains ({...}) and goto, because the alternative is wrong code.
   if ctx.wrap_unsafe then
     return "canonical"
   end
@@ -313,14 +287,11 @@ function M.decide(ir, ctx, mode)
   return "canonical"
 end
 
--- Full analysis for one call: locate the occurrence, build the IR (including
--- binds, so arity is checked here) and the ctx. Shared by inline_call and the
--- _render test hook so the two can never drift apart.
+-- Full analysis of the occ-th call to fname in caller_src. Returns ir (with
+-- binds) and ctx, or nil, nil and a reason. inline_call and the _render test
+-- hook share it, so the two cannot drift apart.
 function M.analyze_call(caller_src, callee_src, fname, N, occ)
-  -- find_calls stops at the occ-th match instead of materializing every
-  -- call in the file: occ=1 (the default) paid the whole-file walk --
-  -- 28.9ms of analyze_call's 28.2ms p50 on a 22k-line kernel file,
-  -- against 0.7ms stopping early.
+  -- find_calls stops at the occ-th match and returns the matches so far.
   local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ)[occ]
   if not call then
     return nil, nil, "call to '" .. fname .. "' not found"
@@ -328,9 +299,12 @@ function M.analyze_call(caller_src, callee_src, fname, N, occ)
   return M.analyze_call_node(caller_src, callee_src, fname, N, call)
 end
 
--- analyze_call for a call node already located (the cursor's).
+-- analyze_call for a call node already located (the one under the cursor).
+-- It builds the IR, binds the call's arguments to the parameters, and builds
+-- the ctx. Returns ir and ctx, or nil, nil and a reason.
 function M.analyze_call_node(caller_src, callee_src, fname, N, call)
-  local ir, err = M.analyze_callee(callee_src, fname, N, M.names_in_scope(call, caller_src))
+  local caller_names = M.names_in_scope(call, caller_src)
+  local ir, err = M.analyze_callee(callee_src, fname, N, caller_names)
   if not ir then
     return nil, nil, err
   end
