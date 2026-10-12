@@ -1,7 +1,9 @@
--- :checkhealth inline-explorer -- one-stop diagnosis of everything the
--- Troubleshooting table in the README covers: Neovim version, language
--- servers and their capabilities, tree-sitter parsers, and (for C) whether
+-- :checkhealth inline-explorer. It checks everything the Troubleshooting
+-- table in the README covers: the Neovim version, the language servers and
+-- their capabilities, the tree-sitter parser, and (for C and C++) whether
 -- clangd can find a compile_commands.json.
+local macro = require("inline-explorer.macro")
+
 local M = {}
 
 local health = vim.health
@@ -14,20 +16,21 @@ local function check_version()
   end
 end
 
-local function check_client(c)
-  local caps = c.server_capabilities or {}
+-- Report which of the requests the plugin relies on `client` supports.
+local function check_client(client)
+  local caps = client.server_capabilities or {}
   if caps.workspaceSymbolProvider then
-    health.ok(("%s: workspace/symbol supported (name resolution)"):format(c.name))
+    health.ok(("%s: workspace/symbol supported (name resolution)"):format(client.name))
   else
-    health.error(("%s: no workspace/symbol -- symbol resolution will fail"):format(c.name))
+    health.error(("%s: no workspace/symbol -- symbol resolution will fail"):format(client.name))
   end
   if caps.documentSymbolProvider then
-    health.ok(("%s: documentSymbol supported (definition ranges)"):format(c.name))
+    health.ok(("%s: documentSymbol supported (definition ranges)"):format(client.name))
   else
-    health.warn(("%s: no documentSymbol -- falling back to tree-sitter extraction"):format(c.name))
+    health.warn(("%s: no documentSymbol -- falling back to tree-sitter extraction"):format(client.name))
   end
-  if c.name == "clangd" then
-    if require("inline-explorer.macro").supports_tweak(c) then
+  if client.name == "clangd" then
+    if macro.supports_tweak(client) then
       health.ok("clangd: applyTweak supported (ExpandMacro path)")
     else
       health.warn("clangd: no applyTweak -- macro expansion uses hover scraping only")
@@ -35,7 +38,7 @@ local function check_client(c)
   end
 end
 
--- Language servers on the buffer.
+-- Report each language server attached to `bufnr`, or warn that there is none.
 local function check_clients(bufnr)
   local clients = vim.lsp.get_clients({ bufnr = bufnr })
   if #clients == 0 then
@@ -44,21 +47,20 @@ local function check_clients(bufnr)
       "expansion fails with 'no language server attached' without one",
     })
   end
-  for _, c in ipairs(clients) do
-    check_client(c)
+  for _, client in ipairs(clients) do
+    check_client(client)
   end
 end
 
--- tree-sitter parser for the filetype.
+-- Report whether the tree-sitter parser for filetype `ft` is installed.
 local function check_parser(ft)
   local lang = vim.treesitter.language.get_lang(ft) or ft
   if pcall(vim.treesitter.language.inspect, lang) then
-    health.ok(
-      ("tree-sitter parser for '%s' installed (view highlighting, extraction fallback%s)"):format(
-        lang,
-        lang == "c" and ", inline substitution" or ""
-      )
-    )
+    local used_for = "view highlighting, extraction fallback"
+    if lang == "c" then
+      used_for = used_for .. ", inline substitution"
+    end
+    health.ok(("tree-sitter parser for '%s' installed (%s)"):format(lang, used_for))
   else
     health.warn(("no tree-sitter parser for '%s'"):format(lang), {
       ":TSInstall " .. lang,
@@ -67,13 +69,18 @@ local function check_parser(ft)
   end
 end
 
--- compile_commands.json, searched upward of the buffer's file.
+-- Report whether a compile_commands.json exists in the directory of
+-- `bufnr`'s file or in any directory above it.
 local function check_compile_commands(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr)
-  local found = vim.fs.find("compile_commands.json", {
-    upward = true,
-    path = bufname ~= "" and vim.fs.dirname(bufname) or nil,
-  })[1]
+  -- An unnamed buffer has no directory; with no path, vim.fs.find starts
+  -- from the current directory.
+  local start_dir
+  if bufname ~= "" then
+    start_dir = vim.fs.dirname(bufname)
+  end
+  local matches = vim.fs.find("compile_commands.json", { upward = true, path = start_dir })
+  local found = matches[1]
   if found then
     health.ok("compile_commands.json found: " .. found)
   else
@@ -84,6 +91,8 @@ local function check_compile_commands(bufnr)
   end
 end
 
+-- Check the current buffer: its language servers, its parser and, for C and
+-- C++, its compile_commands.json.
 function M.check()
   health.start("inline-explorer")
   check_version()

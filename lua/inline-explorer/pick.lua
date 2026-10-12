@@ -1,13 +1,14 @@
--- Picker glue: callers.get / resolver.locate_definition on one side,
--- trail.goto_location on the other, the plugin's own floating list
--- (select.lua) in the middle -- j/k move because it is a real window,
--- not because anything implements them. vim.ui.select was the first
--- middle and was dropped: stock nvim resolves it to inputlist(), a
--- type-a-number prompt, and whether j/k exist must not depend on which
--- UI plugin happens to be installed.
+-- Commands on the identifier under the cursor:
+--   M.callers lists its callers in a picker (select.lua) and goes to the
+--     chosen call;
+--   M.definition goes straight to its definition.
+-- Both move with trail.goto_location, which shows the target in a reading
+-- view and records the move on the navigation trail.
 local callers = require("inline-explorer.callers")
-local trail = require("inline-explorer.trail")
+local resolver = require("inline-explorer.resolver")
 local select_ui = require("inline-explorer.select")
+local trail = require("inline-explorer.trail")
+local view = require("inline-explorer.view")
 local util = require("inline-explorer.util")
 
 local M = {}
@@ -16,64 +17,57 @@ local function word_under_cursor()
   return vim.fn.expand("<cword>")
 end
 
--- The buffer to resolve against: a view's queries go through its source
--- buffer (which has the LSP clients); a plain buffer is its own source.
+-- The buffer to look names up from: a reading view's source buffer (the one
+-- the language servers are attached to), or the current buffer when it is
+-- not a view.
 local function source_buf()
-  local cur = vim.api.nvim_get_current_buf()
-  local st = require("inline-explorer.view").state[cur]
-  return st and st.source_bufnr or cur
+  local st = view.current()
+  return st and st.source_bufnr or vim.api.nvim_get_current_buf()
 end
 
--- The prelude both pickers share: a done() that fires done_cb if given,
--- and the identifier to act on -- nil (after warning and calling done)
--- when there is none.
-local function begin(done_cb, name)
-  local function done()
-    if done_cb then
-      done_cb()
-    end
-  end
+-- A picker row for a callers.get item: the calling function, the file and
+-- line of the call, and the text of that line.
+local function format_caller(item)
+  return ("%s  %s:%d  │ %s"):format(
+    item.name,
+    vim.fn.fnamemodify(vim.uri_to_fname(item.uri), ":t"),
+    item.range.start.line + 1,
+    item.text
+  )
+end
+
+-- List the callers of the identifier under the cursor in a picker, and go to
+-- the chosen call. `name_override` is an identifier to look up instead of the
+-- word under the cursor. `done_cb` is called once when the flow ends (a
+-- choice, a cancel, or nothing to show); tests use it to wait. Interactive
+-- callers pass neither.
+function M.callers(done_cb, name_override)
+  local done = done_cb or function() end
+  local name = name_override or word_under_cursor()
   if name == "" then
     util.notify("no identifier under the cursor", vim.log.levels.WARN)
     done()
-    return nil, done
-  end
-  return name, done
-end
-
--- opts_name overrides the word under the cursor (tests, command args).
--- done_cb fires exactly once, after the flow settles (tests need a seam;
--- interactive use passes nothing).
-function M.callers(done_cb, opts_name)
-  local name, done = begin(done_cb, opts_name or word_under_cursor())
-  if not name then
     return
   end
-  callers.get(name, source_buf(), function(items, source, err)
+  callers.get(name, source_buf(), function(items, provider, note)
     if #items == 0 then
-      -- Never an empty picker: "0 callers" must not read as "nobody calls
-      -- this" -- the index may simply not have finished.
-      util.notify(
-        ("no callers of '%s' found%s (the server's index may be incomplete)"):format(
-          name,
-          err and (" -- " .. err) or ""
-        ),
-        vim.log.levels.INFO
-      )
-      return done()
+      -- No empty picker: the message says the index may be incomplete, so
+      -- "0 callers" does not read as "nobody calls this".
+      local msg = ("no callers of '%s' found"):format(name)
+      if note then
+        msg = msg .. " -- " .. note
+      end
+      util.notify(msg .. " (the server's index may be incomplete)", vim.log.levels.INFO)
+      done()
+      return
     end
-    local title = ("callers of %s — %d [%s]%s"):format(name, #items, source, err and (" (" .. err .. ")") or "")
-    select_ui.open(items, {
-      prompt = title,
-      format_item = function(it)
-        return ("%s  %s:%d  │ %s"):format(
-          it.name,
-          vim.fn.fnamemodify(vim.uri_to_fname(it.uri), ":t"),
-          it.range.start.line + 1,
-          it.text
-        )
-      end,
-    }, function(choice)
+    -- For example "callers of kfree — 12 [lsp]", or
+    -- "callers of foo — 37 [grep] (truncated at 200 matches)".
+    local title = ("callers of %s — %d [%s]"):format(name, #items, provider)
+    if note then
+      title = title .. " (" .. note .. ")"
+    end
+    select_ui.open(items, { prompt = title, format_item = format_caller }, function(choice)
       if choice then
         trail.goto_location(choice)
       end
@@ -82,15 +76,22 @@ function M.callers(done_cb, opts_name)
   end)
 end
 
+-- Go to the definition of the identifier under the cursor. resolver's
+-- locate_definition follows a declaration to its definition when it can.
+-- `done_cb` is called once when the flow ends; tests use it to wait.
 function M.definition(done_cb)
-  local name, done = begin(done_cb, word_under_cursor())
-  if not name then
+  local done = done_cb or function() end
+  local name = word_under_cursor()
+  if name == "" then
+    util.notify("no identifier under the cursor", vim.log.levels.WARN)
+    done()
     return
   end
-  require("inline-explorer.resolver").locate_definition(name, source_buf(), function(loc, _, _, err)
+  resolver.locate_definition(name, source_buf(), function(loc, _lines, _label, err)
     if not loc then
       util.notify(err or ("no definition found for '" .. name .. "'"), vim.log.levels.INFO)
-      return done()
+      done()
+      return
     end
     trail.goto_location(loc)
     done()

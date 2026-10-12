@@ -3,7 +3,7 @@ local M = {}
 
 -- Wrap `cb` so it fires exactly once: either with the real response (via the
 -- returned `finish`) or, after `ms` milliseconds, with whatever `on_timeout`
--- produces. Late calls to `finish` are dropped silently.
+-- returns. Calls to `finish` after the first are dropped silently.
 function M.once_with_timeout(cb, on_timeout, ms)
   local finished = false
   local function finish(...)
@@ -14,6 +14,7 @@ function M.once_with_timeout(cb, on_timeout, ms)
     cb(...)
   end
   vim.defer_fn(function()
+    -- Skip on_timeout() entirely when the real response already arrived.
     if not finished then
       finish(on_timeout())
     end
