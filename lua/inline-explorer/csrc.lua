@@ -1,34 +1,29 @@
--- Low-level tree-sitter/text helpers for C source: parsing, byte-range
--- accessors, declarator/type reconstruction, and edit application.
+-- Low-level tree-sitter and text helpers for C source: parsing, node byte
+-- ranges, declarator and type reconstruction, and edit application. Byte
+-- offsets are 0-based and ranges are end-exclusive, as tree-sitter reports
+-- them, so a node's text is src:sub(start_byte + 1, end_byte).
 local util = require("inline-explorer.util")
 
 local M = {}
 
--- Parsed trees, keyed on the exact source text.
+-- Parsed trees, keyed on the exact source text. Several steps of one inline
+-- action parse the same source, and a parse takes time in proportion to the
+-- whole file. Editing the buffer changes the text, so a stale tree is never
+-- returned. Lua interns strings, so the long key costs no hashing per lookup.
 --
--- One smart-inline over a function asks for the SAME caller source's tree
--- twice -- substitute.call_name_at, then substitute.inline_in_buffer (three
--- times before inline_in_buffer handed its call node to the analysis
--- instead of an occurrence number) -- and parsing is proportional to the
--- whole file while the user's action concerns one call. Measured on a
--- 25,007-line file: about 61ms per parse, ~236ms for the three together.
---
--- Keying on the text itself makes invalidation exact rather than a policy:
--- edit the buffer and the string differs, so the entry cannot be reused.
--- Lua interns strings, so the lookup does not re-hash the file on every
--- call. The entry holds the parser and the tree alongside the root as
--- belt and braces, not as a correctness requirement: on this Neovim a
--- TSNode anchors its TSTree through its function environment (verified:
--- a root cached alone survived 50 GC cycles with all children and ranges
--- intact). An earlier version of this comment claimed the opposite.
+-- At most _parse_cache_max entries are kept. An entry's `at` is the
+-- vim.uv.hrtime() of its last use, which util.evict_lru reads to drop the
+-- least recently used entries. The entry also holds the parser and the tree.
+-- A root node keeps its tree alive by itself, so these are only a precaution.
 M._parse_cache_max = 4
 M._parse_cache = {}
 
+-- The root node of `src` parsed as C.
 function M.parse(src)
-  local e = M._parse_cache[src]
-  if e then
-    e.at = vim.uv.hrtime()
-    return e.root
+  local entry = M._parse_cache[src]
+  if entry then
+    entry.at = vim.uv.hrtime()
+    return entry.root
   end
   local parser = vim.treesitter.get_string_parser(src, "c")
   local tree = parser:parse()[1]
@@ -38,21 +33,30 @@ function M.parse(src)
   return root
 end
 
--- TSNode from a string parser exposes byte offsets only via range(true).
+-- Node positions come from node:range(true), which returns
+--   start_row, start_col, start_byte, end_row, end_col, end_byte
+-- where a column is a byte offset within its row.
 function M.start_byte(node)
-  return (select(3, node:range(true)))
+  local _, _, start_byte = node:range(true)
+  return start_byte
 end
+
 function M.end_byte(node)
-  return (select(6, node:range(true)))
+  local _, _, _, _, _, end_byte = node:range(true)
+  return end_byte
 end
+
 function M.start_col(node)
-  return (select(2, node:range(true)))
+  local _, start_col = node:range(true)
+  return start_col
 end
--- Byte offset of the start of the line `node` starts on.
+
+-- Byte offset of the start of the line that `node` starts on.
 function M.line_start_byte(node)
   return M.start_byte(node) - M.start_col(node)
 end
--- The leading space/tab run of the line `node` starts on.
+
+-- The leading spaces and tabs of the line that `node` starts on.
 function M.line_indent(src, node)
   return src:match("^[ \t]*", M.line_start_byte(node) + 1)
 end
@@ -66,60 +70,61 @@ function M.ancestor_at(root, row, col, ty)
   return node
 end
 
+-- The source text of `node`.
 function M.text(node, src)
   return src:sub(M.start_byte(node) + 1, M.end_byte(node))
 end
 
-function M.query_nodes(node, src, q)
+-- All nodes under `node` that `query_text`, a C tree-sitter query, captures.
+function M.query_nodes(node, src, query_text)
   local out = {}
-  for _, n in vim.treesitter.query.parse("c", q):iter_captures(node, src) do
+  for _, n in vim.treesitter.query.parse("c", query_text):iter_captures(node, src) do
     out[#out + 1] = n
   end
   return out
 end
 
--- Descend a declarator to its identifier name (through pointer/array/fn wrappers).
--- NOTE: parenthesized_declarator has no `declarator` field in tree-sitter-c, so
--- fall through it via its first named child (e.g. `int (*fp)(int)`).
+-- The declarator one level inside declarator `d`, or nil. tree-sitter-c gives
+-- parenthesized_declarator no `declarator` field, so its first named child is
+-- used instead: `(*fp)` holds `*fp`.
+local function inner_declarator(d)
+  if d:type() == "parenthesized_declarator" then
+    return d:named_child(0)
+  end
+  return d:field("declarator")[1]
+end
+
+-- The name that declarator `decl` declares: "p" for `*p`, `p[4]`, `(*p)(int)`
+-- or `p = 0`. nil when no name is found, as for the `*` of an unnamed
+-- `char *` parameter.
 function M.decl_name(decl, src)
-  local n = decl
-  while n do
-    if n:type() == "identifier" then
-      return M.text(n, src)
-    end
-    local d = n:field("declarator")[1]
-    if not d and n:type() == "parenthesized_declarator" then
-      d = n:named_child(0)
-    end
-    if not d then
-      return nil
-    end
-    n = d
+  local d = decl
+  while d and d:type() ~= "identifier" do
+    d = inner_declarator(d)
   end
+  if d then
+    return M.text(d, src)
+  end
+  return nil
 end
 
--- Unwrap a function definition's declarator to the function_declarator node.
+-- The function_declarator inside the declarator `decl` of a function
+-- definition, looking through pointer and parenthesized declarators
+-- (`*f(void)`, `(f)(void)`). nil when anything else wraps it.
 function M.func_declarator(decl)
-  local n = decl
-  while n and n:type() ~= "function_declarator" do
-    if n:type() == "pointer_declarator" then
-      n = n:field("declarator")[1]
-    elseif n:type() == "parenthesized_declarator" then
-      n = n:named_child(0) -- no `declarator` field (see decl_name)
-    else
+  local d = decl
+  while d and d:type() ~= "function_declarator" do
+    local t = d:type()
+    if t ~= "pointer_declarator" and t ~= "parenthesized_declarator" then
       return nil
     end
+    d = inner_declarator(d)
   end
-  return n
+  return d
 end
 
--- C type/type-qualifier keywords that can start (or continue) a base type. A
--- leading token outside this set cannot itself be a type -- it is either a
--- storage-class specifier (static, extern, ...) or, per zlib's `#define
--- local static`, a project macro standing in for one. A token after the type
--- has already started that falls outside this set is not part of the type
--- either (e.g. zlib's `ZEXPORT` calling-convention decorator).
-local TYPE_STARTERS = {
+-- C keywords that can make up a base type: type specifiers and qualifiers.
+local TYPE_KEYWORDS = {
   void = true,
   char = true,
   short = true,
@@ -137,24 +142,10 @@ local TYPE_STARTERS = {
   volatile = true,
 }
 
--- Project macros known to stand in for a storage-class specifier in front of
--- a type, confirmed from real source (zlib's `#define local static`, used
--- ahead of typedef return types tree-sitter has no way to recognize as types
--- -- `local block_state deflate_stored(...)`, `local uInt longest_match(...)`
--- -- so no keyword ever appears anywhere in the run to prove `local` isn't
--- the type). Recognizing the macro by name is necessary but not sufficient --
--- no whole-file context is available here (see return_type's callers), so
--- there is no way to tell this apart, by name alone, from `local` instead
--- being a genuine project type (e.g. `typedef long local;`) with an ordinary
--- decorator macro after it that expands to nothing (`local WINAPI f(...)`).
--- Both shapes put a bare identifier in the ERROR sibling; looks_like_bare_decorator
--- below narrows this against a small curated list of known decorator-macro
--- spellings, not a general rule -- it does not resolve the ambiguity for
--- macros outside that list. See its own comment for what that residual is
--- and why the list's default (unrecognized => real type) is the right way
--- to be wrong.
-local KNOWN_LEADING_MACROS = { ["local"] = true }
+-- Keywords that are followed by a tag name, as in `struct foo`.
+local TAG_KEYWORDS = { struct = true, union = true, enum = true }
 
+-- The whitespace-separated tokens of `text`.
 local function tokenize(text)
   local tokens = {}
   for tok in text:gmatch("%S+") do
@@ -163,213 +154,153 @@ local function tokenize(text)
   return tokens
 end
 
-local function has_type_starter(text)
+local function contains_type_keyword(text)
   for tok in text:gmatch("%S+") do
-    if TYPE_STARTERS[tok] then
+    if TYPE_KEYWORDS[tok] then
       return true
     end
   end
   return false
 end
 
--- Calling-convention/visibility decorator macros that vanish at the
--- preprocessor and so appear as a bare identifier immediately after a
--- KNOWN_LEADING_MACROS-spelled type with nothing of their own to contribute
--- to it. The two entries do not rest on the same evidence, and a reader
--- should not assume they do:
---
---   * WINAPI is attested (zconf.h's `#define ZEXPORT WINAPI`, alongside
---     ZEXPORTVA/WINAPIV) and load-bearing -- removing it turns case30 red.
---   * ZEXPORT is precautionary. It is a real zlib name, but no test and no
---     corpus site exercises it here: `local ZEXPORT` occurs nowhere in
---     zlib's .c files, and `z_size_t ZEXPORT deflateBound_z(...)` never
---     reaches this branch at all (`z_size_t` is not in KNOWN_LEADING_MACROS,
---     so the second clause is false whatever this list holds). Removing it
---     changes no test and no real-source result. It is here for symmetry
---     with the convention it belongs to, not because it has been validated
---     the way WINAPI has.
---
--- Capitalization alone is deliberately NOT used as the signal, even though
--- both known entries happen to be ALL-CAPS: an ALL-CAPS single-word type is
--- an ordinary, widespread C convention well outside zlib (Windows SDK
--- style -- DWORD, BOOL, UINT, HANDLE; embedded/systems style -- U32, S8,
--- STATUS, single-letter T), so treating shape alone as proof of "decorator,
--- not type" misfires on exactly the input this guard exists to protect --
--- silently, since the wrong slot type still compiles under zlib's own
--- `#define local static`.
---
--- This name-list is necessarily incomplete: a project's own decorator macro
--- that is neither ZEXPORT nor WINAPI (e.g. a hypothetical EXPORT_API) will
--- not be recognized here, so the KNOWN_LEADING_MACROS-spelled token in
--- front of it will be wrongly read as a genuine type and the decorator
--- spliced in as if it were the type instead. That residual is real and
--- narrower than the shape it replaces: the overwhelmingly common case
--- across every real corpus this engine has been run against is the ERROR
--- sibling BEING the true type (80+ real zlib call sites), which requires a
--- program to have a typedef literally named `local` to go wrong the other
--- way, versus a decorator macro spelled anything other than these two known
--- names to go wrong this way. It is also milder in kind: a decorator that
--- vanishes at the preprocessor leaves the result slot as a bare
--- `__ie_retN;`, which is a compile error, not a wrong value that runs
--- (measured: `local DLLEXPORT f(...)` fails with `'__ie_ret1' undeclared`).
+-- The base type in `text`, a run of tokens such as `local unsigned long` or
+-- `block_state`. The type starts at the first type keyword (tokens before it
+-- are macros like zlib's `local`), or at the first token when there is no
+-- keyword. It goes on while the next token is a type keyword or the tag after
+-- struct/union/enum, so a trailing macro such as `ZEXPORT` is left out.
+local function base_type_from_run(text)
+  local tokens = tokenize(text)
+  if #tokens == 0 then
+    return "int" -- C's implicit int
+  end
+  local first = 1
+  for i, tok in ipairs(tokens) do
+    if TYPE_KEYWORDS[tok] then
+      first = i
+      break
+    end
+  end
+  local last = first
+  while last < #tokens and (TYPE_KEYWORDS[tokens[last + 1]] or TAG_KEYWORDS[tokens[last]]) do
+    last = last + 1
+  end
+  return table.concat(tokens, " ", first, last)
+end
+
+-- Identifiers that a project #defines to a storage-class keyword, such as
+-- zlib's `#define local static`. In `local block_state f(...)`, tree-sitter
+-- takes such a macro for the return type (see return_base_type).
+local KNOWN_LEADING_MACROS = { ["local"] = true }
+
+-- Calling-convention and export macros that expand to nothing, such as the
+-- `WINAPI` in `local WINAPI f(...)`. Other such macros are not recognized.
 local KNOWN_DECORATOR_MACROS = { ZEXPORT = true, WINAPI = true }
 
-local function looks_like_bare_decorator(text)
+-- Whether `text` is a single token that is in KNOWN_DECORATOR_MACROS.
+local function is_single_known_decorator(text)
   local tokens = tokenize(text)
   return #tokens == 1 and KNOWN_DECORATOR_MACROS[tokens[1]] == true
 end
 
--- Reconstruct a base type from a run of text known (by the guards at each
--- call site below) to contain a real type keyword somewhere, but which may
--- also carry an unrecognized leading macro (zlib's `local`, standing in for
--- `static`). Leading tokens are dropped only while a recognized type
--- keyword still appears later in the run -- that is the signature of a
--- leading macro. Once positioned on the first real token, further keyword
--- tokens are folded in (`unsigned long`, `struct foo`) but the first
--- non-keyword token ends the type -- so a *trailing* decorator (`ZEXPORT`)
--- is left out, matching what field("type") alone already does when it
--- isolates the real type correctly on its own.
-local function base_type_from_run(text)
-  local tokens = tokenize(text)
-  if #tokens == 0 then
-    return "int"
-  end
-  local i = 1
-  while i < #tokens and not TYPE_STARTERS[tokens[i]] do
-    local starter_ahead = false
-    for j = i + 1, #tokens do
-      if TYPE_STARTERS[tokens[j]] then
-        starter_ahead = true
-        break
-      end
-    end
-    if not starter_ahead then
-      break
-    end
-    i = i + 1
-  end
-  local out = { tokens[i] }
-  local j = i + 1
-  while true do
-    local last, nxt = out[#out], tokens[j]
-    if (last == "struct" or last == "union" or last == "enum") and nxt and not TYPE_STARTERS[nxt] then
-      out[#out + 1] = nxt -- tag name, e.g. `struct foo`
-      j = j + 1
-    elseif nxt and TYPE_STARTERS[nxt] then
-      out[#out + 1] = nxt
-      j = j + 1
-    else
-      break
-    end
-  end
-  return table.concat(out, " ")
-end
-
--- The base of a function's return type, before any `*`.
+-- The base of the return type of function_definition `def`, without the
+-- `*`s of its declarator. field("type") is used as-is (it already handles
+-- shapes like `CJSON_PUBLIC(cJSON *) f()`), except where tree-sitter misreads
+-- zlib's leading `local` macro:
 --
--- field("type") is trusted by default: it already gets exotic shapes right
--- that a from-scratch text scan would mangle, notably a function-like macro
--- wrapping the type (cJSON's `CJSON_PUBLIC(cJSON *) f(...)`, grammar node
--- `macro_type_specifier`), which must pass through verbatim so it
--- macro-expands correctly at the real call site. One narrow, known-bad shape
--- is corrected instead of doing a blanket rescan: a bare, non-keyword
--- type_identifier (e.g. `local`) with the true type demoted to an
--- immediately following ERROR sibling -- zlib's `local int f(...)` and
--- `local block_state deflate_stored(...)`. Only fires when the ERROR
--- sibling itself contains a recognized type keyword, or its name is on the
--- small KNOWN_LEADING_MACROS allowlist and it is not a bare, single token
--- on the KNOWN_DECORATOR_MACROS name-list (see looks_like_bare_decorator)
--- -- otherwise field("type") is left as-is, which is what keeps zlib's own
--- `z_size_t ZEXPORT deflateBound_z(...)` untouched (ERROR sibling
--- `ZEXPORT`, no keyword, and `z_size_t` is not on the KNOWN_LEADING_MACROS
--- allowlist).
+--   `local unsigned long f()`  The type node is one sized_type_specifier
+--                              holding all three words. The text of every
+--                              sized_type_specifier is rescanned.
+--   `local block_state f()`    The type node is `local`, and the real type is
+--                              in the ERROR node after it. That text is used
+--                              if it contains a type keyword, or if the type
+--                              node is in KNOWN_LEADING_MACROS and the ERROR
+--                              node is not a lone KNOWN_DECORATOR_MACROS name.
 --
--- A sized_type_specifier can be poisoned the same way as the bare-identifier
--- case but with no ERROR sibling to recover from: `local unsigned long`
--- parses as ONE sized_type_specifier spanning all three words. That is
--- handled by rescanning the field's own (self-contained) text.
-local function return_base_type(fdef, src)
-  local ty = fdef:field("type")[1]
+-- The decorator check is needed because `local WINAPI f()` parses the same
+-- way, and there `local` may be a real typedef. An unlisted decorator, as in
+-- `local DLLEXPORT f()`, is taken for the type. `z_size_t ZEXPORT f()` keeps
+-- z_size_t: ZEXPORT holds no keyword, and z_size_t is not a known macro.
+local function return_base_type(def, src)
+  local ty = def:field("type")[1]
   if not ty then
-    return "int"
+    return "int" -- C's implicit int
   end
-  local base = M.text(ty, src)
+  local ty_text = M.text(ty, src)
   if ty:type() == "sized_type_specifier" then
-    return base_type_from_run(base)
+    return base_type_from_run(ty_text)
   end
-  if ty:type() == "type_identifier" and not TYPE_STARTERS[base] then
+  if ty:type() == "type_identifier" and not TYPE_KEYWORDS[ty_text] then
     local sib = ty:next_sibling()
     if sib and sib:type() == "ERROR" then
       local sib_text = M.text(sib, src)
-      if has_type_starter(sib_text) or (KNOWN_LEADING_MACROS[base] and not looks_like_bare_decorator(sib_text)) then
+      local sib_has_keyword = contains_type_keyword(sib_text)
+      local macro_before_typedef = KNOWN_LEADING_MACROS[ty_text] and not is_single_known_decorator(sib_text)
+      if sib_has_keyword or macro_before_typedef then
         return base_type_from_run(sib_text)
       end
     end
   end
-  return base
+  return ty_text
 end
 
--- How many `*` the declarator adds to the return type: 2 for `char **f(void)`.
+-- How many `*` the declarator `decl` adds to the return type: 2 for
+-- `char **f(void)`. Only pointer_declarators are walked, so a
+-- parenthesized_declarator ends the count: `char (*f(void))` gives 0.
 local function pointer_depth(decl)
   local depth, d = 0, decl
-  while d do
-    local t = d:type()
-    if t == "pointer_declarator" then
-      depth = depth + 1
-      d = d:field("declarator")[1]
-    elseif t == "parenthesized_declarator" then
-      d = d:field("declarator")[1]
-    else
-      break -- function_declarator or anything unexpected
-    end
+  while d and d:type() == "pointer_declarator" do
+    depth = depth + 1
+    d = inner_declarator(d)
   end
   return depth
 end
 
--- Reconstruct a function's declared return type text (base type + pointer depth),
--- so the statement-expression result slot does not depend on body-local names the
--- way `__typeof__(return expr)` would.
-function M.return_type(fdef, src)
-  local base = return_base_type(fdef, src)
-  local depth = pointer_depth(fdef:field("declarator")[1])
+-- The declared return type of function_definition `def` as text: the base
+-- type plus one `*` per pointer level, e.g. "unsigned long *".
+function M.return_type(def, src)
+  local base = return_base_type(def, src)
+  local depth = pointer_depth(def:field("declarator")[1])
   if depth > 0 then
     return base .. " " .. string.rep("*", depth)
   end
   return base
 end
 
--- A function_definition's name and its function_declarator; nil when the
--- declarator is not a plain (possibly pointer-returning) function.
-function M.function_name(fdef, src)
-  local fd = M.func_declarator(fdef:field("declarator")[1])
-  return fd and M.decl_name(fd:field("declarator")[1], src), fd
+-- Returns name, func_decl: the name of function_definition `def` and its
+-- function_declarator. Both are nil when the declarator is not a plain
+-- (possibly pointer-returning) function.
+function M.function_name(def, src)
+  local func_decl = M.func_declarator(def:field("declarator")[1])
+  if not func_decl then
+    return nil, nil
+  end
+  return M.decl_name(func_decl:field("declarator")[1], src), func_decl
 end
 
+-- Returns def, func_decl: the top-level function_definition named `name`
+-- under `root`, and its function_declarator. nil when there is none.
 function M.find_function_def(root, src, name)
   for i = 0, root:named_child_count() - 1 do
-    local c = root:named_child(i)
-    if c:type() == "function_definition" then
-      local fname, fd = M.function_name(c, src)
-      if fname == name then
-        return c, fd
+    local child = root:named_child(i)
+    if child:type() == "function_definition" then
+      local child_name, func_decl = M.function_name(child, src)
+      if child_name == name then
+        return child, func_decl
       end
     end
   end
 end
 
--- Calls to `name` under `root`, as call_expression nodes. `limit`, when
--- given, stops the walk at the limit-th match: the common caller wants
--- occurrence 1, and collecting every call in the file first paid the
--- whole-file walk for it -- 28.9ms on a 22k-line kernel file against
--- 0.7ms stopping early (p50/11). iter_captures streams, so breaking out
--- really does stop the traversal; query_nodes would have materialized
--- every capture first.
+-- Calls to the function `name` under `root`, as call_expression nodes. With
+-- `limit`, the search stops after that many matches. iter_captures is lazy,
+-- so the rest of the tree is not walked (query_nodes would collect every
+-- capture first).
 function M.find_calls(root, src, name, limit)
   local calls = {}
-  local q = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
-  for _, id in q:iter_captures(root, src) do
-    if M.text(id, src) == name then
-      calls[#calls + 1] = id:parent()
+  local query = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
+  for _, callee in query:iter_captures(root, src) do
+    if M.text(callee, src) == name then
+      calls[#calls + 1] = callee:parent()
       if limit and #calls >= limit then
         break
       end
@@ -378,59 +309,84 @@ function M.find_calls(root, src, name, limit)
   return calls
 end
 
--- Parameters as { name = <string|false>, node = <parameter_declaration> }.
-function M.get_params(fd, src)
-  local out, variadic = {}, false
-  local pl = fd:field("parameters")[1]
-  for i = 0, pl:named_child_count() - 1 do
-    local pc = pl:named_child(i)
-    if pc:type() == "variadic_parameter" then
-      variadic = true
-    elseif pc:type() == "parameter_declaration" then
-      local decl = pc:field("declarator")[1]
-      local ty = pc:field("type")[1]
+-- Returns params, is_variadic for function_declarator `func_decl`.
+--   params:      one { name = ..., node = <parameter_declaration> } per
+--                parameter. name is false or nil when the parameter has none
+--                (`int`, `char *`). The `void` of `f(void)` gives no entry.
+--   is_variadic: whether the parameters include `...`.
+function M.get_params(func_decl, src)
+  local params, is_variadic = {}, false
+  local param_list = func_decl:field("parameters")[1]
+  for i = 0, param_list:named_child_count() - 1 do
+    local child = param_list:named_child(i)
+    if child:type() == "variadic_parameter" then
+      is_variadic = true
+    elseif child:type() == "parameter_declaration" then
+      local decl = child:field("declarator")[1]
       if decl then
-        out[#out + 1] = { name = M.decl_name(decl, src), node = pc }
-      elseif not (ty and M.text(ty, src) == "void") then
-        out[#out + 1] = { name = false, node = pc } -- unnamed, non-void parameter
+        params[#params + 1] = { name = M.decl_name(decl, src), node = child }
+      else
+        local ty = child:field("type")[1]
+        local is_void = ty ~= nil and M.text(ty, src) == "void"
+        if not is_void then
+          params[#params + 1] = { name = false, node = child }
+        end
       end
     end
   end
-  return out, variadic
+  return params, is_variadic
 end
 
--- Build a `<param type> <name> = (arg);` binding. Reconstructs the parameter's
--- declared type (arrays decay to pointers) so a NULL/0 argument keeps the right
--- pointer type; __typeof__/__auto_type of the argument would deduce `int` there.
--- Falls back to __auto_type for exotic declarators (function pointers) or
--- unnamed parameters.
+-- For a parameter declarator built only from `*` and `[]` around a name, such
+-- as `*a[]`: the name's identifier node, and one `*` per level ("**"), since
+-- an array parameter is a pointer. nil for any other shape, such as a
+-- function pointer.
+local function pointer_target(decl)
+  local stars, d = "", decl
+  while d and (d:type() == "pointer_declarator" or d:type() == "array_declarator") do
+    stars = stars .. "*"
+    d = inner_declarator(d)
+  end
+  if d and d:type() == "identifier" then
+    return d, stars
+  end
+  return nil
+end
+
+-- The line `<param type> <name> = (<arg>);` that binds one argument. The
+-- parameter's declared type is rebuilt (arrays decay to pointers), so a NULL
+-- or 0 argument keeps the right pointer type, where __typeof__ or __auto_type
+-- of the argument would deduce `int`. Other declarators (function pointers)
+-- and unnamed parameters get an __auto_type line instead.
+--   param:  an entry from get_params
+--   arg:    the argument's expression text at the call site
+--   rename: parameter name -> the name to declare instead, for a name that
+--           the caller already uses
+--   N:      the id of this inline expansion, which keeps generated names unique
+--   idx:    the parameter's 1-based position, used in a generated name
+--   src:    the callee's source text
 function M.build_bind(param, arg, rename, N, idx, src)
   local decl = param.node:field("declarator")[1]
-  if decl then
-    local stars, d = "", decl
-    while d do
-      local t = d:type()
-      if t == "pointer_declarator" or t == "array_declarator" then
-        stars = stars .. "*"
-        d = d:field("declarator")[1]
-      elseif t == "identifier" then
-        break
-      else
-        d = nil
-      end
-    end
-    if d and d:type() == "identifier" then
-      local spec = src:sub(M.start_byte(param.node) + 1, M.start_byte(decl)):gsub("%s+$", "")
-      local name = rename[M.text(d, src)] or M.text(d, src)
-      return string.format("%s %s%s = (%s);", spec, stars, name, arg)
-    end
+  local ident, stars = pointer_target(decl)
+  if ident then
+    -- The declaration specifiers, such as `const char`: all text before the declarator.
+    local spec = src:sub(M.start_byte(param.node) + 1, M.start_byte(decl)):gsub("%s+$", "")
+    local ident_name = M.text(ident, src)
+    local name = rename[ident_name] or ident_name
+    return string.format("%s %s%s = (%s);", spec, stars, name, arg)
   end
-  local name = (param.name and (rename[param.name] or param.name)) or ("__ie_arg" .. idx .. "_" .. N)
+  local name
+  if param.name then
+    name = rename[param.name] or param.name
+  else
+    name = "__ie_arg" .. idx .. "_" .. N -- unnamed parameter
+  end
   return string.format("__auto_type %s = (%s);", name, arg)
 end
 
--- Apply {start_byte, end_byte, replacement} edits (absolute bytes) restricted to
--- the [s, e) region of src, returning that region's transformed text.
+-- The text of the region [s, e) of `src` after applying the `edits` that lie
+-- inside it. Each edit is { start_byte, end_byte, replacement }, in absolute
+-- offsets of `src`. Edits outside the region are ignored.
 function M.apply_edits(src, s, e, edits)
   local within = {}
   for _, ed in ipairs(edits) do
@@ -438,45 +394,51 @@ function M.apply_edits(src, s, e, edits)
       within[#within + 1] = ed
     end
   end
+  -- Apply from the end, so the offsets of earlier edits stay valid.
   table.sort(within, function(a, b)
     return a[1] > b[1]
   end)
   local region = src:sub(s + 1, e)
   for _, ed in ipairs(within) do
-    local a, b = ed[1] - s, ed[2] - s
-    region = region:sub(1, a) .. ed[3] .. region:sub(b + 1)
+    local from, to = ed[1] - s, ed[2] - s
+    region = region:sub(1, from) .. ed[3] .. region:sub(to + 1)
   end
   return region
 end
 
--- Longest common leading-whitespace prefix across the non-blank lines.
+-- The longest run of leading spaces and tabs that all non-blank lines share.
 function M.common_ws_prefix(lines)
-  local p
+  local prefix
   for _, l in ipairs(lines) do
     if l:match("%S") then
       local ws = l:match("^[ \t]*")
-      if not p then
-        p = ws
+      if not prefix then
+        prefix = ws
       else
         local i = 1
-        while i <= #p and p:sub(i, i) == ws:sub(i, i) do
+        while i <= #prefix and prefix:sub(i, i) == ws:sub(i, i) do
           i = i + 1
         end
-        p = p:sub(1, i - 1)
+        prefix = prefix:sub(1, i - 1)
       end
     end
   end
-  return p or ""
+  return prefix or ""
 end
 
--- Dedent a fragment to its common indent, then re-indent each line under `target`.
--- Relative nesting (and the source's tabs/spaces) is preserved.
+-- The lines of `fragment`, with their common indent replaced by `target`.
+-- Relative nesting, and the source's mix of tabs and spaces, are kept. Blank
+-- lines become empty.
 function M.reindent(fragment, target)
   local lines = vim.split(fragment, "\n", { plain = true })
-  local strip = #M.common_ws_prefix(lines)
+  local strip_len = #M.common_ws_prefix(lines)
   local out = {}
   for _, l in ipairs(lines) do
-    out[#out + 1] = l:match("%S") and (target .. l:sub(strip + 1)) or ""
+    if l:match("%S") then
+      out[#out + 1] = target .. l:sub(strip_len + 1)
+    else
+      out[#out + 1] = ""
+    end
   end
   return out
 end
