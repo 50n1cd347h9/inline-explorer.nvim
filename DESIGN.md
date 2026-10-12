@@ -41,7 +41,7 @@ when the server doesn't provide a usable range.
   server's `workspace/symbol` (any language), then `location -> body lines` via
   the server's `textDocument/documentSymbol` full range (tree-sitter, then a
   brace heuristic, as fallbacks when no server range is available).
-- **Expander** (`expander.lua`) — splice the body below the call line, indent,
+- **Expander** (`expander.lua`) — splice the body below the call's statement, indent,
   wrap in a fold, guard against self-recursion.
 - **Config / init** — options, user commands, keymaps.
 

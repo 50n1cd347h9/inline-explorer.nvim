@@ -373,4 +373,54 @@ do
   vim.o.foldmethod = "manual"
 end
 
+-- An expansion goes below the call's STATEMENT, not the cursor's row. A
+-- call spread over lines --
+--   areq = af_alg_alloc_areq(sk, sizeof(struct af_alg_async_req) +
+--                            crypto_aead_reqsize(tfm));
+-- -- had its expansion spliced between the two lines, splitting the
+-- statement. A statement with a body stops where the body begins.
+do
+  local function expand_at(lines, row, word)
+    vim.cmd("enew")
+    vim.bo.filetype = "c"
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+    local v = view.open()
+    vim.api.nvim_win_set_cursor(0, { row, lines[row]:find(word, 1, true) - 1 })
+    local n = vim.api.nvim_buf_line_count(v)
+    expander.expand()
+    vim.wait(1000, function()
+      return vim.api.nvim_buf_line_count(v) > n
+    end, 10)
+    local out = vim.api.nvim_buf_get_lines(v, 0, -1, false)
+    for i, l in ipairs(out) do
+      if l:find("/* v " .. word, 1, true) then
+        return i, l:match("^%s*"), out
+      end
+    end
+    return nil, nil, out
+  end
+
+  local stmt = {
+    "int main(void)",
+    "{",
+    "    areq = alloc(sk, sizeof(x) +",
+    "                 reqsize(tfm));",
+    "    if (cond(a) &&",
+    "        other(b)) {",
+    "        work();",
+    "    }",
+    "}",
+  }
+  local at, pad, out = expand_at(stmt, 3, "alloc")
+  check("statement: a multi-line call expands below its last line", at == 5, out)
+  check("statement: indented from the statement's first line", pad == "      ", out)
+  at, pad, out = expand_at(stmt, 4, "reqsize")
+  check("statement: from a continuation line, the same place and indent", at == 5 and pad == "      ", out)
+  at, _, out = expand_at(stmt, 5, "cond")
+  check("statement: an if expands below its condition, inside the braces", at == 7, out)
+  at, _, out = expand_at(stmt, 7, "work")
+  check("statement: a one-line statement keeps the row below", at == 8, out)
+  view.close()
+end
+
 H.finish("EXPANDER")

@@ -1,5 +1,5 @@
 -- Expander: resolve the symbol under the cursor and splice its definition into
--- the reading view as a folded, indented block below the call line.
+-- the reading view as a folded, indented block below the call's statement.
 local config = require("inline-explorer.config")
 local resolver = require("inline-explorer.resolver")
 local view = require("inline-explorer.view")
@@ -23,11 +23,69 @@ local function notify(msg, level)
   util.notify(msg, level or vim.log.levels.WARN)
 end
 
--- Splice `body` into `bufnr` just below `lnum`, indented one level past the
--- call line, wrapped in a fold that starts open.
-local function insert(st, bufnr, lnum, name, body, label)
+-- Node types that own a body: a statement holding one ends with the body,
+-- and the expansion belongs above it, not after its closing brace.
+local BODY = {
+  compound_statement = true, -- C
+  block = true, -- Lua, Python, Rust, Go
+  statement_block = true, -- JavaScript, TypeScript
+  field_declaration_list = true, -- C struct/union bodies
+}
+
+-- The row to splice below for a call at (row, col): the last row of the
+-- statement holding it. A call spread over several lines --
+--   areq = af_alg_alloc_areq(sk, sizeof(...) +
+--                            crypto_aead_reqsize(tfm));
+-- -- put the expansion between its lines when it went below the cursor's
+-- row. A statement that owns a body (if/while/for, a struct) stops where
+-- the body begins. No parser, or a tree with errors around the call:
+-- the cursor's row, as before. Second value: the row whose indent the
+-- expansion follows -- the statement's first, not a continuation line.
+local function splice_row(bufnr, row, col)
+  local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
+  if not ok or not parser then
+    return row, row
+  end
+  parser:parse() -- the view changes between expansions; never read a stale tree
+  local node = parser:named_node_for_range({ row, col, row, col }, { ignore_injections = true })
+  while node do
+    local t = node:type()
+    if BODY[t] then
+      return row, row -- reached a body without passing a statement
+    end
+    if t:match("statement$") or t:match("declaration$") then
+      break
+    end
+    node = node:parent()
+  end
+  if not node or node:has_error() then
+    return row, row
+  end
+  local last, ecol = select(3, node:range())
+  if ecol == 0 and last > row then
+    last = last - 1 -- end-exclusive at column 0 of the next row
+  end
+  -- A body -- a block, or the lone statement of a braceless if/for --
+  -- caps the statement at the end of what precedes it: `if (f(x)) {`
+  -- keeps the expansion right below the condition.
+  for _, child in ipairs(node:named_children()) do
+    local t = child:type()
+    if BODY[t] or t:match("statement$") then
+      local prev = child:prev_sibling()
+      local cap = prev and select(3, prev:range()) or child:start()
+      if cap >= row then
+        last = math.min(last, cap)
+      end
+    end
+  end
+  return math.max(last, row), math.min(node:start(), row)
+end
+
+-- Splice `body` into `bufnr` just below row `at`, indented one level past
+-- row `indent_row`, wrapped in a fold that starts open.
+local function insert(st, bufnr, at, indent_row, name, body, label)
   local opts = config.options
-  local call_line = vim.api.nvim_buf_get_lines(bufnr, lnum, lnum + 1, false)[1] or ""
+  local call_line = vim.api.nvim_buf_get_lines(bufnr, indent_row, indent_row + 1, false)[1] or ""
   local pad = (call_line:match("^%s*") or "") .. opts.indent
 
   local out = {}
@@ -42,8 +100,8 @@ local function insert(st, bufnr, lnum, name, body, label)
   end
 
   view.change(st, bufnr, function()
-    view.set_lines(bufnr, lnum + 1, lnum + 1, out)
-    view.add_node(st, bufnr, name, lnum + 1, lnum + #out)
+    view.set_lines(bufnr, at + 1, at + 1, out)
+    view.add_node(st, bufnr, name, at + 1, at + #out)
   end)
 end
 
@@ -70,11 +128,13 @@ function M.expand(prefetched)
     return
   end
   local bufnr = vim.api.nvim_get_current_buf()
-  local lnum = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local lnum = cursor[1] - 1
 
   if ancestor_names(st, bufnr, lnum)[name] then
     return notify("'" .. name .. "' is already expanded above (recursion guard)", vim.log.levels.INFO)
   end
+  local at, indent_row = splice_row(bufnr, lnum, cursor[2])
 
   if pre then
     -- Deliberately does NOT number a new action. This branch is only ever
@@ -85,7 +145,7 @@ function M.expand(prefetched)
     -- `#8 total:expand 0.6ms` -- which is exactly the grouping the ids
     -- exist to make reliable.
     local pre_span = require("inline-explorer.profile").start()
-    insert(st, bufnr, lnum, name, pre.body, pre.label)
+    insert(st, bufnr, at, indent_row, name, pre.body, pre.label)
     pre_span("total:expand", name)
     return
   end
@@ -104,7 +164,7 @@ function M.expand(prefetched)
         span("total:expand-failed", name)
         return notify(err or ("could not extract a body for '" .. name .. "'"))
       end
-      insert(st, bufnr, lnum, name, body, label)
+      insert(st, bufnr, at, indent_row, name, body, label)
       span("total:expand", ("%s (%dL, %s)"):format(name, #body, tostring(label)))
     end)
   end)
