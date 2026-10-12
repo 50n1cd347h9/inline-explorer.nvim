@@ -40,13 +40,13 @@ Then run `:checkhealth inline-explorer` in a file you want to read.
 ## Usage
 
 1. `<leader>eo` opens the **reading view**.
-2. On a function call, `<leader>ee` expands its definition below the line.
+2. On a function call, `<leader>ee` expands its definition below the statement.
 3. Move into the definition and expand again to go deeper.
 
 | Keymap (deault)          | Command                        | Action |
 | ----------------- | ------------------------------ | ------ |
 | `<leader>eo`      | `:InlineExplorerOpen`          | Open a reading view |
-| `<leader>ee`      | `:InlineExplorerExpand`        | Expand the definition below the line |
+| `<leader>ee`      | `:InlineExplorerExpand`        | Expand the definition below the statement |
 | `<leader>ei`      | `:InlineExplorerInline`        | C: inline the call or expand the macro in place |
 | `<leader>ec`      | (`za`)                         | Fold / unfold the expansion |
 | `]e` / `[e`       | `:InlineExplorerNext` / `Prev` | Next / previous expansion |
