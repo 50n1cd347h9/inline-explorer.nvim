@@ -1,6 +1,5 @@
--- Navigation across expansion blocks: jump to the next or previous block's
--- first line, list every block in the location list, and name the blocks the
--- cursor is inside (outermost first) for statuslines.
+-- Moving between the expansion blocks of a reading view: next and previous,
+-- the location list, and the statusline breadcrumb.
 local view = require("inline-explorer.view")
 local util = require("inline-explorer.util")
 
@@ -10,10 +9,8 @@ local function notify(msg)
   util.notify(msg, vim.log.levels.INFO)
 end
 
--- The expansion blocks still in the buffer (those whose first and last lines
--- were not replaced), sorted by first row. Each is
--- { name = expanded symbol, first_row, last_row }, with 0-based rows;
--- last_row is the block's last line, not the one after it.
+-- view.block_ranges, sorted by first row. Rows are 0-based and inclusive.
+---@return { name: string, first_row: integer, last_row: integer }[]
 local function sorted_blocks(st, bufnr)
   local blocks = {}
   for _, range in ipairs(view.block_ranges(st, bufnr)) do
@@ -25,8 +22,9 @@ local function sorted_blocks(st, bufnr)
   return blocks
 end
 
--- The reading view the cursor is in. Returns its state, its buffer and the
--- cursor's row (0-based), or nil when the current buffer is not a view.
+---@return inline_explorer.ViewState? st nil outside a reading view
+---@return integer? bufnr
+---@return integer? cursor_row 0-based
 local function cursor_in_view()
   local st = view.current()
   if not st then
@@ -66,7 +64,6 @@ function M.prev()
   notify("no expansion above")
 end
 
--- Fill the location list with every expansion block and open it.
 function M.list()
   local st, bufnr = cursor_in_view()
   if not st then
@@ -85,14 +82,12 @@ function M.list()
     notify("no expansions")
     return
   end
-  -- " " creates a new location list instead of replacing the current one.
   vim.fn.setloclist(0, {}, " ", { title = "inline-explorer expansions", items = items })
   vim.cmd.lopen()
 end
 
--- The names of the blocks that contain the cursor, outermost first, joined
--- with " > ". Returns "" outside a reading view, so a statusline can call it
--- anywhere.
+-- The names of the blocks around the cursor, outermost first, joined with
+-- " > "; "" outside a reading view.
 function M.breadcrumb()
   local st, bufnr, cursor_row = cursor_in_view()
   if not st then

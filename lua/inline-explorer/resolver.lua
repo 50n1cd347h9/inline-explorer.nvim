@@ -1,68 +1,54 @@
--- Resolver: identifier name -> the lines of its definition.
+-- Resolver: identifier name -> the lines of its definition. M.locate finds
+-- where a name is declared or defined (workspace/symbol), and M.extract reads
+-- the lines there from the first source that has them:
+--   C/C++:  tree-sitter -> server -> brace counter
+--   others: server -> tree-sitter -> brace counter
+-- "server" is the symbol's full range in a textDocument/documentSymbol reply.
 --
---   M.locate(name)  asks the source buffer's servers where `name` is
---                   defined (workspace/symbol) and returns a loc.
---   M.extract(loc)  returns the definition's lines and label, from the
---                   first of these sources that has them:
---                     C/C++:  tree-sitter -> server -> brace counter
---                     others: server -> tree-sitter -> brace counter
---                   "server" means the symbol's full range in a
---                   textDocument/documentSymbol reply. Results are cached.
---   M.locate_definition, M.fetch
---                   run locate, then extract. When the lines are only a
---                   declaration, they also chase it to the definition.
---
--- Terms used throughout:
---   loc               { uri, range, kind, name, encoding }: where a symbol
---                     is. kind is an LSP SymbolKind, and range is in
---                     `encoding` units (the answering server's
---                     offset_encoding).
+-- Terms:
 --   label             what the lines are: a tree-sitter node type such as
---                     "function_definition" or "declaration", "heuristic"
---                     for the brace counter, or a server symbol's kind (see
---                     kind_label).
---   local extraction  M.extract_sync: tree-sitter, or the brace counter
---                     (M.extract_heuristic) when tree-sitter finds nothing.
---                     It needs no server.
---   cold              this M.extract call attached the server to the
+--                     "function_definition" or "declaration", "heuristic" for
+--                     the brace counter, or a server symbol's kind_label.
+--   local extraction  M.extract_sync: tree-sitter, else the brace counter
+--                     (M.extract_heuristic). It needs no server.
+--   cold              attach_clients newly attached a client to the
 --                     definition file, so the server must build that file's
---                     preamble before it can answer.
+--                     preamble before it can answer. A FileType autostart
+--                     (vim.lsp.enable, lspconfig) can attach first, during
+--                     the bufload of M.extract's step 2, and such a first
+--                     touch counts as warm.
 --   chase             following a declaration to its definition with
---                     textDocument/definition (M._chase_definition).
---
--- Lookups go by name, not position: the reading view is a copy buffer with
--- no server attached, and nested expansions have no real file position.
+--                     textDocument/definition (workspace/symbol often answers
+--                     with a declaration).
 
--- profile.start() returns span(label, detail), which records the time since
--- start() under `label`. profile.identify(client) logs the client's server
--- (name, version, command) once. Both do nothing while profiling is off.
+-- A loc says where a symbol is.
+---@class inline_explorer.Loc
+---@field uri string
+---@field range lsp.Range in `encoding` units
+---@field kind? lsp.SymbolKind
+---@field name? string
+---@field encoding? string offset_encoding of the server that answered; nil counts as bytes
+
 local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
 
 local M = {}
 
--- How long one LSP round trip may take. After that, extract falls back to
--- local extraction, while locate and the chase report failure, so a wedged
--- server degrades visibly instead of hanging the keypress. It is a module
--- field so tests can shorten it.
+-- Budget for one LSP round trip. Past it, extract falls back to local
+-- extraction, and locate and the chase give up, so a wedged server cannot
+-- stall a lookup.
 M._timeout_ms = 4000
 
--- Budget for a cold extract, which waits for the server to build the
--- definition file's preamble. Healthy builds finish well within it, and
--- builds that do not usually outlast _timeout_ms too, so a longer wait
--- would only delay the same local extraction. Timing out is cheap: the
--- local result is shown but not cached, and the background retry in
--- M.extract caches the server's answer for the next look.
+-- Budget for a cold extract (see "cold" above). Healthy preamble builds
+-- finish well within it, and slower ones usually outlast _timeout_ms too, so
+-- a longer wait would only delay the same local extraction.
 M._cold_timeout_ms = 2000
 
--- For C/C++, M.extract tries local extraction before the server (step 4
--- there). It is a module field so tests can turn it off and exercise the
--- server path.
+-- Step 4 of M.extract. Tests turn it off to reach the server path.
 M._local_first = true
 
--- Neovim 0.11 made request a method: client:request(method, ...). 0.10 has
--- the plain function client.request(method, ...), without self. Client
--- requests in every module go through this shim so 0.10 keeps working.
+-- client:request on Neovim 0.11+, which deprecates the dot call. On 0.10,
+-- client.request is a closure that takes no self.
 function M.client_request(client, method, params, handler, bufnr)
   if vim.fn.has("nvim-0.11") == 1 then
     return client:request(method, params, handler, bufnr)
@@ -70,46 +56,39 @@ function M.client_request(client, method, params, handler, bufnr)
   return client.request(method, params, handler, bufnr)
 end
 
--- Returns `finish`. The first call to finish(...) forwards its arguments to
--- `cb`, and later calls are ignored. If finish has not been called after
--- `ms` (default _timeout_ms), on_timeout() runs and cb receives its return
--- values instead: an on_timeout that returns nil, "timeout" becomes
--- cb(nil, "timeout"). A reply that arrives after that is dropped.
 local function once_with_timeout(cb, on_timeout, ms)
   return require("inline-explorer.async").once_with_timeout(cb, on_timeout, ms or M._timeout_ms)
 end
 
--- Result caches, each an LRU (util.evict_lru) bounded by its *_max field:
---   _locate_cache:  client ids + name -> loc
---   _extract_cache: uri + range       -> { lines = ..., label = ... }
--- An entry stays valid while its definition file's changedtick does not
--- change. Neither cache is cleared on LspAttach or LspDetach: the client
--- set is part of the locate key, and M.extract's own attaching would clear
--- them otherwise. (M._attach_cache, further down, is different: it keeps
--- attachments alive so the server does not rebuild preambles.)
+-- LRU caches (util.evict_lru), each bounded by its *_max field. Locate keys
+-- are client ids + name, extract keys uri + range. An entry is valid while
+-- its definition file's changedtick is unchanged. LspAttach and LspDetach do
+-- not clear them: the client ids are part of the locate key, and M.extract's
+-- own attaching would clear them otherwise.
 M._locate_cache_max = 64
 M._extract_cache_max = 64
+---@type table<string, {value: inline_explorer.Loc, tick: integer?, at: integer}>
 M._locate_cache = {}
+---@type table<string, {value: {lines: string[], label: string}, tick: integer, at: integer}>
 M._extract_cache = {}
 
--- Declarations whose chase found no definition: chase_miss_key(loc) -> the
--- vim.uv.now() of the miss. M.locate_definition skips the chase for
--- _chase_miss_ttl_ms after a miss, so repeated lookups cost no round trip,
--- and a background index that finishes later is noticed once the miss
--- expires.
+-- Chases that got no location other than the declaration itself, including
+-- an error or a timeout, keyed by chase_miss_key(loc) with the vim.uv.now()
+-- of the miss. M.locate_definition skips the chase for _chase_miss_ttl_ms
+-- after a miss, so repeats cost no round trip, and a background index that
+-- finishes later is noticed once the miss expires. A chase that lands on
+-- another declaration is not recorded, so it is retried on every lookup.
+---@type table<string, integer>
 M._chase_miss = {}
 M._chase_miss_ttl_ms = 5 * 60 * 1000
 
--- Empty the result caches and the chase misses (the attach cache is left
--- alone). Only tests call this, to isolate cases.
 function M.clear_caches()
   M._locate_cache = {}
   M._extract_cache = {}
   M._chase_miss = {}
 end
 
--- Returns bufnr's changedtick, or nil when bufnr is nil, invalid or not
--- loaded.
+---@return integer?
 local function tick_of(bufnr)
   if bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
     return vim.api.nvim_buf_get_changedtick(bufnr)
@@ -117,9 +96,6 @@ local function tick_of(bufnr)
   return nil
 end
 
--- Returns the value cached under key, or nil. An entry is valid only while
--- `tick` (its file's current tick) equals the tick stored with it; two nils
--- count as equal. A stale entry is dropped.
 local function cache_get(cache, key, tick)
   local e = cache[key]
   if not e then
@@ -129,7 +105,7 @@ local function cache_get(cache, key, tick)
     cache[key] = nil
     return nil
   end
-  e.at = vim.uv.now() -- last use: util.evict_lru evicts the oldest
+  e.at = vim.uv.now()
   return e.value
 end
 
@@ -138,9 +114,6 @@ local function cache_put(cache, key, value, tick, cap)
   util.evict_lru(cache, cap)
 end
 
--- The ids of bufnr's clients, sorted so the key does not depend on
--- get_clients' order. The client set decides what a name resolves to, so it
--- is part of the locate key rather than a reason to clear the cache.
 local function client_key(bufnr)
   local ids = {}
   for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
@@ -163,8 +136,6 @@ local function chase_miss_key(loc)
   return loc.uri .. "\1" .. loc.range.start.line
 end
 
--- The buffer whose LSP clients we ask: source_bufnr while it is valid, else
--- the current buffer (0).
 local function source_buf(source_bufnr)
   if source_bufnr and vim.api.nvim_buf_is_valid(source_bufnr) then
     return source_bufnr
@@ -172,8 +143,8 @@ local function source_buf(source_bufnr)
   return 0
 end
 
--- The file's existing buffer, or nil. Unlike vim.uri_to_bufnr, it never
--- creates a buffer.
+-- Unlike vim.uri_to_bufnr, never creates a buffer.
+---@return integer?
 local function existing_buf(uri)
   local bufnr = vim.fn.bufnr(vim.uri_to_fname(uri))
   if bufnr == -1 then
@@ -182,14 +153,9 @@ local function existing_buf(uri)
   return bufnr
 end
 
--- cache_get for _locate_cache. The tick is the definition file's, not the
--- source buffer's: typing in the file you read from does not move a
--- definition, but editing the definition file can, and a stale range would
--- make extract return the wrong lines. An entry stored while that file had
--- no loaded buffer has a nil tick and stays valid while the file stays
--- unloaded (a file nobody has opened cannot have been edited). Once the file
--- is loaded and unmodified, the entry adopts its tick: the file was opened,
--- not edited.
+-- An entry stored while its definition file was not loaded has a nil tick:
+-- it stays valid while the file stays unloaded, and adopts the file's tick
+-- once the file is loaded and unmodified (taken as opened, not edited).
 local function locate_cache_get(key)
   local e = M._locate_cache[key]
   if not e then
@@ -203,8 +169,6 @@ local function locate_cache_get(key)
   return cache_get(M._locate_cache, key, now_tick)
 end
 
--- Store loc under key with its definition file's current tick (nil while
--- that file has no loaded buffer; see locate_cache_get).
 local function locate_cache_put(key, loc)
   cache_put(M._locate_cache, key, loc, tick_of(existing_buf(loc.uri)), M._locate_cache_max)
 end
@@ -213,15 +177,12 @@ local function extract_cache_put(key, lines, label, tick)
   cache_put(M._extract_cache, key, { lines = lines, label = label }, tick, M._extract_cache_max)
 end
 
--- "name @ file.c": how span details name a location.
 local function describe(name, uri)
   return (name or "?") .. " @ " .. vim.fn.fnamemodify(vim.uri_to_fname(uri), ":t")
 end
 
--- Ask the source buffer's servers where `name` is defined (workspace/symbol,
--- exact name only). Calls cb(loc, nil) or cb(nil, err), where
--- loc = { uri, range, kind, name, encoding } as described at the top of the
--- file. Found locations are cached (see locate_cache_get).
+-- Only an exact name match counts.
+---@param cb fun(loc: inline_explorer.Loc?, err: string?)
 function M.locate(name, source_bufnr, cb)
   local bufnr = source_buf(source_bufnr)
   if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
@@ -249,8 +210,6 @@ function M.locate(name, source_bufnr, cb)
     return nil, "workspace/symbol timed out (server busy or stuck?)"
   end)
   vim.lsp.buf_request_all(bufnr, "workspace/symbol", { query = name }, function(results)
-    -- Each symbol keeps its server's offset encoding: its range is in that
-    -- server's units, not in bytes (see util.byte_col).
     local all, encoding_of = {}, {}
     for client_id, r in pairs(results or {}) do
       local client = vim.lsp.get_client_by_id(client_id)
@@ -263,10 +222,8 @@ function M.locate(name, source_bufnr, cb)
       return finish(nil, "no symbol named '" .. name .. "'")
     end
 
-    -- Accept only an exact name match. workspace/symbol matches fuzzily, and
-    -- its first suggestion can be an unrelated symbol whose lines would be
-    -- shown without warning. The error names the closest match instead,
-    -- which points at the likely cause: an index that does not know the name.
+    -- workspace/symbol matches fuzzily, and its first result can be an
+    -- unrelated symbol whose lines would be shown without warning.
     local pick
     for _, s in ipairs(all) do
       if s.name == name then
@@ -286,10 +243,9 @@ function M.locate(name, source_bufnr, cb)
   end)
 end
 
--- The label for a server symbol's LSP SymbolKind. Function-like kinds become
--- "function_definition", the label tree-sitter gives a C function, because
--- the inliner substitutes a call only for lines labelled that way. Other
--- kinds become the lowercase kind name ("struct", "variable", ...).
+-- Function-like kinds get the label tree-sitter gives a C function,
+-- "function_definition", because the inliner substitutes a call only for
+-- lines labelled that way.
 local function kind_label(kind)
   local SymbolKind = vim.lsp.protocol.SymbolKind
   if kind == SymbolKind.Method or kind == SymbolKind.Constructor or kind == SymbolKind.Function then
@@ -302,7 +258,7 @@ local function kind_label(kind)
   return "symbol"
 end
 
-local function le(a, b) -- position a <= b
+local function le(a, b)
   return a.line < b.line or (a.line == b.line and a.character <= b.character)
 end
 
@@ -317,15 +273,11 @@ local function same_range(a, b)
     and a["end"].character == b["end"].character
 end
 
--- Returns range, label: the deepest symbol in a documentSymbol reply whose
--- range contains `ref_range`, and its kind_label (nil, nil when none does).
--- It handles both reply shapes:
---   DocumentSymbol[] (hierarchical: range and children). Its range is the
---     full range by spec, so a range equal to ref_range is a valid match.
---   SymbolInformation[] (flat: location.range). Some servers put just the
---     name's range there, so an entry whose range equals ref_range is taken
---     to be the bare name and skipped. Entries must also match `name`, and
---     `uri` when one is given (such replies can span files).
+-- The innermost symbol in a documentSymbol reply whose range contains
+-- ref_range.
+---@param symbols lsp.DocumentSymbol[]|lsp.SymbolInformation[]
+---@return lsp.Range? range
+---@return string? label
 function M._symbol_range(symbols, ref_range, name, uri)
   local best, best_label
   local function consider(range, kind)
@@ -335,6 +287,8 @@ function M._symbol_range(symbols, ref_range, name, uri)
       end
     end
   end
+  -- Some servers put only the name's range in a SymbolInformation, so an
+  -- entry whose range equals ref_range is taken for the bare name and skipped.
   local function flat_entry_matches(s)
     return (name == nil or s.name == name)
       and (uri == nil or s.location.uri == nil or s.location.uri == uri)
@@ -345,10 +299,10 @@ function M._symbol_range(symbols, ref_range, name, uri)
       return
     end
     for _, s in ipairs(list) do
-      if s.range then -- hierarchical DocumentSymbol
+      if s.range then -- DocumentSymbol, whose range is the full range by spec
         consider(s.range, s.kind)
         walk(s.children)
-      elseif s.location and s.location.range then -- flat SymbolInformation
+      elseif s.location and s.location.range then -- SymbolInformation
         if flat_entry_matches(s) then
           consider(s.location.range, s.kind)
         end
@@ -359,11 +313,9 @@ function M._symbol_range(symbols, ref_range, name, uri)
   return best, best_label
 end
 
--- Lines of the definition at `loc`, read from `target` (the definition
--- file's buffer) using the range in a buf_request_all documentSymbol reply.
--- The first client whose symbols contain loc.range wins. Returns lines,
--- label, or nil, nil. It raises on a malformed reply, so callers pcall it.
--- Both the main request in M.extract and its retry after a timeout use it.
+-- Raises on a malformed reply.
+---@return string[]? lines
+---@return string? label
 local function lines_from_symbols(results, loc, target)
   local range, label
   for _, r in pairs(results or {}) do
@@ -377,8 +329,7 @@ local function lines_from_symbols(results, loc, target)
   if not range then
     return nil, nil
   end
-  -- LSP ranges are end-exclusive; end.character == 0 on a line after
-  -- start means that line's content is not actually part of the range.
+  -- The end is exclusive: an end at character 0 leaves its line out.
   local erow = range["end"].line
   if range["end"].character == 0 and erow > range.start.line then
     erow = erow - 1
@@ -390,9 +341,8 @@ local function lines_from_symbols(results, loc, target)
   return ls, label
 end
 
--- Resolve the tree-sitter language for a buffer. A buffer that was only
--- `bufload`ed (e.g. a header the definition lives in) often has no filetype yet,
--- so fall back to matching on its file name.
+-- The filetype is empty when no detection ran on load (detection off, or
+-- autocommands suppressed); then match on the file name.
 local function buffer_lang(bufnr)
   local ft = vim.bo[bufnr].filetype
   if ft == "" then
@@ -401,9 +351,9 @@ local function buffer_lang(bufnr)
   return vim.treesitter.language.get_lang(ft) or ft
 end
 
--- Wrapper nodes whose own range is never a definition: preprocessor
--- conditionals (such as include guards), extern "C" blocks and the
--- declaration lists inside them. outermost_in_window stops at one.
+-- Wrappers whose range is never a definition: preprocessor conditionals
+-- (include guards), extern "C" blocks, and the declaration lists that are
+-- the bodies of extern "C" blocks and namespaces.
 local CONTAINER_NODES = {
   preproc_ifdef = true,
   preproc_if = true,
@@ -413,16 +363,13 @@ local CONTAINER_NODES = {
   declaration_list = true,
 }
 
--- The label of lines found by the brace counter rather than tree-sitter.
 local HEURISTIC = "heuristic"
 
--- The outermost ancestor of the node at (srow, scol) that starts 0-3 rows
--- above srow, or nil. The window allows for a return type or attributes on
--- lines of their own. The outermost node is the one wanted: when the
--- parameter list spans lines, the innermost multi-line node is just the
--- declarator. The walk stops below the whole-file root and at a
--- CONTAINER_NODES ancestor, so a guard or an extern "C" block is never
--- returned.
+-- The outermost node at (srow, scol) that starts 0-3 rows above srow. The
+-- window allows for a return type or attributes on lines of their own, and
+-- the outermost node is wanted because, when the parameter list spans
+-- lines, the innermost multi-line node is just the declarator.
+---@return TSNode?
 local function outermost_in_window(root, srow, scol)
   local node = root:named_descendant_for_range(srow, scol, srow, scol)
   local found
@@ -439,10 +386,9 @@ local function outermost_in_window(root, srow, scol)
   return found
 end
 
--- Local extraction: the definition at `loc`, found without a server.
--- Returns lines, label: the lines of the node outermost_in_window finds and
--- the node's type, or extract_heuristic's lines and HEURISTIC when no
--- parser is available or the parser finds nothing.
+---@param loc inline_explorer.Loc
+---@return string[] lines
+---@return string label
 function M.extract_sync(loc)
   local bufnr = vim.uri_to_bufnr(loc.uri)
   vim.fn.bufload(bufnr)
@@ -450,9 +396,8 @@ function M.extract_sync(loc)
   local sline = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
   local scol = util.byte_col(sline, loc.range.start.character, loc.encoding)
 
-  -- `.h` headers are often detected as C++ while only the C parser is
-  -- installed, so try the detected language, then C, then C++. The first
-  -- language that has a parser decides.
+  -- A `.h` file is detected as C++ by default, but Neovim bundles the C parser
+  -- and not the C++ one, so try the detected language, then C, then C++.
   local seen = {}
   for _, lang in ipairs({ buffer_lang(bufnr), "c", "cpp" }) do
     if lang and lang ~= "" and not seen[lang] then
@@ -472,15 +417,10 @@ function M.extract_sync(loc)
   return M.extract_heuristic(bufnr, srow), HEURISTIC
 end
 
--- extract_heuristic reads at most this many lines, so a missing closing
--- brace cannot pull in the rest of the file.
-local MAX_SCAN_LINES = 500
+local MAX_SCAN_LINES = 500 -- so an unclosed brace cannot pull in the rest of the file
 
--- The brace counter: local extraction's last resort when tree-sitter is
--- unavailable or finds nothing at srow. Returns a #define with its
--- continuation lines, the lines from srow to the brace that closes the
--- first one opened, or, when a ';' comes before any brace, the lines up to
--- it (a prototype). It only really helps C-family languages.
+-- The brace counter. From srow: a #define with its continuation lines, or
+-- the lines through the brace that closes the first one opened.
 function M.extract_heuristic(bufnr, srow)
   local total = vim.api.nvim_buf_line_count(bufnr)
   local first = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
@@ -518,20 +458,19 @@ function M.extract_heuristic(bufnr, srow)
   return out
 end
 
--- Attachments this module created: definition-file bufnr -> { ids = the
--- client ids we attached, at = last use }. They outlive the request because
--- re-attaching a header makes the server rebuild its preamble.
+-- Clients this module attached, keyed by definition-file bufnr. They stay
+-- attached after the request because re-attaching a file makes the server
+-- rebuild its preamble.
 M._attach_cache_max = 8
+---@type table<integer, {ids: integer[], at: integer}>
 M._attach_cache = {}
 
--- Record target's attachment (or refresh its recency), then evict entries
--- beyond _attach_cache_max. For each evicted buffer that is not shown in
--- any window, detach the clients we attached to it. A buffer whose clients
--- were all attached already is not recorded, so it is never detached here.
+-- A buffer whose clients were all attached already is not recorded, so
+-- eviction only detaches clients this module attached.
 local function cache_attachment(target, newly_attached)
   local cache = M._attach_cache
   if cache[target] then
-    cache[target].at = vim.uv.now() -- refresh recency; ids already recorded
+    cache[target].at = vim.uv.now()
   elseif #newly_attached > 0 then
     cache[target] = { ids = newly_attached, at = vim.uv.now() }
   end
@@ -544,8 +483,7 @@ local function cache_attachment(target, newly_attached)
   end)
 end
 
--- Load `target` and attach `clients` to it, through the attach cache.
--- Returns the ids this call newly attached (empty when all were attached).
+---@return integer[] newly_attached client ids
 local function attach_clients(target, clients)
   vim.fn.bufload(target)
   local newly_attached = {}
@@ -560,11 +498,9 @@ local function attach_clients(target, clients)
   return newly_attached
 end
 
--- Load uri's file and attach source_bufnr's clients to it through the
--- attach cache, so that position requests about the file (such as the
--- callers module's callHierarchy) work: a server answers only about
--- documents it has open. Returns the target bufnr, or nil when source_bufnr
--- has no LSP clients.
+-- Attaches source_bufnr's clients to uri's file, since clangd answers
+-- position requests only about documents it has open.
+---@return integer? target the file's bufnr, nil when source_bufnr has no clients
 function M.ensure_attached(uri, source_bufnr)
   local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
   if #clients == 0 then
@@ -575,9 +511,8 @@ function M.ensure_attached(uri, source_bufnr)
   return target
 end
 
--- Step 4 of M.extract: local extraction for a C or C++ file, accepted only
--- when tree-sitter found a node (not the brace counter). Returns lines,
--- label, or nil when M.extract should ask the server.
+---@return string[]? lines nil when M.extract should ask the server
+---@return string? label
 local function extract_local(loc, target)
   local tlang = buffer_lang(target)
   if tlang ~= "c" and tlang ~= "cpp" then
@@ -590,8 +525,7 @@ local function extract_local(loc, target)
   return nil
 end
 
--- Extract the definition at `loc` (see the top of the file). Calls
--- cb(lines, label) exactly once on every path, possibly synchronously.
+-- Calls cb(lines, label) exactly once on every path, possibly synchronously.
 -- The steps, in order:
 --   1. no client on source_bufnr -> local extraction
 --   2. load the definition file and attach the source buffer's clients
@@ -600,6 +534,7 @@ end
 --   5. no documentSymbol client  -> local extraction
 --   6. ask the server. Use local extraction when the reply has no usable
 --      range, and on timeout (then retry in the background).
+---@param loc inline_explorer.Loc
 function M.extract(loc, source_bufnr, cb)
   local span = profile.start()
   local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
@@ -607,18 +542,14 @@ function M.extract(loc, source_bufnr, cb)
     profile.identify(c)
   end
 
-  -- 1. No client: local extraction.
   if #clients == 0 then
     local lines, label = M.extract_sync(loc)
     span("extract:no-lsp")
     return cb(lines, label)
   end
 
-  -- 2. Load the definition file and attach the clients.
   local target = vim.uri_to_bufnr(loc.uri)
 
-  -- Spans from here on name the symbol, its file and the file's length, so
-  -- a slow span in the log can be traced to its file.
   local function detail()
     local where = describe(loc.name, loc.uri)
     if not vim.api.nvim_buf_is_loaded(target) then
@@ -627,8 +558,6 @@ function M.extract(loc, source_bufnr, cb)
     return ("%s (%dL)"):format(where, vim.api.nvim_buf_line_count(target))
   end
 
-  -- Time the disk load apart from the server's preamble build: the first is
-  -- our I/O, the second is server work we only wait for.
   local load_span = profile.start()
   local was_loaded = vim.api.nvim_buf_is_loaded(target)
   vim.fn.bufload(target)
@@ -636,8 +565,9 @@ function M.extract(loc, source_bufnr, cb)
     load_span("extract:bufload", detail())
   end
 
-  -- Attach even when step 3 finds the lines cached: the macro path needs the
-  -- definition file attached before clangd runs its ExpandMacro tweak.
+  -- Attach even on a cache hit (step 3): the attach cache may have detached
+  -- this file since its lines were cached (detaching keeps the changedtick),
+  -- and the chase in M.locate_definition asks its clients.
   local attach_span = profile.start()
   local newly_attached = attach_clients(target, clients)
   local cold = #newly_attached > 0
@@ -645,7 +575,6 @@ function M.extract(loc, source_bufnr, cb)
     attach_span("extract:attach", detail())
   end
 
-  -- 3. Cached lines, valid while the definition file's tick is unchanged.
   local key = extract_key(loc)
   local tick = tick_of(target)
   if tick then
@@ -656,10 +585,9 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
 
-  -- 4. C/C++: local extraction first. A documentSymbol request on a file the
-  -- server has not opened makes clangd build its preamble, which can take
-  -- seconds, while tree-sitter finds the same range without a round trip. A
-  -- brace counter result is not trusted here; the server is asked instead.
+  -- 4. Tree-sitter finds the same range without a round trip, while clangd
+  -- answers documentSymbol on a newly opened file only after building its
+  -- preamble, which can take seconds.
   if M._local_first then
     local ts_lines, ts_label = extract_local(loc, target)
     if ts_lines then
@@ -671,26 +599,20 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
 
-  -- 5. buf_request_all calls its handler once every client that is attached
-  -- to target and supports documentSymbol has replied. With no such client
-  -- it would never call it, so use local extraction now instead of waiting.
+  -- 5. With no client supporting the method, buf_request_all reports an
+  -- error and never calls its handler.
   if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
     local lines, label = M.extract_sync(loc)
     span("extract:no-capability", detail())
     return cb(lines, label)
   end
 
-  -- 6. Ask the server, and stop waiting after `budget`.
-  local params = { textDocument = { uri = loc.uri } } -- the retry sends the same request
+  local params = { textDocument = { uri = loc.uri } }
   local budget = cold and M._cold_timeout_ms or M._timeout_ms
-  -- Set by on_timeout before once_with_timeout hands its result (local
-  -- extraction's, not the server's) to on_reply. It keeps that result out
-  -- of the cache and labels its span "extract:timeout".
+  -- True in on_reply only for on_timeout's local result.
   local timed_out = false
 
   local function on_reply(lines, label)
-    -- After a timeout the elapsed time is the budget, not the server's
-    -- latency, so the span must not read as a cold or warm answer.
     if timed_out then
       span("extract:timeout", detail())
     elseif cold then
@@ -698,24 +620,20 @@ function M.extract(loc, source_bufnr, cb)
     else
       span("extract:warm", detail())
     end
-    -- Cache what was shown, including local extraction's result when the
-    -- reply had no usable range, but never the result of a timeout.
+    -- Also caches the local result for a reply without a usable range, but
+    -- nothing after a timeout: the next look should get the server's lines.
     if lines and tick and not timed_out then
       extract_cache_put(key, lines, label, tick)
     end
     cb(lines, label)
   end
 
-  -- Re-send the request in the background. If the late reply has the
-  -- definition, cache it so the next look gets the server's lines without
-  -- waiting. With profiling on, also time it: a fast retry means the server
-  -- was still building the preamble, and a slow one means this file is
-  -- expensive for the server and no budget would help.
+  -- With profiling on, the retry's span shows how much longer than the
+  -- budget the server needed.
   local function retry_in_background()
     local probe = profile.enabled and profile.start() or nil
     vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
       local ok, lines, label = pcall(lines_from_symbols, results, loc, target)
-      -- When the reply cannot be read, pcall's second value is the error.
       local got_lines = ok and lines ~= nil
       if got_lines then
         local now_tick = tick_of(target)
@@ -732,8 +650,6 @@ function M.extract(loc, source_bufnr, cb)
   local function on_timeout()
     timed_out = true
     retry_in_background()
-    -- Name the file, and tell the user that looking again will use the
-    -- server: the retry caches the server's answer when it arrives.
     util.notify(
       ("%s: no answer within %dms for %s; extracted locally. Looking again will use the server."):format(
         loc.name or "?",
@@ -742,12 +658,13 @@ function M.extract(loc, source_bufnr, cb)
       ),
       vim.log.levels.WARN
     )
-    return M.extract_sync(loc) -- once_with_timeout passes these to on_reply
+    return M.extract_sync(loc)
   end
 
   local finish = once_with_timeout(on_reply, on_timeout, budget)
   vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
-    -- pcall so that a malformed reply cannot leave cb uncalled.
+    -- pcall: on a malformed reply, extract locally now rather than at the
+    -- timeout.
     local ok, lines, label = pcall(lines_from_symbols, results, loc, target)
     if ok and lines then
       finish(lines, label)
@@ -757,17 +674,18 @@ function M.extract(loc, source_bufnr, cb)
   end)
 end
 
--- Position of loc.name, as a whole word, within the first 4 lines of its
--- declaration in `target`, or loc.range.start when the name is not there.
--- loc.range.start may sit on a keyword such as `void`, where a position
--- request finds nothing. loc.range is in loc.encoding; the result is in
--- `out_encoding`, the encoding of the server it will be sent to.
+-- Where loc.name appears as a whole word in the 4 lines from loc's start
+-- line, else loc.range.start. A position request needs the identifier, and
+-- loc.range.start may sit on a keyword such as `void`.
+---@param loc inline_explorer.Loc
+---@param out_encoding string encoding of the server the position is sent to
+---@return lsp.Position
 function M.name_position(target, loc, out_encoding)
   local from = loc.range.start.line
   local lines = vim.api.nvim_buf_get_lines(target, from, from + 4, false)
   if loc.name then
     for i, l in ipairs(lines) do
-      local start1 = l:find("%f[%w_]" .. vim.pesc(loc.name) .. "%f[^%w_]") -- 1-based byte index
+      local start1 = l:find("%f[%w_]" .. vim.pesc(loc.name) .. "%f[^%w_]")
       if start1 then
         return { line = from + i - 1, character = util.lsp_col(l, start1 - 1, out_encoding) }
       end
@@ -778,13 +696,8 @@ function M.name_position(target, loc, out_encoding)
   return { line = from, character = util.lsp_col(l, byte, out_encoding) }
 end
 
--- Chase a declaration to its definition with one textDocument/definition
--- request. workspace/symbol often answers with a declaration (kfree is
--- declared in slab.h but defined in mm/slub.c), and extract returns the
--- lines at whatever loc it is given. Calls cb(dloc), or cb(nil) when no
--- definition elsewhere is found: the declaration's file has no buffer or no
--- client that answers definition requests, the index lacks the definition,
--- or the declaration is the definition.
+---@param loc inline_explorer.Loc a declaration
+---@param cb fun(dloc: inline_explorer.Loc?) nil on no client or answer, an error, a timeout, or loc itself
 function M._chase_definition(loc, cb)
   local target = existing_buf(loc.uri)
   if not target then
@@ -794,13 +707,10 @@ function M._chase_definition(loc, cb)
   if #clients == 0 then
     return cb(nil)
   end
-  -- Aim at the identifier itself (see M.name_position).
   local encoding = clients[1].offset_encoding
   local pos = M.name_position(target, loc, encoding)
 
   local span = profile.start()
-  -- On a miss, `why` says what happened (an error, an empty answer, the
-  -- declaration itself, or a timeout), and the span records it.
   local finish = once_with_timeout(function(dloc, why)
     local where = describe(loc.name, loc.uri)
     if dloc then
@@ -829,16 +739,14 @@ function M._chase_definition(loc, cb)
     if not first then
       return finish(nil, "empty -- the index has no answer for this position")
     end
-    -- Location or LocationLink; normalize to { uri, range }.
     local uri = first.uri or first.targetUri
+    -- A LocationLink's targetSelectionRange is the name; its targetRange may
+    -- start at a leading comment, and extraction from there returns the
+    -- comment.
     local range = first.range or first.targetSelectionRange or first.targetRange
     if not uri or not range then
       return finish(nil, "no location in the answer")
     end
-    -- An answer that points back at the declaration is a miss. A server
-    -- answers this way when its index has never seen the defining file, for
-    -- example when the source root has no compile database (as with an
-    -- out-of-tree build such as buildroot).
     if uri == loc.uri and range.start.line == pos.line then
       return finish(nil, "self -- the index does not know the defining file (compile_commands.json missing?)")
     end
@@ -846,20 +754,18 @@ function M._chase_definition(loc, cb)
   end, target)
 end
 
--- Replace the cached location for `name` with the chased definition, so a
--- repeat lookup goes straight to the definition without chasing again. The
--- entry gets the definition file's tick, as in M.locate.
+-- Caches the chased definition under `name`, so a repeat lookup skips the
+-- chase.
 function M._locate_cache_replace(name, source_bufnr, dloc)
   locate_cache_put(locate_key(source_buf(source_bufnr), name), dloc)
 end
 
--- name -> cb(loc, lines, label, err): locate, then extract. When the lines
--- are only a declaration (label "declaration", tree-sitter's node type for a
--- C prototype), chase it once and extract the definition instead. loc is
--- where the lines came from: the definition, or the declaration when the
--- chase fails. When locate fails, loc and lines are nil and err says why
--- (extract itself always returns lines). M.fetch and go-to-definition both
--- use this, so they reach the same definition.
+-- Locates `name` and extracts its lines. When they are only a declaration
+-- (label "declaration"), chases it once and extracts the definition instead.
+-- loc is where the lines came from: the definition, or the declaration when
+-- the chase fails. When locate fails, only err is set. M.fetch and
+-- go-to-definition share this so both reach the same definition.
+---@param cb fun(loc: inline_explorer.Loc?, lines: string[]?, label: string?, err: string?)
 function M.locate_definition(name, source_bufnr, cb)
   M.locate(name, source_bufnr, function(loc, err)
     if not loc then
@@ -872,14 +778,11 @@ function M.locate_definition(name, source_bufnr, cb)
       local function keep_declaration()
         return cb(loc, lines, label, nil)
       end
-      -- Skip the chase while a recent chase for this declaration missed.
       local miss_key = chase_miss_key(loc)
       local miss_at = M._chase_miss[miss_key]
       if miss_at and (vim.uv.now() - miss_at) < M._chase_miss_ttl_ms then
         return keep_declaration()
       end
-      -- The extract above attached the declaration's file, which the chase's
-      -- definition request needs.
       M._chase_definition(loc, function(dloc)
         if not dloc then
           M._chase_miss[miss_key] = vim.uv.now()
@@ -897,7 +800,8 @@ function M.locate_definition(name, source_bufnr, cb)
   end)
 end
 
--- name -> definition lines: cb(lines, label, err). See M.locate_definition.
+-- M.locate_definition without the loc.
+---@param cb fun(lines: string[]?, label: string?, err: string?)
 function M.fetch(name, source_bufnr, cb)
   M.locate_definition(name, source_bufnr, function(_, lines, label, err)
     cb(lines, label, err)

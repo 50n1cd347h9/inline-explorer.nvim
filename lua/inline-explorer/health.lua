@@ -1,7 +1,4 @@
--- :checkhealth inline-explorer. It checks everything the Troubleshooting
--- table in the README covers: the Neovim version, the language servers and
--- their capabilities, the tree-sitter parser, and (for C and C++) whether
--- clangd can find a compile_commands.json.
+-- :checkhealth inline-explorer, for the buffer it was run from.
 local macro = require("inline-explorer.macro")
 
 local M = {}
@@ -16,7 +13,6 @@ local function check_version()
   end
 end
 
--- Report which of the requests the plugin relies on `client` supports.
 local function check_client(client)
   local caps = client.server_capabilities or {}
   if caps.workspaceSymbolProvider then
@@ -38,7 +34,6 @@ local function check_client(client)
   end
 end
 
--- Report each language server attached to `bufnr`, or warn that there is none.
 local function check_clients(bufnr)
   local clients = vim.lsp.get_clients({ bufnr = bufnr })
   if #clients == 0 then
@@ -52,7 +47,6 @@ local function check_clients(bufnr)
   end
 end
 
--- Report whether the tree-sitter parser for filetype `ft` is installed.
 local function check_parser(ft)
   local lang = vim.treesitter.language.get_lang(ft) or ft
   if pcall(vim.treesitter.language.inspect, lang) then
@@ -69,12 +63,8 @@ local function check_parser(ft)
   end
 end
 
--- Report whether a compile_commands.json exists in the directory of
--- `bufnr`'s file or in any directory above it.
 local function check_compile_commands(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr)
-  -- An unnamed buffer has no directory; with no path, vim.fs.find starts
-  -- from the current directory.
   local start_dir
   if bufname ~= "" then
     start_dir = vim.fs.dirname(bufname)
@@ -91,8 +81,8 @@ local function check_compile_commands(bufnr)
   end
 end
 
--- The buffer to report on. :checkhealth runs the checks in its own
--- health:// buffer, so the file it was run from is the alternate buffer.
+-- :checkhealth runs the checks in its own health:// buffer, so the file it was
+-- run from is the alternate buffer.
 local function checked_buffer()
   local cur = vim.api.nvim_get_current_buf()
   if not vim.startswith(vim.api.nvim_buf_get_name(cur), "health://") then
@@ -105,8 +95,6 @@ local function checked_buffer()
   return cur
 end
 
--- Check the buffer :checkhealth was run from: its language servers, its
--- parser and, for C and C++, its compile_commands.json.
 function M.check()
   health.start("inline-explorer")
   check_version()

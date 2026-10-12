@@ -1,5 +1,5 @@
 -- Expander: resolve the symbol under the cursor and splice its definition into
--- the reading view as a folded, indented block below the call's statement.
+-- the reading view as a foldable, indented block below the call's statement.
 local config = require("inline-explorer.config")
 local profile = require("inline-explorer.profile")
 local resolver = require("inline-explorer.resolver")
@@ -8,8 +8,7 @@ local util = require("inline-explorer.util")
 
 local M = {}
 
--- Names of the expansion blocks that contain row `row` (0-based). Used to
--- stop a symbol from being expanded inside its own body (recursion).
+-- The names of the blocks that contain row `row` (0-based), as a set.
 local function ancestor_names(st, bufnr, row)
   local names = {}
   for _, range in ipairs(view.block_ranges(st, bufnr)) do
@@ -24,9 +23,7 @@ local function notify(msg, level)
   util.notify(msg, level or vim.log.levels.WARN)
 end
 
--- Tree-sitter node types that are a statement's body ({ ... }). A statement
--- that contains one (if/while/for, struct) ends with that body, so the
--- expansion goes before the body, not after its closing brace.
+-- Node types of a statement's body, such as the { ... } of an if or a struct.
 local BODY_TYPES = {
   compound_statement = true, -- C
   block = true, -- Lua, Python, Rust, Go
@@ -34,26 +31,22 @@ local BODY_TYPES = {
   field_declaration_list = true, -- C struct/union bodies
 }
 
--- Whether a node type is a statement or a declaration, going by the type
--- names that tree-sitter grammars use.
 local function is_statement(node_type)
   return node_type:match("statement$") ~= nil or node_type:match("declaration$") ~= nil
 end
 
--- The innermost statement node that contains (row, col). Returns nil when
--- there is no parser, when the walk up reaches a body or the root before a
--- statement, or when the statement contains a syntax error.
+-- The innermost statement node around (row, col), or nil: without a parser,
+-- when the walk up meets a body or the root first, or on a syntax error.
 local function statement_at(bufnr, row, col)
   local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
   if not ok or not parser then
     return nil
   end
-  parser:parse() -- the view changes between expansions, so the last tree may be stale
+  parser:parse()
   local node = parser:named_node_for_range({ row, col, row, col }, { ignore_injections = true })
   while node do
     local t = node:type()
-    -- Bodies are checked first: compound_statement is a body, although its
-    -- name ends in "statement".
+    -- Bodies first: compound_statement is a body, though it ends in "statement".
     if BODY_TYPES[t] then
       return nil
     end
@@ -80,7 +73,7 @@ local function statement_end(node, row)
   for _, child in ipairs(node:named_children()) do
     local t = child:type()
     if BODY_TYPES[t] or t:match("statement$") then
-      local cap -- the last row of what precedes the body
+      local cap
       local prev = child:prev_sibling()
       if prev then
         local _, _, prev_end_row = prev:range()
@@ -99,22 +92,10 @@ local function statement_end(node, row)
   return math.max(last, row)
 end
 
--- Where to put the expansion for the call at (row, col). Returns two 0-based
--- rows:
---   at          Insert below this row. It is the last row of the statement
---               that contains the call, so a call spread over several lines
---               is not split. For a statement with a body (if/while/for,
---               struct), it is the row where the part before the body ends,
---               e.g. the condition's row in `if (f(x)) {`.
---   indent_row  Copy this row's indentation. It is the statement's first
---               row, not a continuation line.
--- Without a statement around the call (no parser, no statement node, or a
--- syntax error in it), both are `row`.
---
--- Example: with the cursor on the first line of
---     areq = af_alg_alloc_areq(sk, sizeof(...) +
---                              crypto_aead_reqsize(tfm));
--- `at` is the second line and `indent_row` the first.
+-- Where to put the expansion of the call at (row, col), as 0-based rows.
+-- Without a statement around the call (see statement_at), both are `row`.
+---@return integer at insert below this row: where the statement ends, so it is not split (see statement_end)
+---@return integer indent_row copy this row's indentation: the statement's first row, not a continuation
 local function splice_row(bufnr, row, col)
   local node = statement_at(bufnr, row, col)
   if not node then
@@ -124,10 +105,7 @@ local function splice_row(bufnr, row, col)
   return statement_end(node, row), math.min(stmt_start_row, row)
 end
 
--- Splice `body` (a list of lines) into `bufnr` just below row `at`, indented
--- one level past row `indent_row`, and track it as a block with an open
--- fold. `label` is the kind of definition (e.g. "function_definition"),
--- shown in the header comment.
+-- Splice `body` below row `at` as a block, indented one level past `indent_row`.
 local function insert(st, bufnr, at, indent_row, name, body, label)
   local opts = config.options
   local indent_line = vim.api.nvim_buf_get_lines(bufnr, indent_row, indent_row + 1, false)[1] or ""
@@ -154,14 +132,9 @@ local function insert(st, bufnr, at, indent_row, name, body, label)
   end)
 end
 
--- Expand the symbol under the cursor: look up its definition and insert it
--- as a folded block below the call's statement (see splice_row).
---
--- `prefetched` ({ name, body, label }) is a definition that the caller has
--- already looked up; it is inserted without another lookup. inliner.lua
--- passes one when it cannot substitute a call in place and falls back to a
--- block. Command and keymap callbacks pass their own opts table here, so a
--- table without a non-empty `body` is ignored.
+-- `prefetched` ({ name, body, label }) is a definition that inliner.lua has
+-- already fetched: it is inserted without a lookup. A user command passes its
+-- opts table here instead, so a table without a non-empty `body` is ignored.
 function M.expand(prefetched)
   local st = view.current()
   if not st then
@@ -190,13 +163,11 @@ function M.expand(prefetched)
   local at, indent_row = splice_row(bufnr, row, col)
 
   if prefetched then
-    -- No profile.begin_action() here, unlike the lookup below: this branch
-    -- runs only as the second half of an inline (inliner.lua) that fell back
-    -- to a block, so its span belongs to that inline's action.
+    -- No profile.begin_action(): this is the block fallback of an inline
+    -- (inliner.lua), whose action this span belongs to.
     local stop_timer = profile.start()
     insert(st, bufnr, at, indent_row, name, prefetched.body, prefetched.label)
-    -- Every expansion ends with a `total:` span, which the benchmark harness
-    -- (tests/lib/bench.lua) waits for.
+    -- Every expansion ends with a `total:` span: tests/lib/bench.lua waits for it.
     stop_timer("total:expand", name)
     return
   end

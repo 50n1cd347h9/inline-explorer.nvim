@@ -1,9 +1,9 @@
--- Small async helpers shared by the LSP-facing modules.
 local M = {}
 
--- Wrap `cb` so it fires exactly once: either with the real response (via the
--- returned `finish`) or, after `ms` milliseconds, with whatever `on_timeout`
--- returns. Calls to `finish` after the first are dropped silently.
+-- The first call to the returned `finish(...)` passes its arguments to `cb`,
+-- and later calls are ignored. If `finish` has not been called within `ms`
+-- milliseconds, `on_timeout()` runs and `cb` gets its return values instead.
+---@return fun(...) finish
 function M.once_with_timeout(cb, on_timeout, ms)
   local finished = false
   local function finish(...)
@@ -14,7 +14,6 @@ function M.once_with_timeout(cb, on_timeout, ms)
     cb(...)
   end
   vim.defer_fn(function()
-    -- Skip on_timeout() entirely when the real response already arrived.
     if not finished then
       finish(on_timeout())
     end

@@ -1,34 +1,20 @@
--- Macro expansion through clangd. A macro has no type or structured body for
--- tree-sitter to work with, so we ask clangd, which runs the real
--- preprocessor (include paths, #define, #ifdef).
---
--- Preferred path: the ExpandMacro tweak. We send textDocument/codeAction, then
--- workspace/executeCommand with the tweak's command. clangd answers by sending
--- us a workspace/applyEdit request. We intercept that request and take its
--- newText as the expansion, instead of applying it to the buffer.
---
--- Fallback (older clangd, a tweak failure, or no answer within
--- TWEAK_TIMEOUT_MS): read the expansion from the textDocument/hover markdown.
---
--- Terms: a "fetch" is one expansion request through the tweak. It registers a
--- "claim" so that the interceptor can recognize its applyEdit. When the fetch
--- ends, its claim becomes a "tombstone", which catches and discards a
--- matching applyEdit for GRACE_MS more (the "grace window"). So a reply that
--- arrives shortly after the timeout does not edit the buffer.
+-- Macro expansion through clangd, which runs the real preprocessor. Preferred:
+-- textDocument/codeAction offers the ExpandMacro tweak, executeCommand runs
+-- it, and clangd sends back a workspace/applyEdit, which we intercept and read
+-- instead of applying. Fallback: the expansion that textDocument/hover shows.
+-- A fetch is one tweak request; its claim lets the interceptor recognize its
+-- applyEdit. When the fetch ends, the claim becomes a tombstone, which for
+-- GRACE_MS (the grace window) discards a late matching applyEdit rather than
+-- let it edit the source buffer.
 
--- csrc.parse caches trees by source text, so a source that another module has
--- already parsed is not parsed again here.
 local csrc = require("inline-explorer.csrc")
 local profile = require("inline-explorer.profile")
--- resolver.client_request calls client.request in the form that the running
--- Neovim uses (a dot call on 0.10, a colon call on 0.11).
 local resolver = require("inline-explorer.resolver")
 local simplify = require("inline-explorer.simplify")
 local util = require("inline-explorer.util")
 
 local M = {}
 
--- `lines` without leading and trailing whitespace-only lines (in place).
 local function trim_blank_lines(lines)
   while lines[1] and lines[1]:match("^%s*$") do
     table.remove(lines, 1)
@@ -39,43 +25,36 @@ local function trim_blank_lines(lines)
   return lines
 end
 
--- Hover.contents (MarkupContent | MarkedString | MarkedString[]) as one
--- markdown string. Language-tagged MarkedStrings come back fenced, which is
--- the shape expansion_lines reads.
 local function hover_markdown(contents)
   return table.concat(vim.lsp.util.convert_input_to_markdown_lines(contents), "\n")
 end
 
--- The expansion lines in clangd's hover markdown for a macro, or nil when the
--- hover shows no expansion. clangd puts the `#define` and the expansion in
--- fenced code, separated by an "Expands to" marker. The marker is either a
--- plain markdown line or a `// Expands to` comment inside the same block. The
--- code after the marker is the expansion.
+-- clangd's hover for a macro shows the `#define` and the expansion in fenced
+-- code, split by an "Expands to" marker: a markdown line, or a `// Expands to`
+-- comment inside the block.
+---@return string[]? lines nil when the hover shows no expansion, {} when it is only blank lines
 local function expansion_lines(md)
   local in_code, seen_marker = false, false
   local after = {}
   for _, l in ipairs(vim.split(md, "\n", { plain = true })) do
     if l:match("^%s*```") then
       in_code = not in_code
-    elseif l:lower():find("expands to", 1, true) then -- plain-text search
-      seen_marker = true -- the marker line itself is dropped
+    elseif l:lower():find("expands to", 1, true) then
+      seen_marker = true
     elseif in_code and seen_marker then
       after[#after + 1] = l
     end
   end
-  -- Without the marker and code after it, this is not a macro expansion (the
-  -- hover may show a function signature, for example), and it must not be
-  -- spliced in.
   if not (seen_marker and #after > 0) then
     return nil
   end
   return trim_blank_lines(after)
 end
 
--- The macro use at (row, col): the whole call_expression for a function-like
--- macro, otherwise the identifier. Returns invocation, is_statement (whether
--- the use is an expression statement of its own), or nil when there is no
--- identifier at (row, col).
+-- The macro use at (row, col): the call_expression when the identifier there
+-- is its callee, else the identifier.
+---@return TSNode? invocation nil when there is no identifier at (row, col)
+---@return boolean? is_statement whether the use is a whole expression statement
 local function find_invocation(root, row, col)
   local node = csrc.ancestor_at(root, row, col, "identifier")
   if not node then
@@ -85,7 +64,6 @@ local function find_invocation(root, row, col)
   local parent = node:parent()
   if parent and parent:type() == "call_expression" then
     local callee = parent:field("function")[1]
-    -- `node` is the name being called, so the use is the whole call.
     if callee and csrc.start_byte(callee) == csrc.start_byte(node) then
       invocation = parent
     end
@@ -95,37 +73,34 @@ local function find_invocation(root, row, col)
   return invocation, is_statement
 end
 
--- Replace the macro use at (row, col) of `src` with the expansion `exp_lines`.
--- `root` is src's tree, when the caller already has it. Returns the new
--- source, or nil and an error message.
+-- `src` with the macro use at (row, col) replaced by `exp_lines`. `root` is
+-- src's parsed root, when the caller has it.
+---@return string? new_src
+---@return string? err
 function M.replace_in_src(src, row, col, exp_lines, root)
   local invocation, is_statement = find_invocation(root or csrc.parse(src), row, col)
   if not invocation then
     return nil, "no macro use under the cursor"
   end
-  -- A copy, so that indenting it below leaves the caller's exp_lines unchanged.
   local parts = {}
   for i, l in ipairs(exp_lines) do
     parts[i] = l
   end
   if #parts > 1 then
-    -- Indent continuation lines to the leading whitespace of the use's line,
-    -- not to everything before the macro (that would repeat `foo = ` on each line).
+    -- The indent of the use's line, not all text before the use, which would
+    -- repeat `foo = ` on each line.
     local indent = csrc.line_indent(src, invocation)
     for i = 2, #parts do
       parts[i] = indent .. parts[i]
     end
   end
-  -- simplify.parens turns `((X))` into `(X)`, which removes the `(({ ... }))`
-  -- nests that kernel macros put around their bodies. Trim after it, because
-  -- the grouped check below is anchored at both ends, and clangd's text can
-  -- start with a space.
+  -- Trimmed because clangd's text can start with a space, which would fail
+  -- the anchored `^%b()$` check below.
   local exp = vim.trim(simplify.parens(table.concat(parts, "\n")))
   local rep = exp
   if not is_statement then
-    -- In an expression, wrap the expansion to keep its precedence, unless it
-    -- already is one balanced (...) or ({...}) group. Then collapse the double
-    -- parentheses that the wrap may have created.
+    -- Parenthesized to keep its precedence in an expression; simplify.parens
+    -- then drops a pair if the wrap doubled one.
     if not exp:match("^%b()$") then
       rep = "(" .. exp .. ")"
     end
@@ -134,20 +109,17 @@ function M.replace_in_src(src, row, col, exp_lines, root)
   return src:sub(1, csrc.start_byte(invocation)) .. rep .. src:sub(csrc.end_byte(invocation) + 1)
 end
 
--- How long the tweak path may take before we give up and fall back to hover.
 local TWEAK_TIMEOUT_MS = 2000
 
--- clangd's "Expand macro" tweak in a codeAction response, as the Command to
--- execute; nil when the response has none.
+---@return lsp.Command? cmd the command of the "Expand macro" action in a codeAction reply
 local function pick_expand_action(actions)
   if type(actions) ~= "table" then
     return nil
   end
   for _, action in ipairs(actions) do
     if type(action) == "table" and type(action.title) == "string" and action.title:find("^Expand macro") then
-      -- The protocol allows two shapes. A CodeAction holds its Command table
-      -- in `.command`. A bare Command has a command-id string there and is
-      -- itself what we execute.
+      -- A CodeAction holds its Command in `.command`; a bare Command has a
+      -- string there.
       local cmd = action
       if type(action.command) == "table" then
         cmd = action.command
@@ -160,7 +132,6 @@ local function pick_expand_action(actions)
   return nil
 end
 
--- Whether LSP position `a` is at or after position `b`.
 local function at_or_after(a, b)
   if a.line ~= b.line then
     return (a.line or 0) > (b.line or 0)
@@ -168,7 +139,7 @@ local function at_or_after(a, b)
   return (a.character or 0) >= (b.character or 0)
 end
 
--- Whether `pos` is inside `range`, both ends included.
+-- Both ends of `range` count as inside.
 local function pos_in_range(pos, range)
   if type(range) ~= "table" or type(range.start) ~= "table" or type(range["end"]) ~= "table" then
     return false
@@ -176,22 +147,22 @@ local function pos_in_range(pos, range)
   return at_or_after(pos, range.start) and at_or_after(range["end"], pos)
 end
 
--- The text edits of `workspace_edit` when it touches document `uri` and
--- nothing else; nil when it also touches another document, or carries a
--- create, rename or delete operation.
+-- The text edits of `workspace_edit`, if it edits document `uri` and nothing
+-- else.
+---@return lsp.TextEdit[]? edits nil if it touches another document or creates, renames or deletes one
 local function edits_only_for(workspace_edit, uri)
   local edits
   if type(workspace_edit.changes) == "table" then
     for k, v in pairs(workspace_edit.changes) do
       if k ~= uri then
-        return nil -- a second document: not ours
+        return nil
       end
       edits = v
     end
   elseif type(workspace_edit.documentChanges) == "table" then
     for _, dc in ipairs(workspace_edit.documentChanges) do
       if type(dc) ~= "table" or type(dc.textDocument) ~= "table" or dc.textDocument.uri ~= uri then
-        return nil -- a foreign uri, or a create/rename/delete operation: not ours
+        return nil
       end
       if type(dc.edits) == "table" then
         edits = edits or {}
@@ -204,10 +175,8 @@ local function edits_only_for(workspace_edit, uri)
   return edits
 end
 
--- Whether `workspace_edit` looks like the ExpandMacro edit for the macro use
--- at `pos` in document `uri`: it touches that document only, and one of its
--- ranges contains `pos`. Other edits (a rename across files, another plugin's
--- code action, an edit elsewhere in the file) fail one of the two tests.
+-- Whether `workspace_edit` can be the ExpandMacro edit for the macro use at
+-- `pos`: it edits document `uri` only, and one of its ranges contains `pos`.
 local function edit_matches(workspace_edit, uri, pos)
   if type(workspace_edit) ~= "table" or type(uri) ~= "string" or type(pos) ~= "table" then
     return false
@@ -224,10 +193,10 @@ local function edit_matches(workspace_edit, uri, pos)
   return false
 end
 
--- The expansion in the tweak's edit: the newText of the first edit for `uri`,
--- as lines without leading and trailing blank lines. nil when there is no
--- such text. Unlike edit_matches, it does not reject an edit that also
--- touches other documents; it reads only edits that edit_matches accepted.
+-- The newText of the first text edit for `uri`, without blank edge lines. It
+-- reads only edits that edit_matches accepted, so other documents are not
+-- checked again.
+---@return string[]? lines nil when there is no text
 local function edit_lines(workspace_edit, uri)
   if type(workspace_edit) ~= "table" then
     return nil
@@ -253,27 +222,24 @@ local function edit_lines(workspace_edit, uri)
   return out
 end
 
--- After a fetch has finished, an applyEdit that still matches its claim is
--- discarded (not passed on to the previous handler) for GRACE_MS more.
---
--- Known limitation: within this window, a genuine single-document edit whose
--- range contains the fetch position (a rename of that very macro, say) is
--- discarded too, and answered { applied = true }. applyEdit carries no id
--- that links it to the executeCommand that caused it, so the two cannot be
--- told apart. The window is kept short for that reason.
+-- The grace window's cost: a genuine edit that matches a tombstone (the user
+-- running a clangd tweak on that same macro use, say) is discarded too, and
+-- answered { applied = true }. applyEdit carries no id that links it to our
+-- executeCommand, so the two cannot be told apart. Hence the short window.
 local GRACE_MS = 3000
 
--- client.id -> list of claims, one per fetch: { uri, pos, on_edit, expires },
--- where uri and pos locate the macro use in LSP terms.
---   in flight: on_edit is set; the fetch is waiting for its applyEdit.
---   tombstone: on_edit is nil; a matching applyEdit is discarded until
---              `expires` (a vim.uv.now() time in milliseconds).
--- Overlapping fetches on one client each keep their own claim, so each one
--- leaves its own tombstone.
+---@class inline_explorer.Claim
+---@field uri string
+---@field pos lsp.Position the macro use
+---@field on_edit? fun(edit: lsp.WorkspaceEdit) set while in flight; nil on a tombstone
+---@field expires? integer the tombstone's end, in vim.uv.now() milliseconds
+
+-- client.id -> claims, one per fetch, so overlapping fetches each leave their
+-- own tombstone.
+---@type table<integer, inline_explorer.Claim[]>
 local claims_by_client = {}
 
--- client.id -> the interceptor installed on that client, to tell whether
--- another plugin has replaced it since.
+-- client.id -> our interceptor, to tell whether another plugin replaced it.
 local interceptor_by_client = {}
 
 local function is_in_flight(claim)
@@ -294,7 +260,6 @@ local function add_claim(client_id, claim)
   claims[#claims + 1] = claim
 end
 
--- Remove the tombstones in `claims` whose grace window has passed.
 local function drop_expired(claims, now)
   for i = #claims, 1, -1 do
     local claim = claims[i]
@@ -304,8 +269,6 @@ local function drop_expired(claims, now)
   end
 end
 
--- The newest claim in `claims` that matches `edit` and is in flight (when
--- `in_flight` is true) or a tombstone (when it is false); nil when none is.
 local function newest_match(claims, edit, in_flight)
   for i = #claims, 1, -1 do
     local claim = claims[i]
@@ -316,16 +279,12 @@ local function newest_match(claims, edit, in_flight)
   return nil
 end
 
--- Install a workspace/applyEdit handler on `client` that
---   1. drops tombstones whose grace window has passed,
---   2. gives a matching edit to the newest in-flight claim,
---   3. discards an edit that matches a tombstone,
---   4. passes anything else to the handler installed before it (or to the
---      global one).
--- It is never removed, because putting the previous handler back could undo
--- a handler that another plugin installed later. Calling this again does
--- nothing while our handler is still installed. If another plugin has
--- replaced it, a new one is installed on top of that plugin's handler.
+-- Installs a workspace/applyEdit handler on `client` that drops expired
+-- tombstones, gives a matching edit to the newest in-flight claim, discards
+-- one that matches a tombstone, and passes anything else to the handler it
+-- replaced (or the global one). It is never removed, since restoring the old
+-- handler could undo one that another plugin installed later. A repeat call
+-- does nothing while ours is still installed.
 local function install_interceptor(client)
   local installed = interceptor_by_client[client.id]
   if installed ~= nil and client.handlers["workspace/applyEdit"] == installed then
@@ -338,12 +297,11 @@ local function install_interceptor(client)
     if claims then
       local now = vim.uv.now()
       drop_expired(claims, now)
-      -- An in-flight claim wins over a tombstone, so a new fetch at a
-      -- position that an older fetch also covered still gets its answer.
+      -- In-flight claims first, so a new fetch at a position that an older
+      -- fetch's tombstone covers still gets its edit.
       local claim = newest_match(claims, edit, true)
       if claim then
-        -- The claim stays, as a tombstone, so a duplicate applyEdit for the
-        -- same tweak is discarded instead of applied.
+        -- Kept as a tombstone, so a duplicate applyEdit is discarded too.
         local on_edit = claim.on_edit
         to_tombstone(claim, now)
         on_edit(edit)
@@ -360,9 +318,7 @@ local function install_interceptor(client)
   interceptor_by_client[client.id] = handler
 end
 
--- Drop the claims and interceptor records of clients that no longer exist,
--- so a restarted clangd leaves no dead entries behind. Client ids are never
--- reused, so this is only housekeeping. Each fetch runs it.
+-- Housekeeping only: client ids are never reused.
 local function prune_dead_clients()
   for id in pairs(claims_by_client) do
     if not vim.lsp.get_client_by_id(id) then
@@ -376,8 +332,6 @@ local function prune_dead_clients()
   end
 end
 
--- Whether `client` advertises clangd's applyTweak command (ExpandMacro).
--- :checkhealth reports the same check.
 function M.supports_tweak(client)
   local provider = (client.server_capabilities or {}).executeCommandProvider
   if type(provider) ~= "table" or type(provider.commands) ~= "table" then
@@ -386,18 +340,14 @@ function M.supports_tweak(client)
   return vim.tbl_contains(provider.commands, "clangd.applyTweak")
 end
 
--- The LSP position of byte column `col` on line `row` of buffer `bufnr`, in
--- `client`'s position encoding (the cursor counts bytes; the server counts
--- in whatever units it negotiated).
+-- `col` is a byte column; the position is in `client`'s encoding.
 local function source_position(bufnr, row, col, client)
   local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
   return { line = row, character = util.lsp_col(line, col, client.offset_encoding) }
 end
 
--- Fetch the expansion through the ExpandMacro tweak. Calls cb(lines) exactly
--- once: with the applyEdit's newText lines on success, or with nil on any
--- failure (no clangd, no tweak support, no tweak at this position, a request
--- error, or the timeout), so that the caller can fall back.
+-- Calls cb(lines) exactly once, with nil on any failure (no clangd or tweak, a
+-- request error, the timeout) so that the caller can fall back.
 local function fetch_via_tweak(bufnr, row, col, cb)
   prune_dead_clients()
   local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd" })[1]
@@ -413,13 +363,9 @@ local function fetch_via_tweak(bufnr, row, col, cb)
   local uri = vim.uri_from_bufnr(bufnr)
   local pos = source_position(bufnr, row, col, client)
 
-  local claim -- set when the codeAction reply offers the tweak; nil before that
+  local claim -- set once codeAction offers the tweak
   local finished = false
-  -- finish(lines) ends the fetch, and calls after the first do nothing. The
-  -- success path, every error path and the timeout call it. It turns this
-  -- fetch's claim into a tombstone, so that a late applyEdit is discarded,
-  -- and calls cb. When the interceptor has taken the edit, the claim is a
-  -- tombstone already.
+  -- Every outcome (the edit, an error, the timeout) ends here.
   local function finish(lines)
     if finished then
       return
@@ -451,8 +397,7 @@ local function fetch_via_tweak(bufnr, row, col, cb)
       return finish(nil)
     end
 
-    -- Claim the applyEdit that the tweak will send back, so that the
-    -- interceptor hands it to on_edit.
+    -- Before executeCommand: clangd sends the applyEdit before it replies.
     claim = {
       uri = uri,
       pos = pos,
@@ -466,14 +411,14 @@ local function fetch_via_tweak(bufnr, row, col, cb)
       command = cmd.command,
       arguments = cmd.arguments,
     }, function(exec_err)
-      -- A successful reply carries no edit: the applyEdit (or the timeout)
-      -- finishes the fetch.
+      -- A success reply carries no edit and follows the applyEdit, which has
+      -- ended the fetch if our claim took it; otherwise the timeout will.
       if exec_err then
         finish(nil)
       end
     end, bufnr)
     if not exec_sent then
-      finish(nil) -- the request never went out; do not wait for the timeout
+      finish(nil)
     end
   end, bufnr)
   if not sent then
@@ -481,13 +426,10 @@ local function fetch_via_tweak(bufnr, row, col, cb)
   end
 end
 
--- Fetch the expansion from clangd's hover at (row, col). This works with any
--- clangd, but reads the expansion out of markdown. Calls cb(lines) once, with
--- nil when the hover shows no expansion.
+-- Calls cb(lines) once, with expansion_lines' result, or nil with no hover.
 local function fetch_via_hover(bufnr, row, col, cb)
-  -- clangd must be attached: its position encoding is needed below, and with
-  -- no client attached, buf_request_all would never call our handler, so cb
-  -- would never run.
+  -- clangd's position encoding is needed, and with no client attached,
+  -- buf_request_all would never call back.
   local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd" })[1]
   if not client then
     return cb(nil)
@@ -512,19 +454,15 @@ local function fetch_via_hover(bufnr, row, col, cb)
   end)
 end
 
--- Fetch the expansion of the macro use at (row, col) of the source file: the
--- ExpandMacro tweak first, hover as the fallback. Calls cb(lines) exactly
--- once, with nil when neither works. `st` is the explorer view state; only
--- st.source_bufnr (the buffer of the original C file) is used. A nil row
--- means the caller could not map its position back to the source (the macro
--- use is on inserted text), so there is nothing to ask.
+-- Calls cb(lines) exactly once: nil when neither the tweak nor the hover has
+-- an expansion, {} when the hover's is only blank lines. (row, col) is in the
+-- source buffer; a nil row (a use with no source line) gives cb(nil) at once.
+---@param st inline_explorer.ViewState
 function M.fetch_expansion(st, row, col, cb)
   if row == nil then
     return cb(nil)
   end
   local bufnr = st.source_bufnr
-  -- profile.start() returns a stop function. Calling it with a label records
-  -- the time since start() under that label.
   local stop_tweak_timer = profile.start()
   fetch_via_tweak(bufnr, row, col, function(lines)
     if lines and #lines > 0 then

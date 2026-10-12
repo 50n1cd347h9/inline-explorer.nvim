@@ -1,5 +1,4 @@
--- Entry point. setup() validates the options, defines the user commands and
--- sets the global keymaps; breadcrumb() is the statusline helper.
+-- Entry point: setup() and the statusline helper breadcrumb().
 local config = require("inline-explorer.config")
 local view = require("inline-explorer.view")
 local expander = require("inline-explorer.expander")
@@ -12,8 +11,6 @@ local util = require("inline-explorer.util")
 
 local M = {}
 
--- :InlineExplorerToggleMode switches config.options.mode, which the inliner
--- reads each time it substitutes.
 local function toggle_mode()
   if config.options.mode == "correct" then
     config.options.mode = "readable"
@@ -23,7 +20,6 @@ local function toggle_mode()
   util.notify("substitution mode = " .. config.options.mode)
 end
 
--- :InlineExplorerProfile [on | off | clear | report | path | open]
 local function run_profile_command(cmd)
   local sub = cmd.args
   if sub == "" then
@@ -31,7 +27,6 @@ local function run_profile_command(cmd)
   end
   if sub == "on" or sub == "off" then
     profile.enabled = sub == "on"
-    -- Start the report afresh; the log file keeps its history.
     profile.clear()
     local msg = "profiling " .. sub
     if sub == "on" and profile.logfile then
@@ -39,7 +34,6 @@ local function run_profile_command(cmd)
     end
     util.notify(msg)
   elseif sub == "clear" then
-    -- true: empty the log file as well as the recorded spans.
     profile.clear(true)
     util.notify("profile cleared")
   elseif sub == "path" then
@@ -50,13 +44,12 @@ local function run_profile_command(cmd)
     else
       util.notify("logging to file is disabled", vim.log.levels.WARN)
     end
-  else -- "report", the default; an unknown argument also gets the report
+  else -- "report", or an unknown argument
     vim.api.nvim_echo({ { profile.report() } }, true, {})
   end
 end
 
 function M.setup(opts)
-  -- The validated options merged over the defaults: the table config.options holds.
   local options = config.setup(opts)
   profile.enabled = options.profile
 
@@ -83,15 +76,13 @@ function M.setup(opts)
   command("InlineExplorerNext", nav.next, { desc = "Jump to the next expansion block" })
   command("InlineExplorerPrev", nav.prev, { desc = "Jump to the previous expansion block" })
   command("InlineExplorerList", nav.list, { desc = "List expansion blocks in the location list" })
-  -- Wrapped: pick.callers takes a completion callback as its first parameter,
-  -- so it must not receive the command's argument table.
+  -- Wrapped, so that pick.callers does not take the command's argument table as done_cb.
   command("InlineExplorerCallers", function()
     pick.callers()
   end, { desc = "Pick a caller of the function under the cursor and go there" })
   command("InlineExplorerTrail", trail.list, { desc = "List the navigation trail in the location list" })
 
-  -- Global keymaps only. The keymaps that work inside a reading view (undo,
-  -- block navigation, callers, gd, the trail) are set by view.open().
+  -- Global keymaps; those local to a reading view are set by view.open().
   local map = vim.keymap.set
   local keymaps = options.keymaps
   if keymaps.open then
@@ -111,10 +102,7 @@ function M.setup(opts)
   end
 end
 
--- Statusline helper: the names of the expansion blocks that contain the
--- cursor, outermost first, joined with " > " (for example "outer > inner").
--- Returns "" outside a reading view. Call it as
--- require("inline-explorer").breadcrumb().
+-- See nav.breadcrumb.
 function M.breadcrumb()
   return nav.breadcrumb()
 end
