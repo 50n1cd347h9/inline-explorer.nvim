@@ -42,7 +42,7 @@ end
 local function check_clients(bufnr)
   local clients = vim.lsp.get_clients({ bufnr = bufnr })
   if #clients == 0 then
-    health.warn("no language server attached to the current buffer", {
+    health.warn("no language server attached to the buffer :checkhealth was run from", {
       "open a source file with an LSP configured, then re-run :checkhealth",
       "expansion fails with 'no language server attached' without one",
     })
@@ -91,12 +91,26 @@ local function check_compile_commands(bufnr)
   end
 end
 
--- Check the current buffer: its language servers, its parser and, for C and
--- C++, its compile_commands.json.
+-- The buffer to report on. :checkhealth runs the checks in its own
+-- health:// buffer, so the file it was run from is the alternate buffer.
+local function checked_buffer()
+  local cur = vim.api.nvim_get_current_buf()
+  if not vim.startswith(vim.api.nvim_buf_get_name(cur), "health://") then
+    return cur
+  end
+  local alt = vim.fn.bufnr("#")
+  if alt > 0 and vim.api.nvim_buf_is_valid(alt) then
+    return alt
+  end
+  return cur
+end
+
+-- Check the buffer :checkhealth was run from: its language servers, its
+-- parser and, for C and C++, its compile_commands.json.
 function M.check()
   health.start("inline-explorer")
   check_version()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = checked_buffer()
   check_clients(bufnr)
   local ft = vim.bo[bufnr].filetype
   if ft ~= "" then

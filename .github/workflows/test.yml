@@ -40,7 +40,7 @@ jobs:
       - name: Run fast suites
         run: |
           set -e
-          for s in gen_spec properties_spec pbt_spec ir_spec substitute_spec macro_spec resolver_spec expander_spec bench_lib_spec trail_spec callers_spec pick_spec real_source_lib_spec; do
+          for s in gen_spec properties_spec pbt_spec ir_spec substitute_spec macro_spec resolver_spec expander_spec bench_lib_spec trail_spec callers_spec pick_spec health_spec real_source_lib_spec; do
             echo "==== tests/$s.lua"
             out=$(nvim --headless --clean -u NONE -c "luafile tests/$s.lua" -c "qa!" 2>&1 | tr '\r' '\n')
             echo "$out"
