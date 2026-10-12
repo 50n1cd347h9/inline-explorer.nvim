@@ -64,8 +64,8 @@ check(
   tostring(vim.api.nvim_buf_is_valid(v1))
 )
 
-local saved_n = trail._stack_n
-trail._stack_n = 2
+local saved_n = trail._stack_max
+trail._stack_max = 2
 vim.cmd.edit(paths[1])
 local a = view.open()
 trail.goto_location(loc_of(2))
@@ -91,7 +91,7 @@ trail.goto_location(loc_of(2))
 trail.goto_location(loc_of(3)) -- stack full: f1's and f2's views
 check("back at a full stack: steps back", trail.back() == true)
 check("back at a full stack: depth never exceeds the cap", #trail._stack <= 2, #trail._stack)
-trail._stack_n = saved_n
+trail._stack_max = saved_n
 trail.clear()
 
 -- Abandoning a fresh view by a plain buffer switch must not leak its

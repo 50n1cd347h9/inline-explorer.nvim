@@ -9,7 +9,7 @@
 -- every textual call, including through macros the AST cannot follow, but
 -- cannot tell two same-named statics apart. The label is what tells the
 -- user which contract they are looking at.
-local C = require("inline-explorer.csrc")
+local csrc = require("inline-explorer.csrc")
 
 local M = {}
 
@@ -106,16 +106,16 @@ local function grep_callers(name, root, cb)
         local ok, flines = pcall(vim.fn.readfile, file)
         if ok then
           local src = table.concat(flines, "\n")
-          local pok, root_node = pcall(C.parse, src)
+          local pok, root_node = pcall(csrc.parse, src)
           if pok then
             for _, h in ipairs(hits) do
               -- the innermost call_expression must be calling this identifier
-              local call = C.ancestor_at(root_node, h.lnum, h.col, "call_expression")
+              local call = csrc.ancestor_at(root_node, h.lnum, h.col, "call_expression")
               local fn = call and call:field("function")[1]
-              if fn and C.text(fn, src) == name then
+              if fn and csrc.text(fn, src) == name then
                 -- enclosing function name, "?" when there is none
-                local fdef = C.ancestor_at(root_node, h.lnum, h.col, "function_definition")
-                local encl = fdef and C.function_name(fdef, src) or "?"
+                local fdef = csrc.ancestor_at(root_node, h.lnum, h.col, "function_definition")
+                local encl = fdef and csrc.function_name(fdef, src) or "?"
                 items[#items + 1] = {
                   name = encl,
                   uri = vim.uri_from_fname(file),

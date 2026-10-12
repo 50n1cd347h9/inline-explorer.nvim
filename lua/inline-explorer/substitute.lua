@@ -24,9 +24,9 @@
 -- layout-only printers: pretty / canonical statement-expression /
 -- readable-multi). This module is the facade: it keeps the public API and
 -- test hooks stable while delegating to those three.
-local C = require("inline-explorer.csrc")
-local A = require("inline-explorer.canalyze")
-local P = require("inline-explorer.cprint")
+local csrc = require("inline-explorer.csrc")
+local canalyze = require("inline-explorer.canalyze")
+local cprint = require("inline-explorer.cprint")
 
 local M = {}
 
@@ -37,40 +37,40 @@ local function print_call(caller_src, ir, ctx, err, mode)
   if not ir then
     return nil, err
   end
-  return P.PRINTERS[A.decide(ir, ctx, mode or "correct")](caller_src, ir, ctx)
+  return cprint.PRINTERS[canalyze.decide(ir, ctx, mode or "correct")](caller_src, ir, ctx)
 end
 
 function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
-  local ir, ctx, err = A.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
+  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
   return print_call(caller_src, ir, ctx, err, mode)
 end
 
 -- Test/introspection hook: run the analysis without printing.
 function M._probe(caller_src, callee_src, fname, occ, mode)
-  local call = C.find_calls(C.parse(caller_src), caller_src, fname, occ or 1)[occ or 1]
+  local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ or 1)[occ or 1]
   if not call then
     return nil, "call to '" .. fname .. "' not found"
   end
-  local ir, err = A.analyze_callee(callee_src, fname, 1, A.enclosing_scope(call, caller_src))
+  local ir, err = canalyze.analyze_callee(callee_src, fname, 1, canalyze.names_in_scope(call, caller_src))
   if not ir then
     return nil, err
   end
-  local ctx = A.analyze_context(caller_src, call)
-  return { ir = ir, ctx = ctx, decision = A.decide(ir, ctx, mode or "correct") }
+  local ctx = canalyze.analyze_context(caller_src, call)
+  return { ir = ir, ctx = ctx, decision = canalyze.decide(ir, ctx, mode or "correct") }
 end
 
 -- Test hooks for the property suites: the layout helpers, and a renderer that
 -- forces a named printer, bypassing decide() -- used to check that canonical
 -- and pretty output of the same call are semantically identical.
-M._rebase = C.rebase
-M._common_ws_prefix = C.common_ws_prefix
+M._rebase = csrc.reindent
+M._common_ws_prefix = csrc.common_ws_prefix
 
 function M._render(caller_src, callee_src, fname, N, occ, printer)
-  local p = P.PRINTERS[printer]
+  local p = cprint.PRINTERS[printer]
   if not p then
     return nil, "unknown printer '" .. tostring(printer) .. "'"
   end
-  local ir, ctx, err = A.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
+  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
   if not ir then
     return nil, err
   end
@@ -82,7 +82,7 @@ end
 -- `root`, when given, is caller_src's tree already (a buffer's own parse);
 -- otherwise caller_src is parsed.
 local function named_call_at(caller_src, row, col, root)
-  local call = C.ancestor_at(root or C.parse(caller_src), row, col, "call_expression")
+  local call = csrc.ancestor_at(root or csrc.parse(caller_src), row, col, "call_expression")
   if not call then
     return nil, "no call under the cursor"
   end
@@ -90,7 +90,7 @@ local function named_call_at(caller_src, row, col, root)
   if not fn or fn:type() ~= "identifier" then
     return nil, "call target is not a plain function name"
   end
-  return call, C.text(fn, caller_src)
+  return call, csrc.text(fn, caller_src)
 end
 
 -- Name of the function called at (row, col), or nil.
@@ -108,7 +108,7 @@ function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)
   if not call then
     return nil, fname
   end
-  local ir, ctx, err = A.analyze_call_node(caller_src, callee_src, fname, N or 1, call)
+  local ir, ctx, err = canalyze.analyze_call_node(caller_src, callee_src, fname, N or 1, call)
   return print_call(caller_src, ir, ctx, err, mode)
 end
 

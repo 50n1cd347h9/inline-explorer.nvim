@@ -2,7 +2,7 @@
 -- defensively at every level, so faithful expansions arrive wrapped in noise
 -- like `(({ ... }))`; the pretty printer's own `(expr)` wrapping can also
 -- double up when the return expression was already parenthesized.
-local C = require("inline-explorer.csrc")
+local csrc = require("inline-explorer.csrc")
 
 local M = {}
 
@@ -42,8 +42,8 @@ function M.parens(text)
     if node:type() == "parenthesized_expression" and node:named_child_count() == 1 then
       local child = node:named_child(0)
       if child:type() == "parenthesized_expression" then
-        cuts[#cuts + 1] = C.sb(node) -- the '('
-        cuts[#cuts + 1] = C.eb(node) - 1 -- the ')'
+        cuts[#cuts + 1] = csrc.start_byte(node) -- the '('
+        cuts[#cuts + 1] = csrc.end_byte(node) - 1 -- the ')'
       end
     end
     for c in node:iter_children() do

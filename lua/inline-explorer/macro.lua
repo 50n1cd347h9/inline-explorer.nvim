@@ -13,11 +13,8 @@ local M = {}
 -- same smart-inline keypress parsed the caller cached on the substitute
 -- path and re-parsed it uncached here -- measured at 33-42ms on a
 -- 13k-line kernel file against ~0ms for the cache hit.
-local C = require("inline-explorer.csrc")
+local csrc = require("inline-explorer.csrc")
 local util = require("inline-explorer.util")
-local parse = C.parse
-local sb = C.sb
-local eb = C.eb
 
 -- `lines` without leading and trailing whitespace-only lines (in place).
 local function trim_blank_lines(lines)
@@ -67,12 +64,17 @@ M._hover_markdown = hover_markdown
 -- The macro use under (row, col): the whole call_expression for a function-like
 -- macro, else the identifier. Also whether it sits in statement position.
 local function find_invocation(root, row, col)
-  local node = C.ancestor_at(root, row, col, "identifier")
+  local node = csrc.ancestor_at(root, row, col, "identifier")
   if not node then
     return nil
   end
   local inv, p = node, node:parent()
-  if p and p:type() == "call_expression" and p:field("function")[1] and sb(p:field("function")[1]) == sb(node) then
+  if
+    p
+    and p:type() == "call_expression"
+    and p:field("function")[1]
+    and csrc.start_byte(p:field("function")[1]) == csrc.start_byte(node)
+  then
     inv = p
   end
   local stmt = inv:parent() and inv:parent():type() == "expression_statement"
@@ -81,7 +83,7 @@ end
 
 -- Replace the macro use under the cursor with `exp_lines`. Returns new_src, err.
 function M.replace_in_src(src, row, col, exp_lines, root)
-  local inv, stmt_ctx = find_invocation(root or parse(src), row, col)
+  local inv, stmt_ctx = find_invocation(root or csrc.parse(src), row, col)
   if not inv then
     return nil, "no macro use under the cursor"
   end
@@ -92,7 +94,7 @@ function M.replace_in_src(src, row, col, exp_lines, root)
   if #parts > 1 then
     -- Indent continuation lines to the leading whitespace of the use's line
     -- (NOT everything before the macro, which would repeat `foo = ` on each line).
-    local indent = C.line_indent(src, inv)
+    local indent = csrc.line_indent(src, inv)
     for i = 2, #parts do
       parts[i] = indent .. parts[i]
     end
@@ -118,7 +120,7 @@ function M.replace_in_src(src, row, col, exp_lines, root)
   if not stmt_ctx then
     rep = simplify.parens(rep)
   end
-  return src:sub(1, sb(inv)) .. rep .. src:sub(eb(inv) + 1)
+  return src:sub(1, csrc.start_byte(inv)) .. rep .. src:sub(csrc.end_byte(inv) + 1)
 end
 
 -- How long the tweak path may take before we give up and fall back to hover.

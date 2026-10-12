@@ -478,8 +478,8 @@ do
     -- Attachment hygiene: definition-file attachments are cached (dropping
     -- them makes clangd rebuild the header's preamble on every repeat), and
     -- the least recently used entry beyond the capacity is detached.
-    local saved_cap = resolver._attach_cache_n
-    resolver._attach_cache_n = 1
+    local saved_cap = resolver._attach_cache_max
+    resolver._attach_cache_max = 1
     local function extract_temp_header(name, body)
       local hp = vim.fn.tempname() .. ".h"
       H.writef(hp, body)
@@ -507,7 +507,7 @@ do
       evicted == 0 and newest > 0,
       ("old=%d new=%d"):format(evicted, newest)
     )
-    resolver._attach_cache_n = saved_cap
+    resolver._attach_cache_max = saved_cap
 
     resolver._timeout_ms = saved
     resolver._local_first = saved_lf
@@ -639,8 +639,8 @@ do
     )
 
     -- Capacity is honoured rather than growing without bound.
-    local saved_n = resolver._locate_cache_n
-    resolver._locate_cache_n = 2
+    local saved_n = resolver._locate_cache_max
+    resolver._locate_cache_max = 2
     resolver.clear_caches()
     for i = 1, 5 do
       local done = false
@@ -656,7 +656,7 @@ do
       n = n + 1
     end
     check("cache: locate cache is bounded by its capacity", n <= 2, ("entries=%d"):format(n))
-    resolver._locate_cache_n = saved_n
+    resolver._locate_cache_max = saved_n
     resolver._local_first = saved_lf2
     resolver.clear_caches()
 

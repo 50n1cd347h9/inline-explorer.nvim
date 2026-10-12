@@ -55,7 +55,7 @@ check("header comment present", text:find("/* v helper (function_definition) */"
 check("footer comment present", text:find("/* ^ helper */", 1, true) ~= nil, text)
 check("body indented one level past the call line", text:find("\n      static int helper", 1, true) ~= nil, text)
 check("view stays nomodifiable", vim.bo[vbuf].modifiable == false)
-check("one expansion node tracked", #view.current().nodes == 1)
+check("one expansion node tracked", #view.current().blocks == 1)
 
 -- Recursion guard: cursor inside the expansion, same name -> no second splice.
 local before = vim.api.nvim_buf_line_count(vbuf)
@@ -79,7 +79,7 @@ require("inline-explorer.history").undo()
 check("undo restores the original view", vim.api.nvim_buf_line_count(vbuf) == 4)
 require("inline-explorer.history").redo()
 check("redo brings the expansion back", vim.api.nvim_buf_line_count(vbuf) == before)
-check("redo brings it back as a tracked block", #view.current().nodes == 1, #view.current().nodes)
+check("redo brings it back as a tracked block", #view.current().blocks == 1, #view.current().blocks)
 require("inline-explorer.history").undo()
 
 -- Line-origin bookkeeping: after undo the map is identity again; a splice
@@ -107,7 +107,7 @@ do
   local lines_now = vim.api.nvim_buf_get_lines(vbuf, 0, -1, false)
   lines_now[3] = "    int r = (0);"
   view.rewrite(st, vbuf, table.concat(lines_now, "\n"), 2)
-  check("rewrite: node survives an unrelated line change", #st.nodes == 1, #st.nodes)
+  check("rewrite: node survives an unrelated line change", #st.blocks == 1, #st.blocks)
   check("rewrite: changed line loses its origin", view.src_line(st, 2) == nil, vim.inspect(st.origin))
   check(
     "rewrite: unchanged lines keep origins",
@@ -119,10 +119,10 @@ do
   -- takes it away again. The block survives both.
   require("inline-explorer.history").undo()
   check("undo of a rewrite restores the line's origin", view.src_line(st, 2) == 2, view.src_line(st, 2))
-  check("undo of a rewrite keeps the block", #st.nodes == 1, #st.nodes)
+  check("undo of a rewrite keeps the block", #st.blocks == 1, #st.blocks)
   require("inline-explorer.history").redo()
   check("redo of a rewrite drops the origin again", view.src_line(st, 2) == nil, view.src_line(st, 2))
-  check("redo of a rewrite keeps the block", #st.nodes == 1, #st.nodes)
+  check("redo of a rewrite keeps the block", #st.blocks == 1, #st.blocks)
 
   -- A rewrite replaces only the lines that differ.
   check(
@@ -201,7 +201,7 @@ do
     "prefetched body is what got spliced",
     table.concat(vim.api.nvim_buf_get_lines(vbuf, 0, -1, false), "\n"):find("prefetched_fn(void)", 1, true) ~= nil
   )
-  check("prefetched splice is tracked as a node", #st.nodes >= 1, #st.nodes)
+  check("prefetched splice is tracked as a node", #st.blocks >= 1, #st.blocks)
   check(
     "prefetched expand records a total:expand span",
     (function()

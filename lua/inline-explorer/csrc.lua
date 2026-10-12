@@ -21,7 +21,7 @@ local M = {}
 -- TSNode anchors its TSTree through its function environment (verified:
 -- a root cached alone survived 50 GC cycles with all children and ranges
 -- intact). An earlier version of this comment claimed the opposite.
-M._parse_cache_n = 4
+M._parse_cache_max = 4
 M._parse_cache = {}
 
 function M.parse(src)
@@ -34,27 +34,27 @@ function M.parse(src)
   local tree = parser:parse()[1]
   local root = tree:root()
   M._parse_cache[src] = { parser = parser, tree = tree, root = root, at = vim.uv.hrtime() }
-  util.evict_lru(M._parse_cache, M._parse_cache_n)
+  util.evict_lru(M._parse_cache, M._parse_cache_max)
   return root
 end
 
 -- TSNode from a string parser exposes byte offsets only via range(true).
-function M.sb(node)
+function M.start_byte(node)
   return (select(3, node:range(true)))
 end
-function M.eb(node)
+function M.end_byte(node)
   return (select(6, node:range(true)))
 end
-function M.scol(node)
+function M.start_col(node)
   return (select(2, node:range(true)))
 end
 -- Byte offset of the start of the line `node` starts on.
-function M.bol(node)
-  return M.sb(node) - M.scol(node)
+function M.line_start_byte(node)
+  return M.start_byte(node) - M.start_col(node)
 end
 -- The leading space/tab run of the line `node` starts on.
 function M.line_indent(src, node)
-  return src:match("^[ \t]*", M.bol(node) + 1)
+  return src:match("^[ \t]*", M.line_start_byte(node) + 1)
 end
 
 -- The innermost node of type `ty` enclosing (row, col), or nil.
@@ -67,7 +67,7 @@ function M.ancestor_at(root, row, col, ty)
 end
 
 function M.text(node, src)
-  return src:sub(M.sb(node) + 1, M.eb(node))
+  return src:sub(M.start_byte(node) + 1, M.end_byte(node))
 end
 
 function M.query_nodes(node, src, q)
@@ -420,7 +420,7 @@ function M.build_bind(param, arg, rename, N, idx, src)
       end
     end
     if d and d:type() == "identifier" then
-      local spec = src:sub(M.sb(param.node) + 1, M.sb(decl)):gsub("%s+$", "")
+      local spec = src:sub(M.start_byte(param.node) + 1, M.start_byte(decl)):gsub("%s+$", "")
       local name = rename[M.text(d, src)] or M.text(d, src)
       return string.format("%s %s%s = (%s);", spec, stars, name, arg)
     end
@@ -471,7 +471,7 @@ end
 
 -- Dedent a fragment to its common indent, then re-indent each line under `target`.
 -- Relative nesting (and the source's tabs/spaces) is preserved.
-function M.rebase(fragment, target)
+function M.reindent(fragment, target)
   local lines = vim.split(fragment, "\n", { plain = true })
   local strip = #M.common_ws_prefix(lines)
   local out = {}

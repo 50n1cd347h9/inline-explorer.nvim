@@ -11,7 +11,7 @@ local M = {}
 -- Used to stop a symbol from being expanded inside its own body (recursion).
 local function ancestor_names(st, bufnr, lnum)
   local names = {}
-  for _, node in ipairs(view.live_nodes(st, bufnr)) do
+  for _, node in ipairs(view.block_ranges(st, bufnr)) do
     if lnum >= node.s and lnum <= node.e then
       names[node.name] = true
     end
@@ -120,7 +120,7 @@ local function insert(st, bufnr, at, indent_row, name, body, label)
 
   view.change(st, bufnr, function()
     view.set_lines(bufnr, at + 1, at + 1, out)
-    view.add_node(st, bufnr, name, at + 1, at + #out)
+    view.add_block(st, bufnr, name, at + 1, at + #out)
   end)
 end
 

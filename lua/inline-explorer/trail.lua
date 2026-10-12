@@ -19,7 +19,7 @@ local M = {}
 -- forward history. Capacity is a module field so tests can shrink it.
 M._stack = {}
 M._pos = 0
-M._stack_n = 8
+M._stack_max = 8
 
 local function wipe(buf)
   -- The state entry goes unconditionally: an INVALID buffer's entry is
@@ -27,11 +27,11 @@ local function wipe(buf)
   -- view) but the entry, with its full origin array and undo snapshots,
   -- stayed behind a validity guard that skipped it forever.
   if not vim.api.nvim_buf_is_valid(buf) then
-    view.state[buf] = nil
+    view.forget(buf)
     return
   end
   if #vim.fn.win_findbuf(buf) == 0 then
-    view.state[buf] = nil
+    view.forget(buf)
     pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end
 end
@@ -48,7 +48,7 @@ function M.clear()
   M._stack, M._pos = {}, 0
   -- The view being looked at survives clear(); closing it is view.close's
   -- job, not the trail's.
-  if view.state[cur] then
+  if view.is_view(cur) then
     vim.bo[cur].bufhidden = "wipe"
   end
 end
@@ -66,7 +66,7 @@ end
 
 local function push_current()
   local cur = vim.api.nvim_get_current_buf()
-  if not view.state[cur] then
+  if not view.is_view(cur) then
     return
   end
   -- A new navigation from a back-state drops forward history -- browser and
@@ -84,7 +84,7 @@ local function push_current()
   M._pos = #M._stack
   -- Depth cap: evict from the bottom. An evicted buffer may still appear
   -- higher in the stack (buffer reuse), so only wipe it when it does not.
-  while #M._stack > M._stack_n do
+  while #M._stack > M._stack_max do
     local e = table.remove(M._stack, 1)
     M._pos = M._pos - 1
     local still_referenced = false
@@ -123,7 +123,7 @@ function M.goto_location(loc)
   -- Entering trail-land from a plain buffer opens its view first, so the
   -- journey is view-to-view from the very first hop.
   local cur = vim.api.nvim_get_current_buf()
-  if not view.state[cur] and vim.api.nvim_buf_get_name(cur) ~= "" then
+  if not view.is_view(cur) and vim.api.nvim_buf_get_name(cur) ~= "" then
     view.open()
   end
   push_current()

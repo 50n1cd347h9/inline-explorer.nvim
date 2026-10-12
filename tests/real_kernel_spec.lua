@@ -471,7 +471,7 @@ do
       end, 20)
     end
   end
-  local nodes_before = #(view.state[v0].nodes or {})
+  local nodes_before = #(view.state[v0].blocks or {})
   local before = vim.api.nvim_buf_line_count(v0)
   check("kernel trail: an expansion exists before the switch", nodes_before > 0, nodes_before)
   if items and #items > 0 then
@@ -482,10 +482,10 @@ do
     check("kernel trail: back restores the SAME buffer", vim.api.nvim_get_current_buf() == v0)
     check(
       "kernel trail: the expansion survived the round trip",
-      #(view.state[v0].nodes or {}) == nodes_before and vim.api.nvim_buf_line_count(v0) == before,
+      #(view.state[v0].blocks or {}) == nodes_before and vim.api.nvim_buf_line_count(v0) == before,
       ("nodes %d->%d lines %d->%d"):format(
         nodes_before,
-        #(view.state[v0].nodes or {}),
+        #(view.state[v0].blocks or {}),
         before,
         vim.api.nvim_buf_line_count(v0)
       )

@@ -1160,8 +1160,8 @@ do
   )
 
   -- Capacity is honoured rather than growing without bound.
-  local saved = C._parse_cache_n
-  C._parse_cache_n = 2
+  local saved = C._parse_cache_max
+  C._parse_cache_max = 2
   C._parse_cache = {}
   for i = 1, 5 do
     C.parse(("int f%d(void) { return %d; }\n"):format(i, i))
@@ -1171,7 +1171,7 @@ do
     n = n + 1
   end
   check("parse cache: bounded by its capacity", n <= 2, ("entries=%d"):format(n))
-  C._parse_cache_n = saved
+  C._parse_cache_max = saved
   C._parse_cache = {}
 
   vim.treesitter.get_string_parser = real

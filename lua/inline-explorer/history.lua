@@ -23,7 +23,7 @@ local function step(cmd, nothing)
   if vim.fn.undotree().seq_cur == before then
     return util.notify(nothing, vim.log.levels.INFO)
   end
-  view.restore_nodes(st, bufnr)
+  view.restore_blocks(st, bufnr)
 end
 
 function M.undo()

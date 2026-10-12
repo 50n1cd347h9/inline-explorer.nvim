@@ -12,7 +12,7 @@ end
 
 -- Live blocks as sorted { s, e, name } (0-based rows, extmark-tracked).
 local function blocks(st, bufnr)
-  local out = view.live_nodes(st, bufnr)
+  local out = view.block_ranges(st, bufnr)
   table.sort(out, function(a, b)
     return a.s < b.s
   end)

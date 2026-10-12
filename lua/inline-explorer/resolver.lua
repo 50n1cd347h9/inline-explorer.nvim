@@ -83,8 +83,8 @@ end
 -- until the plugin was pointed at the source it was written for.
 --
 -- Capacities are module fields so tests can shrink them.
-M._locate_cache_n = 64
-M._extract_cache_n = 64
+M._locate_cache_max = 64
+M._extract_cache_max = 64
 M._locate_cache = {}
 M._extract_cache = {}
 
@@ -251,7 +251,7 @@ function M.locate(name, source_bufnr, cb)
   local finish = once_with_timeout(function(loc, err)
     span(loc and "locate:ok" or "locate:miss", loc and describe(loc.name or name, loc.uri) or name)
     if loc then
-      cache_put(M._locate_cache, key, loc, (def_tick(loc.uri)), M._locate_cache_n)
+      cache_put(M._locate_cache, key, loc, (def_tick(loc.uri)), M._locate_cache_max)
     end
     cb(loc, err)
   end, function()
@@ -483,7 +483,7 @@ end
 
 -- LRU cache of definition-file attachments (target bufnr -> { ids, at }).
 -- Capacity is a module field so tests can shrink it.
-M._attach_cache_n = 8
+M._attach_cache_max = 8
 M._attach_cache = {}
 
 local function cache_attachment(target, newly_attached)
@@ -493,7 +493,7 @@ local function cache_attachment(target, newly_attached)
   elseif #newly_attached > 0 then
     cache[target] = { ids = newly_attached, at = vim.uv.now() }
   end
-  util.evict_lru(cache, M._attach_cache_n, function(b, e)
+  util.evict_lru(cache, M._attach_cache_max, function(b, e)
     if vim.api.nvim_buf_is_valid(b) and #vim.fn.win_findbuf(b) == 0 then
       for _, id in ipairs(e.ids) do
         pcall(vim.lsp.buf_detach_client, b, id)
@@ -612,7 +612,7 @@ function M.extract(loc, source_bufnr, cb)
   -- and had never been reproduced; the ratio holds, the absolute numbers
   -- did not, so they are replaced with ones that can be re-derived from the
   -- method above. The least
-  -- recently used entries beyond _attach_cache_n are detached instead, so a
+  -- recently used entries beyond _attach_cache_max are detached instead, so a
   -- long session stays bounded without repaying the preamble every keypress.
   -- A buffer the user actually has in a window is never detached.
   local attach_span = profile.start()
@@ -662,7 +662,7 @@ function M.extract(loc, source_bufnr, cb)
     local llines, llabel = extract_local(loc, target)
     if llines then
       if etick then
-        cache_put(M._extract_cache, ekey, { llines, llabel }, etick, M._extract_cache_n)
+        cache_put(M._extract_cache, ekey, { llines, llabel }, etick, M._extract_cache_max)
       end
       span("extract:local", detail())
       return cb(llines, llabel)
@@ -710,7 +710,7 @@ function M.extract(loc, source_bufnr, cb)
     -- whatever the user was shown is what they get again, and the
     -- changedtick guard retires it as soon as the file changes.
     if lines and etick and not timed_out then
-      cache_put(M._extract_cache, ekey, { lines, label }, etick, M._extract_cache_n)
+      cache_put(M._extract_cache, ekey, { lines, label }, etick, M._extract_cache_max)
     end
     cb(lines, label)
   end, function()
@@ -744,7 +744,7 @@ function M.extract(loc, source_bufnr, cb)
         if ok2 and lines then
           local now_tick = tick_of(target)
           if now_tick then
-            cache_put(M._extract_cache, ekey, { lines, label }, now_tick, M._extract_cache_n)
+            cache_put(M._extract_cache, ekey, { lines, label }, now_tick, M._extract_cache_max)
           end
         end
         if probe then
@@ -935,7 +935,13 @@ end
 -- rules; a definition file we cannot tick is simply not cached, same as in
 -- locate.
 function M._locate_cache_replace(name, source_bufnr, dloc)
-  cache_put(M._locate_cache, locate_key(source_buf(source_bufnr), name), dloc, (def_tick(dloc.uri)), M._locate_cache_n)
+  cache_put(
+    M._locate_cache,
+    locate_key(source_buf(source_bufnr), name),
+    dloc,
+    (def_tick(dloc.uri)),
+    M._locate_cache_max
+  )
 end
 
 -- Composed lookup: name -> definition. locate then extract, chasing a

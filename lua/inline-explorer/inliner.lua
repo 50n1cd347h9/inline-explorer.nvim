@@ -88,7 +88,7 @@ function M.smart()
     local prefetched = { name = ident, body = lines, label = label }
     if fname and label == "function_definition" then
       local N = (st.subst_n or 0) + 1
-      -- substitute covers parse, analysis (including enclosing_scope's
+      -- substitute covers parse, analysis (including names_in_scope's
       -- whole-translation-unit walk) and printing. Kept as one span
       -- deliberately -- splitting it further would need the boundary
       -- inside substitute itself -- but it now says which callee and how
