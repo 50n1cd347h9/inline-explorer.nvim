@@ -89,7 +89,7 @@ require("inline-explorer").setup({
     trail_forward = "<C-i>",
   },
   indent = "  ",    -- indent per expansion level
-  header = true,    -- wrap expansions in /* v name */ ... /* ^ name */
+  header = true,    -- wrap expansions in /* v name (label) */ ... /* ^ name */
   mode = "correct", -- inline style: "correct" or "readable"
   profile = false,  -- record latency from startup
 })

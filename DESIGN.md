@@ -29,18 +29,20 @@ real, cursor-navigable buffer text. The copy buffer makes that safe.
 No server is attached to the copy buffer, and nested expansions sit on inserted
 text that has no position in any real file. So the symbol under the cursor is
 resolved by **name** (`workspace/symbol`), which works identically at depth 0 and
-depth N. Once resolved, the server's `textDocument/documentSymbol` supplies the
-definition's full range; tree-sitter extraction only takes over as a fallback
-when the server doesn't provide a usable range.
+depth N. Once resolved, the definition's lines come from tree-sitter first for
+C/C++ (it finds the same range without waiting for the server to build the
+file's preamble), and from the server's `textDocument/documentSymbol` range
+first for other languages; each falls back to the other, then to a brace
+heuristic.
 
 ## Components
 
 - **View** (`view.lua`) — open/close the copy buffer, track per-view expansion
-  nodes (extmarks).
+  blocks (extmarks).
 - **Resolver** (`resolver.lua`) — `name -> definition location` via the attached
-  server's `workspace/symbol` (any language), then `location -> body lines` via
-  the server's `textDocument/documentSymbol` full range (tree-sitter, then a
-  brace heuristic, as fallbacks when no server range is available).
+  server's `workspace/symbol` (any language), then `location -> body lines`:
+  tree-sitter first for C/C++, the server's `textDocument/documentSymbol` range
+  first for other languages, a brace heuristic last.
 - **Expander** (`expander.lua`) — splice the body below the call's statement, indent,
   wrap in a fold, guard against self-recursion.
 - **Config / init** — options, user commands, keymaps.
@@ -51,8 +53,8 @@ A second, stronger mode (`substitute.lua` + `inliner.lua`): instead of pasting t
 definition below the call, rewrite the call into the effect of the body — true
 compiler-style inlining — so the surrounding statement reads on its own.
 
-Decisions (from brainstorming): C-only, `goto` allowed, no fallback to
-block-paste, rigour level X (compile-correct).
+Decisions (from brainstorming): C-only, `goto` allowed, block-paste only for
+calls the analysis rejects, rigour level X (compile-correct).
 
 Since the 2026-07 restructuring the engine is a pipeline: `analyze_callee`
 resolves the callee into a small IR, `analyze_context` resolves the call
@@ -70,16 +72,19 @@ Mechanism:
 - A callee whose only `return` is its last statement and carries a value
   renders as a *pretty hoist* (setup lifted above the call statement, return
   expression spliced in, parenthesised) when the call runs unconditionally;
-  readable mode uses it either way.
+  readable mode uses it either way. A declaration that lines cannot be inserted
+  above gets the canonical form in both modes, since wrapping it in a block
+  would end its scope early.
 - Everything else renders as a GNU statement expression `({ ... })` with each
   `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and the
   reconstructed declared return type as `__ie_retN`'s value slot. This makes
-  *any* function inlinable as an expression, so there is no block-paste fallback.
-- Callee labels (function-scoped) and hoisted locals that collide with the caller
-  scope are suffixed `name__ieN`, keyed by a per-expansion id N, so repeated and
-  nested inlining stays correct.
-- Truly non-inlinable cases (variadic, macros) report an error rather than
-  producing wrong code.
+  *any* function inlinable as an expression.
+- Callee labels (function-scoped), and parameters and top-level locals that
+  collide with the caller scope, are suffixed `name__ieN`, keyed by a
+  per-expansion id N, so repeated and nested inlining stays correct.
+- Calls the analysis rejects (variadic functions, for example) are not
+  rewritten: the inliner falls back to block-paste (`<leader>ee`) rather than
+  produce wrong code. Macros are expanded through clangd instead.
 
 Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
 
