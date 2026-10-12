@@ -925,18 +925,21 @@ function M._locate_cache_replace(name, source_bufnr, dloc)
   cache_put(M._locate_cache, locate_key(source_buf(source_bufnr), name), dloc, (def_tick(dloc.uri)), M._locate_cache_n)
 end
 
--- Composed lookup: name -> definition body. locate then extract, one
--- callback: cb(lines, label, err). On failure lines is nil and err carries
--- the reason (extract itself always yields something via its fallbacks, so a
--- nil here means location failed).
-function M.fetch(name, source_bufnr, cb)
+-- Composed lookup: name -> definition. locate then extract, chasing a
+-- declaration to its definition: cb(loc, lines, label, err). loc is where
+-- the lines came from -- the definition when the chase succeeded, else the
+-- declaration, labelled as one. On failure loc and lines are nil and err
+-- carries the reason (extract itself always yields something via its
+-- fallbacks, so a nil here means location failed). fetch and gd share
+-- this, so both land on the same place whichever runs first.
+function M.locate_definition(name, source_bufnr, cb)
   M.locate(name, source_bufnr, function(loc, err)
     if not loc then
-      return cb(nil, nil, err or "not found")
+      return cb(nil, nil, nil, err or "not found")
     end
     M.extract(loc, source_bufnr, function(lines, label)
       if label ~= "declaration" then
-        return cb(lines, label, nil)
+        return cb(loc, lines, label, nil)
       end
       -- A declaration is an answer to a different question. Chase the
       -- definition once; the extract above already attached the
@@ -944,22 +947,29 @@ function M.fetch(name, source_bufnr, cb)
       local misskey = loc.uri .. "\1" .. loc.range.start.line
       local miss_at = M._chase_miss[misskey]
       if miss_at and (vim.uv.now() - miss_at) < M._chase_miss_ttl_ms then
-        return cb(lines, label, nil)
+        return cb(loc, lines, label, nil)
       end
       M._chase_definition(loc, function(dloc)
         if not dloc then
           M._chase_miss[misskey] = vim.uv.now()
-          return cb(lines, label, nil)
+          return cb(loc, lines, label, nil)
         end
         M.extract(dloc, source_bufnr, function(l2, lb2)
           if not l2 or lb2 == "declaration" then
-            return cb(lines, label, nil)
+            return cb(loc, lines, label, nil)
           end
           M._locate_cache_replace(name, source_bufnr, dloc)
-          cb(l2, lb2, nil)
+          cb(dloc, l2, lb2, nil)
         end)
       end)
     end)
+  end)
+end
+
+-- name -> definition body: cb(lines, label, err).
+function M.fetch(name, source_bufnr, cb)
+  M.locate_definition(name, source_bufnr, function(_, lines, label, err)
+    cb(lines, label, err)
   end)
 end
 

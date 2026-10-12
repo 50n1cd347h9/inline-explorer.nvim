@@ -1,4 +1,4 @@
--- Picker glue: callers.get / resolver.locate on one side,
+-- Picker glue: callers.get / resolver.locate_definition on one side,
 -- trail.goto_location on the other, the plugin's own floating list
 -- (select.lua) in the middle -- j/k move because it is a real window,
 -- not because anything implements them. vim.ui.select was the first
@@ -87,7 +87,7 @@ function M.definition(done_cb)
   if not name then
     return
   end
-  require("inline-explorer.resolver").locate(name, source_buf(), function(loc, err)
+  require("inline-explorer.resolver").locate_definition(name, source_buf(), function(loc, _, _, err)
     if not loc then
       util.notify(err or ("no definition found for '" .. name .. "'"), vim.log.levels.INFO)
       return done()
