@@ -19,6 +19,19 @@ jobs:
       - name: Check formatting (stylua.toml)
         run: stylua --check lua tests
 
+  luacheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install luacheck
+        run: |
+          mkdir luacheck-bin
+          curl -sL -o luacheck-bin/luacheck https://github.com/lunarmodules/luacheck/releases/download/v1.2.0/luacheck
+          chmod +x luacheck-bin/luacheck
+          echo "$PWD/luacheck-bin" >> "$GITHUB_PATH"
+      - name: Lint and complexity ceiling (.luacheckrc)
+        run: luacheck lua tests
+
   fast-suites:
     runs-on: ubuntu-latest
     steps:

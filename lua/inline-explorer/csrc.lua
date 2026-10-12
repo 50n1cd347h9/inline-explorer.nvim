@@ -265,9 +265,7 @@ local function base_type_from_run(text)
   return table.concat(out, " ")
 end
 
--- Reconstruct a function's declared return type text (base type + pointer depth),
--- so the statement-expression result slot does not depend on body-local names the
--- way `__typeof__(return expr)` would.
+-- The base of a function's return type, before any `*`.
 --
 -- field("type") is trusted by default: it already gets exotic shapes right
 -- that a from-scratch text scan would mangle, notably a function-like macro
@@ -290,23 +288,29 @@ end
 -- case but with no ERROR sibling to recover from: `local unsigned long`
 -- parses as ONE sized_type_specifier spanning all three words. That is
 -- handled by rescanning the field's own (self-contained) text.
-function M.return_type(fdef, src)
-  local decl = fdef:field("declarator")[1]
+local function return_base_type(fdef, src)
   local ty = fdef:field("type")[1]
-  local base = ty and M.text(ty, src) or "int"
-
-  if ty and ty:type() == "sized_type_specifier" then
-    base = base_type_from_run(base)
-  elseif ty and ty:type() == "type_identifier" and not TYPE_STARTERS[base] then
+  if not ty then
+    return "int"
+  end
+  local base = M.text(ty, src)
+  if ty:type() == "sized_type_specifier" then
+    return base_type_from_run(base)
+  end
+  if ty:type() == "type_identifier" and not TYPE_STARTERS[base] then
     local sib = ty:next_sibling()
     if sib and sib:type() == "ERROR" then
       local sib_text = M.text(sib, src)
       if has_type_starter(sib_text) or (KNOWN_LEADING_MACROS[base] and not looks_like_bare_decorator(sib_text)) then
-        base = base_type_from_run(sib_text)
+        return base_type_from_run(sib_text)
       end
     end
   end
+  return base
+end
 
+-- How many `*` the declarator adds to the return type: 2 for `char **f(void)`.
+local function pointer_depth(decl)
   local depth, d = 0, decl
   while d do
     local t = d:type()
@@ -319,6 +323,15 @@ function M.return_type(fdef, src)
       break -- function_declarator or anything unexpected
     end
   end
+  return depth
+end
+
+-- Reconstruct a function's declared return type text (base type + pointer depth),
+-- so the statement-expression result slot does not depend on body-local names the
+-- way `__typeof__(return expr)` would.
+function M.return_type(fdef, src)
+  local base = return_base_type(fdef, src)
+  local depth = pointer_depth(fdef:field("declarator")[1])
   if depth > 0 then
     return base .. " " .. string.rep("*", depth)
   end

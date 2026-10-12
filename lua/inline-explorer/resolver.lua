@@ -518,6 +518,22 @@ local function attach_clients(target, clients)
   return newly_attached
 end
 
+-- The local half of extract's local-first order (see there): the
+-- definition's lines from tree-sitter, for C and C++ only, and only when
+-- they come from a node rather than the brace-counting heuristic. nil
+-- otherwise, and the server is asked.
+local function extract_local(loc, target)
+  local tlang = buffer_lang(target)
+  if tlang ~= "c" and tlang ~= "cpp" then
+    return nil
+  end
+  local lines, label = M.extract_sync(loc)
+  if lines and #lines > 0 and label ~= "heuristic" then
+    return lines, label
+  end
+  return nil
+end
+
 -- Extract the definition at `loc`. Asks the server attached to `source_bufnr`
 -- for the target document's symbols and uses the returned full range; falls
 -- back to extract_sync when there is no server, no client actually supports
@@ -643,16 +659,13 @@ function M.extract(loc, source_bufnr, cb)
   -- (no tree-sitter parser, or not C-family) keep the server-first order.
   -- _local_first is a knob so tests can exercise the server path.
   if M._local_first then
-    local tlang = buffer_lang(target)
-    if tlang == "c" or tlang == "cpp" then
-      local llines, llabel = M.extract_sync(loc)
-      if llines and #llines > 0 and llabel ~= "heuristic" then
-        if etick then
-          cache_put(M._extract_cache, ekey, { llines, llabel }, etick, M._extract_cache_n)
-        end
-        span("extract:local", detail())
-        return cb(llines, llabel)
+    local llines, llabel = extract_local(loc, target)
+    if llines then
+      if etick then
+        cache_put(M._extract_cache, ekey, { llines, llabel }, etick, M._extract_cache_n)
       end
+      span("extract:local", detail())
+      return cb(llines, llabel)
     end
   end
   -- The span says whether WE made the server open a new document, which is

@@ -40,20 +40,17 @@ end
 -- Extract the expansion from clangd's macro hover markdown. clangd puts the
 -- `#define` and the expansion in fenced code, separated by an "Expands to"
 -- marker that may be plain markdown OR a `// Expands to` comment inside the same
--- block. Take the code that follows the marker (falling back to all code).
+-- block. Take the code that follows the marker.
 local function expansion_lines(md)
   local incode, seen = false, false
-  local after, all = {}, {}
+  local after = {}
   for _, l in ipairs(vim.split(md, "\n", { plain = true })) do
     if l:match("^%s*```") then
       incode = not incode
     elseif l:lower():find("expands to", 1, true) then
       seen = true -- marker line itself is dropped
-    elseif incode then
-      all[#all + 1] = l
-      if seen then
-        after[#after + 1] = l
-      end
+    elseif incode and seen then
+      after[#after + 1] = l
     end
   end
   -- Only treat it as a macro expansion when clangd actually showed one; a plain
@@ -209,6 +206,34 @@ local function pos_in_range(pos, range)
   return ge(pos, range.start) and ge(range["end"], pos)
 end
 
+-- The text edits of `workspace_edit` when it touches document `uri` and
+-- nothing else; nil when it also touches another document, or carries a
+-- create/rename/delete operation.
+local function edits_only_for(workspace_edit, uri)
+  local edits
+  if type(workspace_edit.changes) == "table" then
+    for k, v in pairs(workspace_edit.changes) do
+      if k ~= uri then
+        return nil -- a second document -> not ours
+      end
+      edits = v
+    end
+  elseif type(workspace_edit.documentChanges) == "table" then
+    for _, dc in ipairs(workspace_edit.documentChanges) do
+      if type(dc) ~= "table" or type(dc.textDocument) ~= "table" or dc.textDocument.uri ~= uri then
+        return nil -- a foreign uri, or a create/rename/delete op -> not ours
+      end
+      if type(dc.edits) == "table" then
+        edits = edits or {}
+        for _, e in ipairs(dc.edits) do
+          edits[#edits + 1] = e
+        end
+      end
+    end
+  end
+  return edits
+end
+
 -- Does this WorkspaceEdit look like OUR ExpandMacro tweak's edit? True iff it
 -- touches exactly the one document `uri` (nothing else) AND at least one of its
 -- ranges contains `pos` -- i.e. it rewrites the macro invocation we asked
@@ -219,27 +244,7 @@ function M._edit_matches(workspace_edit, uri, pos)
   if type(workspace_edit) ~= "table" or type(uri) ~= "string" or type(pos) ~= "table" then
     return false
   end
-  local edits
-  if type(workspace_edit.changes) == "table" then
-    for k, v in pairs(workspace_edit.changes) do
-      if k ~= uri then
-        return false -- a second document -> not ours
-      end
-      edits = v
-    end
-  elseif type(workspace_edit.documentChanges) == "table" then
-    for _, dc in ipairs(workspace_edit.documentChanges) do
-      if type(dc) ~= "table" or type(dc.textDocument) ~= "table" or dc.textDocument.uri ~= uri then
-        return false -- a foreign uri, or a create/rename/delete op -> not ours
-      end
-      if type(dc.edits) == "table" then
-        edits = edits or {}
-        for _, e in ipairs(dc.edits) do
-          edits[#edits + 1] = e
-        end
-      end
-    end
-  end
+  local edits = edits_only_for(workspace_edit, uri)
   if type(edits) ~= "table" then
     return false
   end

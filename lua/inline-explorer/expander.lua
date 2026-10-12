@@ -32,42 +32,45 @@ local BODY = {
   field_declaration_list = true, -- C struct/union bodies
 }
 
--- The row to splice below for a call at (row, col): the last row of the
--- statement holding it. A call spread over several lines --
---   areq = af_alg_alloc_areq(sk, sizeof(...) +
---                            crypto_aead_reqsize(tfm));
--- -- put the expansion between its lines when it went below the cursor's
--- row. A statement that owns a body (if/while/for, a struct) stops where
--- the body begins. No parser, or a tree with errors around the call:
--- the cursor's row, as before. Second value: the row whose indent the
--- expansion follows -- the statement's first, not a continuation line.
-local function splice_row(bufnr, row, col)
+local function is_statement(node_type)
+  return node_type:match("statement$") ~= nil or node_type:match("declaration$") ~= nil
+end
+
+-- The innermost statement holding (row, col). nil when there is no
+-- parser, when the walk up reaches a body before any statement, or when
+-- the tree has errors there.
+local function statement_at(bufnr, row, col)
   local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
   if not ok or not parser then
-    return row, row
+    return nil
   end
   parser:parse() -- the view changes between expansions; never read a stale tree
   local node = parser:named_node_for_range({ row, col, row, col }, { ignore_injections = true })
   while node do
     local t = node:type()
     if BODY[t] then
-      return row, row -- reached a body without passing a statement
+      return nil -- checked first: compound_statement is a body, not a statement
     end
-    if t:match("statement$") or t:match("declaration$") then
+    if is_statement(t) then
       break
     end
     node = node:parent()
   end
-  if not node or node:has_error() then
-    return row, row
+  if node and node:has_error() then
+    return nil
   end
-  local last, ecol = select(3, node:range())
-  if ecol == 0 and last > row then
+  return node
+end
+
+-- The last row of statement `node`, but no earlier than `row`. A body --
+-- a block, or the lone statement of a braceless if/for -- caps the
+-- statement at the end of what precedes it: `if (f(x)) {` keeps the
+-- expansion right below the condition.
+local function statement_end(node, row)
+  local _, _, last, last_col = node:range()
+  if last_col == 0 and last > row then
     last = last - 1 -- end-exclusive at column 0 of the next row
   end
-  -- A body -- a block, or the lone statement of a braceless if/for --
-  -- caps the statement at the end of what precedes it: `if (f(x)) {`
-  -- keeps the expansion right below the condition.
   for _, child in ipairs(node:named_children()) do
     local t = child:type()
     if BODY[t] or t:match("statement$") then
@@ -78,7 +81,23 @@ local function splice_row(bufnr, row, col)
       end
     end
   end
-  return math.max(last, row), math.min(node:start(), row)
+  return math.max(last, row)
+end
+
+-- The row to splice below for a call at (row, col): the last row of the
+-- statement holding it. A call spread over several lines --
+--   areq = af_alg_alloc_areq(sk, sizeof(...) +
+--                            crypto_aead_reqsize(tfm));
+-- -- put the expansion between its lines when it went below the cursor's
+-- row. Without a statement, the cursor's row, as before. Second value:
+-- the row whose indent the expansion follows -- the statement's first,
+-- not a continuation line.
+local function splice_row(bufnr, row, col)
+  local node = statement_at(bufnr, row, col)
+  if not node then
+    return row, row
+  end
+  return statement_end(node, row), math.min(node:start(), row)
 end
 
 -- Splice `body` into `bufnr` just below row `at`, indented one level past

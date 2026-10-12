@@ -83,6 +83,62 @@ end
 -- printers do layout only; every judgement lives in analyze_* / decide.
 -- ---------------------------------------------------------------------------
 
+-- Names hoisted into the caller scope -- the callee's parameters and its
+-- top-level body locals -- that would collide with a name the caller
+-- already has in `scope`, each mapped to name__ieN.
+local function plan_renames(params, stmts, callee_src, scope, N)
+  local rename = {}
+  local function maybe_rename(nm)
+    if nm and scope[nm] then
+      rename[nm] = nm .. "__ie" .. N
+    end
+  end
+  for _, p in ipairs(params) do
+    maybe_rename(p.name)
+  end
+  for _, s in ipairs(stmts) do
+    if s:type() == "declaration" then
+      -- Every declarator shape, as enclosing_scope collects them: an
+      -- uninitialized `int *p;` or `int a[2];` sits directly under the
+      -- declaration as a pointer/array declarator, and missing it left the
+      -- name unrenamed -- a redeclaration when the caller had it in scope.
+      for _, d in ipairs(C.query_nodes(s, callee_src, "(declaration declarator: (_) @d)")) do
+        maybe_rename(C.decl_name(d, callee_src))
+      end
+    end
+  end
+  return rename
+end
+
+-- Body edits on callee_src (absolute bytes): label suffixing + collision
+-- renames. Disjoint from the return edits the printers make.
+local function plan_body_edits(body, callee_src, rename, N)
+  local edits = {}
+  local function suffix_label(n)
+    edits[#edits + 1] = { C.sb(n), C.eb(n), C.text(n, callee_src) .. "__ie" .. N }
+  end
+  for _, n in ipairs(C.query_nodes(body, callee_src, "(labeled_statement label: (statement_identifier) @l)")) do
+    suffix_label(n)
+  end
+  for _, n in ipairs(C.query_nodes(body, callee_src, "(goto_statement label: (statement_identifier) @g)")) do
+    suffix_label(n)
+  end
+  if next(rename) then
+    for _, id in ipairs(C.query_nodes(body, callee_src, "(identifier) @i")) do
+      local r = rename[C.text(id, callee_src)]
+      -- rename's keys are names the callee itself declares (its params and
+      -- top-level body locals), so a renamed name shadows any same-named
+      -- caller-scope function -- every occurrence in the body, including
+      -- `name(...)` in call position, refers to the callee's own
+      -- declaration and must be renamed along with it.
+      if r then
+        edits[#edits + 1] = { C.sb(id), C.eb(id), r }
+      end
+    end
+  end
+  return edits
+end
+
 -- IR: everything the printers need to know about the callee.
 --   params/rename   parameter list and planned collision renames (name__ieN)
 --   stmts/returns   body statement nodes and return_statement nodes
@@ -113,52 +169,8 @@ function M.analyze_callee(callee_src, fname, N, scope)
   end
   local returns = C.query_nodes(body, callee_src, "(return_statement) @r")
 
-  -- Names hoisted into the caller scope; rename those that would collide.
-  local rename = {}
-  local function maybe_rename(nm)
-    if nm and scope[nm] then
-      rename[nm] = nm .. "__ie" .. N
-    end
-  end
-  for _, p in ipairs(params) do
-    maybe_rename(p.name)
-  end
-  for _, s in ipairs(stmts) do
-    if s:type() == "declaration" then
-      -- Every declarator shape, as enclosing_scope collects them: an
-      -- uninitialized `int *p;` or `int a[2];` sits directly under the
-      -- declaration as a pointer/array declarator, and missing it left the
-      -- name unrenamed -- a redeclaration when the caller had it in scope.
-      for _, d in ipairs(C.query_nodes(s, callee_src, "(declaration declarator: (_) @d)")) do
-        maybe_rename(C.decl_name(d, callee_src))
-      end
-    end
-  end
-
-  -- Body edits: label suffixing + collision renames (disjoint from return edits).
-  local body_edits = {}
-  local function suffix_label(n)
-    body_edits[#body_edits + 1] = { C.sb(n), C.eb(n), C.text(n, callee_src) .. "__ie" .. N }
-  end
-  for _, n in ipairs(C.query_nodes(body, callee_src, "(labeled_statement label: (statement_identifier) @l)")) do
-    suffix_label(n)
-  end
-  for _, n in ipairs(C.query_nodes(body, callee_src, "(goto_statement label: (statement_identifier) @g)")) do
-    suffix_label(n)
-  end
-  if next(rename) then
-    for _, id in ipairs(C.query_nodes(body, callee_src, "(identifier) @i")) do
-      local r = rename[C.text(id, callee_src)]
-      -- rename's keys are names the callee itself declares (its params and
-      -- top-level body locals), so a renamed name shadows any same-named
-      -- caller-scope function -- every occurrence in the body, including
-      -- `name(...)` in call position, refers to the callee's own
-      -- declaration and must be renamed along with it.
-      if r then
-        body_edits[#body_edits + 1] = { C.sb(id), C.eb(id), r }
-      end
-    end
-  end
+  local rename = plan_renames(params, stmts, callee_src, scope, N)
+  local body_edits = plan_body_edits(body, callee_src, rename, N)
 
   local last = stmts[#stmts]
   return {
@@ -174,6 +186,40 @@ function M.analyze_callee(callee_src, fname, N, scope)
     ret_var = "__ie_ret" .. N,
     end_label = "__ie_end" .. N,
   }
+end
+
+-- Whether binary expression `n` is a `&&` or `||`: its right operand runs
+-- only sometimes.
+local function short_circuits(n, src)
+  for i = 0, n:child_count() - 1 do
+    local ch = n:child(i)
+    if not ch:named() and (C.text(ch, src) == "&&" or C.text(ch, src) == "||") then
+      return true
+    end
+  end
+  return false
+end
+
+-- Whether the call runs whenever its statement `target` does: `target` is
+-- a plain statement (not a loop or if header), and no ?: arm or &&/||
+-- lies between the call and it.
+local function is_unconditional(call, target, caller_src)
+  local t = target:type()
+  if t ~= "return_statement" and t ~= "expression_statement" and t ~= "declaration" then
+    return false
+  end
+  local n = call
+  while n and n ~= target do
+    local ty = n:type()
+    if ty == "conditional_expression" then
+      return false
+    end
+    if ty == "binary_expression" and short_circuits(n, caller_src) then
+      return false
+    end
+    n = n:parent()
+  end
+  return true
 end
 
 -- ctx: everything the printers need to know about the call site.
@@ -200,24 +246,7 @@ end
 function M.analyze_context(caller_src, call)
   local target = enclosing_statement(call)
   local t = target:type()
-  local unconditional = t == "return_statement" or t == "expression_statement" or t == "declaration"
-  if unconditional then
-    local n = call
-    while n and n ~= target do
-      local ty = n:type()
-      if ty == "conditional_expression" then
-        unconditional = false
-      elseif ty == "binary_expression" then
-        for i = 0, n:child_count() - 1 do
-          local ch = n:child(i)
-          if not ch:named() and (C.text(ch, caller_src) == "&&" or C.text(ch, caller_src) == "||") then
-            unconditional = false
-          end
-        end
-      end
-      n = n:parent()
-    end
-  end
+  local unconditional = is_unconditional(call, target, caller_src)
   local stmt_bol = C.bol(target)
   local prefix = caller_src:sub(stmt_bol + 1, C.sb(target))
   -- Indentation is the leading space/tab run (form feed and vertical tab are C
