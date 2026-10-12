@@ -94,11 +94,9 @@ check("back at a full stack: depth never exceeds the cap", #trail._stack <= 2, #
 trail._stack_max = saved_n
 trail.clear()
 
--- Abandoning a fresh view by a plain buffer switch must not leak its
--- state entry. bufhidden=wipe kills the buffer; before the fix the entry
--- -- origin array plus undo snapshots -- stayed in view.state forever,
--- because close() requires the view to be current and the trail sweep
--- skipped invalid buffers.
+-- Abandoning a fresh view by a plain buffer switch must not leak its state
+-- entry: bufhidden=wipe kills the buffer without view.close(), so the entry
+-- has to go when the buffer is wiped.
 do
   trail.clear()
   vim.cmd.edit(paths[1])
