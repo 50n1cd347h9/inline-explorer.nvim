@@ -715,14 +715,16 @@ function M.extract(loc, source_bufnr, cb)
     local probe = profile.enabled and profile.start() or nil
     vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
       local ok, lines, label = pcall(lines_from_symbols, results, loc, target)
-      if ok and lines then
+      -- When the reply cannot be read, pcall's second value is the error.
+      local got_lines = ok and lines ~= nil
+      if got_lines then
         local now_tick = tick_of(target)
         if now_tick then
           extract_cache_put(key, lines, label, now_tick)
         end
       end
       if probe then
-        probe(lines and "extract:retry-after-timeout" or "extract:retry-failed", detail())
+        probe(got_lines and "extract:retry-after-timeout" or "extract:retry-failed", detail())
       end
     end)
   end
