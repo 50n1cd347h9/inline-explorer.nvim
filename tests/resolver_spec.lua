@@ -782,6 +782,29 @@ do
     skip = "declaration-chase checks (in-process LSP server unavailable)",
   })
   if cid then
+    -- gd chases too. It used locate alone, so on a cold cache it opened
+    -- the prototype in api.h, and the body only after an expand had
+    -- cached the chased location: which one you got depended on order.
+    resolver.clear_caches()
+    vim.api.nvim_buf_set_lines(src_buf, 0, -1, false, { "    kfree_like(p);" })
+    vim.api.nvim_win_set_cursor(0, { 1, 6 })
+    local gd_done = false
+    require("inline-explorer.pick").definition(function()
+      gd_done = true
+    end)
+    vim.wait(10000, function()
+      return gd_done
+    end, 10)
+    local gd_st = require("inline-explorer.view").state[vim.api.nvim_get_current_buf()]
+    local gd_file = gd_st and vim.api.nvim_buf_get_name(gd_st.source_bufnr) or "(no view)"
+    check(
+      "chase: gd on a cold cache opens the definition, not the prototype",
+      gd_done and vim.fn.resolve(gd_file) == vim.fn.resolve(cpath),
+      gd_file
+    )
+    require("inline-explorer.trail").clear()
+    vim.api.nvim_set_current_buf(src_buf)
+
     resolver.clear_caches()
     local done, lines, label = false, nil, nil
     resolver.fetch("kfree_like", src_buf, function(l, lb)
