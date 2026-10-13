@@ -9,7 +9,6 @@
 
 local csrc = require("inline-explorer.csrc")
 local profile = require("inline-explorer.profile")
-local resolver = require("inline-explorer.resolver")
 local simplify = require("inline-explorer.simplify")
 local util = require("inline-explorer.util")
 
@@ -401,7 +400,7 @@ local function fetch_via_tweak(bufnr, row, col, cb)
     range = { start = pos, ["end"] = pos },
     context = { diagnostics = {} },
   }
-  local sent = resolver.client_request(client, "textDocument/codeAction", code_action_params, function(err, actions)
+  local sent = client:request("textDocument/codeAction", code_action_params, function(err, actions)
     if finished then
       return
     end
@@ -423,7 +422,7 @@ local function fetch_via_tweak(bufnr, row, col, cb)
     }
     add_claim(client.id, claim)
 
-    local exec_sent = resolver.client_request(client, "workspace/executeCommand", {
+    local exec_sent = client:request("workspace/executeCommand", {
       command = cmd.command,
       arguments = cmd.arguments,
     }, function(exec_err)

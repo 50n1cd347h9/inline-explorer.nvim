@@ -6,10 +6,10 @@ local M = {}
 local health = vim.health
 
 local function check_version()
-  if vim.fn.has("nvim-0.10") == 1 then
-    health.ok("Neovim >= 0.10")
+  if vim.fn.has("nvim-0.11") == 1 then
+    health.ok("Neovim >= 0.11")
   else
-    health.error("Neovim 0.10+ required")
+    health.error("Neovim 0.11+ required")
   end
 end
 

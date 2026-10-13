@@ -13,7 +13,7 @@ lua_ls, ...).
 
 ## Requirements
 
-- Neovim 0.10+
+- Neovim 0.11+
 - A language server attached to the files you read
 - Recommended: the tree-sitter parser for the language (`:TSInstall <lang>`);
   required for C inline substitution

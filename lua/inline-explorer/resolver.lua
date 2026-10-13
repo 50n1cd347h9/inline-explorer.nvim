@@ -47,23 +47,6 @@ M._cold_timeout_ms = 2000
 -- Step 4 of M.extract. Tests turn it off to reach the server path.
 M._local_first = true
 
--- client:request on Neovim 0.11+, which deprecates the dot call. On 0.10,
--- client.request is a closure that takes no self.
----@param client vim.lsp.Client
----@param method string
----@param params table?
----@param handler lsp.Handler?
----@param bufnr integer?
----@return boolean sent
----@return integer? request_id
-function M.client_request(client, method, params, handler, bufnr)
-  if vim.fn.has("nvim-0.11") == 1 then
-    return client:request(method, params, handler, bufnr)
-  end
-  ---@cast client table
-  return client.request(method, params, handler, bufnr)
-end
-
 local function once_with_timeout(cb, on_timeout, ms)
   return require("inline-explorer.async").once_with_timeout(cb, on_timeout, ms or M._timeout_ms)
 end
@@ -736,7 +719,7 @@ function M._chase_definition(loc, cb)
   end, function()
     return nil, "timeout"
   end)
-  M.client_request(clients[1], "textDocument/definition", {
+  clients[1]:request("textDocument/definition", {
     textDocument = { uri = loc.uri },
     position = pos,
   }, function(err, result)

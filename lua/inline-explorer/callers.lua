@@ -201,9 +201,9 @@ local function call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
       return
     end
     local request = { item = result[1] }
-    resolver.client_request(client, "callHierarchy/incomingCalls", request, on_incoming_calls, target_bufnr)
+    client:request("callHierarchy/incomingCalls", request, on_incoming_calls, target_bufnr)
   end
-  resolver.client_request(client, "textDocument/prepareCallHierarchy", params, on_prepared, target_bufnr)
+  client:request("textDocument/prepareCallHierarchy", params, on_prepared, target_bufnr)
 end
 
 -- Find the call sites of function `name` with the language servers attached

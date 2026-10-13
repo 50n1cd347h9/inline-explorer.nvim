@@ -16,7 +16,8 @@ nvim --headless --clean -u NONE -c "luafile tests/substitute_spec.lua" -c "qa!"
 ```
 
 The fast suites (the list CI runs is in `.github/workflows/test.yml`) need
-only Neovim and gcc. The real-source specs additionally need `git`, network
+only Neovim and gcc. CI runs them on the pinned release (0.11.3) and on the
+oldest supported one (0.11.0). The real-source specs additionally need `git`, network
 access and `make`; `bench_spec` needs clangd (`IE_BENCH_CLANGD`), and
 `real_kernel_spec` a prepared kernel tree (`IE_KERNEL_DIR`) -- both are
 described below.

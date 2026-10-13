@@ -43,18 +43,14 @@ M.defaults = {
 -- The options in effect; setup() replaces the table.
 M.options = vim.deepcopy(M.defaults)
 
--- Checked by hand: vim.validate's 0.11 form does not exist in 0.10, and its
--- 0.10 form is deprecated in 0.11.
 local function check(opts)
-  local types = { keymaps = "table", indent = "string", header = "boolean", mode = "string", profile = "boolean" }
+  local types = { keymaps = "table", indent = "string", header = "boolean", profile = "boolean" }
   for name, expected in pairs(types) do
-    if opts[name] ~= nil and type(opts[name]) ~= expected then
-      error(("inline-explorer: option '%s' must be a %s"):format(name, expected), 0)
-    end
+    vim.validate("inline-explorer." .. name, opts[name], expected, true)
   end
-  if opts.mode ~= nil and opts.mode ~= "correct" and opts.mode ~= "readable" then
-    error('inline-explorer: mode must be "correct" or "readable"', 0)
-  end
+  vim.validate("inline-explorer.mode", opts.mode, function(v)
+    return v == "correct" or v == "readable"
+  end, true, '"correct" or "readable"')
   for k in pairs(opts) do
     if M.defaults[k] == nil then
       util.notify(("unknown option '%s' (typo?)"):format(k), vim.log.levels.WARN)

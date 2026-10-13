@@ -1046,6 +1046,13 @@ do
     "encoding: utf-8 and nil are bytes already",
     util.byte_col(line, 9, "utf-8") == 9 and util.lsp_col(line, 9, nil) == 9
   )
+  check(
+    "encoding: a column past the end is the line's end, in every encoding",
+    util.byte_col(line, 99, "utf-8") == #line
+      and util.byte_col(line, 99, "utf-16") == #line
+      and util.lsp_col(line, 99, nil) == #line
+      and util.lsp_col(line, 99, "utf-16") == 9
+  )
 
   local epath = vim.fn.tempname() .. ".c"
   H.writef(epath, "/* éééééééééééé */ static int g(void) { return 2; }\nint h(void);\n")
