@@ -37,12 +37,18 @@ local function return_edits(ir, style)
 end
 
 -- Statements 1..last_i with ir.body_edits and `extra` applied, from the start
--- of the first one's line, so that csrc.reindent sees the callee's indentation.
+-- of the first one's line, so that csrc.reindent sees the callee's
+-- indentation; but from the statement itself when code precedes it on that
+-- line, as the signature of `static int f(int x) { return x; }` does.
 local function body_text(ir, last_i, extra)
   local edits = {}
   vim.list_extend(edits, ir.body_edits)
   vim.list_extend(edits, extra or {})
-  local from = csrc.line_start_byte(ir.stmts[1])
+  local first = ir.stmts[1]
+  local from = csrc.line_start_byte(first)
+  if not ir.src:sub(from + 1, csrc.start_byte(first)):match("^[ \t]*$") then
+    from = csrc.start_byte(first)
+  end
   return csrc.apply_edits(ir.src, from, csrc.end_byte(ir.stmts[last_i]), edits)
 end
 

@@ -1602,6 +1602,30 @@ out: __maybe_unused
   )
 end
 
+-- Case 40: a callee written on one line. The body was taken from the start
+-- of its first statement's line, which is the signature, so the canonical,
+-- readable and pretty forms all pasted `static int twice(int x) { ...`.
+do
+  local twice = "static int twice(int x) { return x * 2; }"
+  local tern = "static int caller(int c, int n)\n{\n    return c ? twice(n) : 0;\n}"
+  local t = transform(tern, twice, "twice", { { N = 1 } })
+  local main = "int main(void){ return (caller(1, 4)==8 && caller(0, 4)==0)?0:1; }\n"
+  check("case40 canonical leaves the signature out", not t:find("static int twice", 1, true), t)
+  check("case40 canonical runs equal", (run_ok(twice .. "\n" .. t .. main, "c40a")), t)
+
+  local inc2 = "static int inc2(int x) { int t = x + 1; return t * 2; }"
+  local decl = "static int caller(int n)\n{\n    int r = inc2(n);\n    return r;\n}"
+  local t2 = transform(decl, inc2, "inc2", { { N = 1 } })
+  local main2 = "int main(void){ return (caller(4)==10)?0:1; }\n"
+  check("case40 pretty leaves the signature out", not t2:find("static int inc2", 1, true), t2)
+  check("case40 pretty runs equal", (run_ok(inc2 .. "\n" .. t2 .. main2, "c40b")), t2)
+
+  local sgn = "static int sgn(int x) { if (x < 0) return -1; return x > 0; }"
+  local t3 = transform(decl:gsub("inc2", "sgn"), sgn, "sgn", { { N = 1, mode = "readable" } })
+  check("case40 readable leaves the signature out", not t3:find("static int sgn", 1, true), t3)
+  check("case40 readable compiles", (compiles(sgn .. "\n" .. t3 .. main2, "c40c")), t3)
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be
