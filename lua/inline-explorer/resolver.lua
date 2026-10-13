@@ -369,6 +369,16 @@ function M._symbol_range(symbols, ref_range, name, uri)
   return best, best_label
 end
 
+-- The last row a range covers. Ranges end exclusively, so one that takes its
+-- last line's newline, as a #define's node does, ends at column 0 of the
+-- next row, which it leaves out.
+local function last_row(start_row, end_row, end_col)
+  if end_col == 0 and end_row > start_row then
+    return end_row - 1
+  end
+  return end_row
+end
+
 -- Raises on a malformed reply.
 local function lines_from_symbols(symbols, loc, target)
   if type(symbols) ~= "table" then
@@ -378,11 +388,7 @@ local function lines_from_symbols(symbols, loc, target)
   if not range then
     return nil, nil
   end
-  -- The end is exclusive: an end at character 0 leaves its line out.
-  local erow = range["end"].line
-  if range["end"].character == 0 and erow > range.start.line then
-    erow = erow - 1
-  end
+  local erow = last_row(range.start.line, range["end"].line, range["end"].character)
   local ls = vim.api.nvim_buf_get_lines(target, range.start.line, erow + 1, false)
   if #ls == 0 then
     return nil, nil
@@ -454,8 +460,9 @@ function M.extract_sync(loc)
       if ok and parser then
         local node = outermost_in_window(parser:parse()[1]:root(), srow, scol)
         if node then
-          local start_row, _, end_row = node:range()
-          return vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false), node:type()
+          local start_row, _, end_row, end_col = node:range()
+          local erow = last_row(start_row, end_row, end_col)
+          return vim.api.nvim_buf_get_lines(bufnr, start_row, erow + 1, false), node:type()
         end
         break -- this parser found nothing: use the brace counter, not the next parser
       end

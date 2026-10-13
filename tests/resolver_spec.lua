@@ -71,13 +71,21 @@ do
   check("extract_sync: body includes the return", table.concat(lines, "\n"):find("return per_cpu", 1, true) ~= nil)
 end
 
--- extract_sync: macro definition -> a preproc node type, continuation kept.
+-- extract_sync: macro definition -> a preproc node type, continuation kept,
+-- and nothing after it. A #define's node ends at column 0 of the next row,
+-- so taking its end row as the last line added the line below the macro.
 do
   local cpath = vim.fn.tempname() .. ".c"
-  H.writef(cpath, "#define TWICE(x) \\\n    ((x) + (x))\nint y;\n")
+  H.writef(cpath, "#define TWICE(x) \\\n    ((x) + (x))\nint y;\n#define ONE 1\nint z;\n")
   local lines, label = resolver.extract_sync({ uri = vim.uri_from_fname(cpath), range = range(0, 8, 0, 13) })
   check("extract_sync: macro label is a preproc node", type(label) == "string" and label:find("preproc") ~= nil, label)
-  check("extract_sync: continuation line kept", table.concat(lines, "\n"):find("(x) + (x)", 1, true) ~= nil)
+  check(
+    "extract_sync: a function-like macro is its two lines, continuation kept",
+    #lines == 2 and lines[2] == "    ((x) + (x))",
+    lines
+  )
+  local one = resolver.extract_sync({ uri = vim.uri_from_fname(cpath), range = range(3, 8, 3, 11) })
+  check("extract_sync: an object-like macro is its one line", #one == 1 and one[1] == "#define ONE 1", one)
 end
 
 -- extract (async wrapper): with no LSP attached it falls back to extract_sync
