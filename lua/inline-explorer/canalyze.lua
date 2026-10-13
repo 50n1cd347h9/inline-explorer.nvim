@@ -30,36 +30,48 @@ local LOCAL_DECLARATIONS = [[
 ]]
 local DECLARATIONS = LOCAL_DECLARATIONS .. "(parameter_declaration declarator: (_) @d)"
 
--- Whether error recovery left identifier `id` in an ERROR node of a
--- declaration. There it is the name declared, as `limit` in
--- `u32 __maybe_unused limit = 7;`, or an annotation macro, as FAR in
--- `struct state FAR *s;`.
-local function in_declaration_error(id)
-  local parent = id:parent()
-  if not parent or parent:type() ~= "ERROR" then
-    return false
-  end
-  local holder = parent:parent()
-  return holder ~= nil and (holder:type() == "declaration" or holder:type():match("declarator$") ~= nil)
-end
-
--- The names under `nodes`: a list of those in_declaration_error, and the set
--- of those an expression uses outside any ERROR node. A held name that is
--- also used is what a declaration declares: an annotation macro is not used
--- as a value, though tree-sitter-c may read it as a type elsewhere.
-local function split_names(nodes, src)
-  local held, used = {}, {}
+-- { name, byte } for each identifier that error recovery left in an ERROR
+-- node of a declaration under `nodes`. It is the name declared, as `limit`
+-- in `u32 __maybe_unused limit = 7;`, or an annotation macro, as FAR in
+-- `struct state FAR *s;`; misparsed_names tells them apart.
+local function error_held(nodes, src)
+  local held = {}
   for _, node in ipairs(nodes) do
-    for _, id in ipairs(csrc.query_nodes(node, src, "(identifier) @i")) do
-      local nm = csrc.text(id, src)
-      if in_declaration_error(id) then
-        held[#held + 1] = nm
-      elseif id:parent():type() ~= "ERROR" then
-        used[nm] = true
+    local errors = node:has_error() and csrc.query_nodes(node, src, "(ERROR (identifier) @e)") or {}
+    for _, id in ipairs(errors) do
+      local holder = id:parent():parent()
+      if holder and (holder:type() == "declaration" or holder:type():match("declarator$")) then
+        held[#held + 1] = { csrc.text(id, src), csrc.start_byte(id) }
       end
     end
   end
-  return held, used
+  return held
+end
+
+-- The error_held names under `nodes` that an expression there also uses
+-- outside any ERROR node: an annotation macro is not used as a value,
+-- though tree-sitter-c may read it as a type elsewhere. Each is
+-- { name, byte }.
+local function misparsed_names(nodes, src)
+  local held = error_held(nodes, src)
+  if #held == 0 then
+    return held
+  end
+  local used = {}
+  for _, node in ipairs(nodes) do
+    for _, id in ipairs(csrc.query_nodes(node, src, "(identifier) @i")) do
+      if id:parent():type() ~= "ERROR" then
+        used[csrc.text(id, src)] = true
+      end
+    end
+  end
+  local out = {}
+  for _, h in ipairs(held) do
+    if used[h[1]] then
+      out[#out + 1] = h
+    end
+  end
+  return out
 end
 
 local function holds_function_head(n)
@@ -126,11 +138,8 @@ function M.caller_names(call, src)
       end
     end
   end
-  local held, used = split_names(declaring, src)
-  for _, nm in ipairs(held) do
-    if used[nm] then
-      declared[nm] = true
-    end
+  for _, h in ipairs(misparsed_names(declaring, src)) do
+    declared[h[1]] = true
   end
   -- Tags too, unlike ordinary_names: that costs a rename at most, and the
   -- whole-file case is slow enough.
@@ -229,7 +238,7 @@ end
 -- Builds ir.rename. Only parameters and top-level locals count, those in
 -- #if blocks included: those are the names a hoist declares in the caller's
 -- block.
-local function plan_renames(params, stmts, callee_src, spelled, N)
+local function plan_renames(params, stmts, body, callee_src, spelled, N)
   local rename = {}
   local function maybe_rename(nm)
     if nm and spelled[nm] then
@@ -239,15 +248,15 @@ local function plan_renames(params, stmts, callee_src, spelled, N)
   for _, p in ipairs(params) do
     maybe_rename(p.name)
   end
-  local _, used = split_names(stmts, callee_src)
+  local misparsed = misparsed_names({ body }, callee_src)
   for _, s in ipairs(flatten_preproc(stmts, {})) do
     if TOP_LEVEL_DECLARING[s:type()] then
       for _, d in ipairs(csrc.query_nodes(s, callee_src, LOCAL_DECLARATIONS)) do
         maybe_rename(csrc.decl_name(d, callee_src))
       end
-      for _, nm in ipairs((split_names({ s }, callee_src))) do
-        if used[nm] then
-          maybe_rename(nm)
+      for _, h in ipairs(misparsed) do
+        if h[2] >= csrc.start_byte(s) and h[2] < csrc.end_byte(s) then
+          maybe_rename(h[1])
         end
       end
     end
@@ -289,12 +298,10 @@ end
 -- declared name in `out: __maybe_unused return 0;`: pasted as it is, it
 -- would return from the caller.
 local function has_stray_return(body, src)
-  if #csrc.query_nodes(body, src, '([(identifier) (type_identifier)] @r (#eq? @r "return"))') > 0 then
-    return true
-  end
-  for _, keyword in ipairs(csrc.query_nodes(body, src, '"return" @k')) do
-    local parent = keyword:parent()
-    if not parent or parent:type() ~= "return_statement" then
+  local query = '([(identifier) (type_identifier)] @r (#eq? @r "return")) ("return" @k)'
+  for _, n in ipairs(csrc.query_nodes(body, src, query)) do
+    local parent = n:parent()
+    if n:named() or not parent or parent:type() ~= "return_statement" then
       return true
     end
   end
@@ -355,7 +362,7 @@ function M.analyze_callee(callee_src, fname, N, caller)
   end
   local returns = csrc.query_nodes(body, callee_src, "(return_statement) @r")
 
-  local rename = plan_renames(params, stmts, callee_src, caller.spelled, N)
+  local rename = plan_renames(params, stmts, body, callee_src, caller.spelled, N)
   local body_edits = plan_body_edits(body, callee_src, rename, N)
 
   local last = stmts[#stmts]
