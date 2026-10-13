@@ -181,6 +181,9 @@ function M.smart()
     local prefetched = { name = ident, body = lines, label = label }
     if call_name and label == "function_definition" then
       inline_function(action, prefetched)
+    elseif label == "declaration" then
+      -- Its definition was not found, and it is no macro.
+      block_fallback(action, prefetched)
     else
       -- For anything but a macro, clangd has no expansion, and expand_macro
       -- block-pastes the definition.

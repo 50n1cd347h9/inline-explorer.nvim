@@ -431,4 +431,39 @@ do
   view.close()
 end
 
+-- The inliner block-pastes a declaration (a definition that was not found)
+-- without asking clangd for a macro expansion it cannot have. Asking cost up
+-- to the tweak's and the hover's budgets on top of a chase, past the view's
+-- fetch guard.
+do
+  local inliner = require("inline-explorer.inliner")
+  local macro = require("inline-explorer.macro")
+  local saved_fetch, saved_expansion = resolver.fetch, macro.fetch_expansion
+  local asked = 0
+  macro.fetch_expansion = function(_, _, _, cb)
+    asked = asked + 1
+    cb(nil)
+  end
+  resolver.fetch = function(name, _, cb)
+    cb({ "int " .. name .. "(int x);" }, "declaration")
+  end
+  vim.cmd.enew()
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "int main(void)", "{", "    int r = proto_only(1);", "}" })
+  vim.bo.filetype = "c"
+  local pbuf = view.open()
+  vim.api.nvim_win_set_cursor(0, { 3, ("    int r = proto_only(1);"):find("proto_only") - 1 })
+  inliner.smart()
+  local pasted = vim.wait(1000, function()
+    local shown = table.concat(vim.api.nvim_buf_get_lines(pbuf, 0, -1, false), "\n")
+    return shown:find("int proto_only(int x);", 1, true) ~= nil
+  end, 10)
+  check(
+    "inline: a declaration is block-pasted without asking for a macro expansion",
+    pasted and asked == 0,
+    ("pasted=%s asked=%d"):format(tostring(pasted), asked)
+  )
+  resolver.fetch, macro.fetch_expansion = saved_fetch, saved_expansion
+  view.close()
+end
+
 H.finish("EXPANDER")
