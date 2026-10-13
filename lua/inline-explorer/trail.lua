@@ -98,6 +98,18 @@ local function show(entry)
   return true
 end
 
+-- A file a jump opens gets the servers of the file the jump came from when
+-- it has none, as a FileType autostart would give it: lookups from its view
+-- go through them.
+local function share_clients(from, to)
+  if from == to or #vim.lsp.get_clients({ bufnr = to }) > 0 then
+    return
+  end
+  for _, client in ipairs(vim.lsp.get_clients({ bufnr = from })) do
+    vim.lsp.buf_attach_client(to, client.id)
+  end
+end
+
 -- Show the reading view of `loc`'s file in the current window, on `loc`'s
 -- source row (expansions above it in a reused view shift it), and push the
 -- view the window leaves.
@@ -113,6 +125,7 @@ function M.goto_location(loc)
   -- From a plain file, open its view first, so that push_current() stacks the
   -- file and back() can return to it.
   local cur = vim.api.nvim_get_current_buf()
+  local from = view.state[cur] and view.state[cur].source_bufnr or cur
   if not view.is_view(cur) and vim.api.nvim_buf_get_name(cur) ~= "" then
     view.open()
   end
@@ -120,6 +133,7 @@ function M.goto_location(loc)
 
   local src_buf = vim.fn.bufadd(path)
   vim.fn.bufload(src_buf)
+  share_clients(from, src_buf)
   local target = view_of(src_buf) or view.open(src_buf)
   vim.api.nvim_set_current_buf(target)
   -- Stacked or only shown, a view on the trail must survive buffer switches.

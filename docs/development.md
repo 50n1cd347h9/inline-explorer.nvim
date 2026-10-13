@@ -359,9 +359,11 @@ server's own answer next time, instead of waiting for the instant answer.
 The plugin attaches a server to a definition file only right before asking
 it about that file, and keeps the last few files it attached or loaded open
 to stay out of the first case; past those it detaches its server, or unloads
-a file it loaded itself so that every server closes it. It caches resolution
-results to stay out of the second (`:InlineExplorerProfile clear` wipes both
-the report and the log between experiments).
+a file it loaded itself so that every server closes it. (A file that a jump
+to a definition or a caller opens without any server gets the servers of
+the file the jump came from.) It caches resolution results to stay out of
+the second (`:InlineExplorerProfile clear` wipes both the report and the log
+between experiments).
 
 Enable it permanently with `setup({ profile = true })`; set
 `require("inline-explorer.profile").logfile = false` to keep it in memory only.
