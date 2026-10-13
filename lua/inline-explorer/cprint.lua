@@ -22,7 +22,7 @@ local function return_edits(ir, style)
   for _, r in ipairs(ir.returns) do
     local keyword = r:child(0)
     local semicolon = r:child(r:child_count() - 1)
-    local has_expr = r:named_child_count() > 0
+    local has_expr = #csrc.code_children(r) > 0
     if style == "assign" then
       replace(keyword, has_expr and (ir.ret_var .. " =") or "(void)0")
     elseif has_expr then
@@ -92,8 +92,7 @@ local function print_pretty(caller_src, ir, ctx)
   if #ir.stmts >= 2 then
     vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts - 1), ""))
   end
-  local expr = ir.stmts[#ir.stmts]:named_child(0)
-  ---@cast expr -nil
+  local expr = csrc.code_children(ir.stmts[#ir.stmts])[1]
   local expr_text = csrc.apply_edits(ir.src, csrc.start_byte(expr), csrc.end_byte(expr), ir.body_edits)
   local replacement = simplify.parens("(" .. expr_text .. ")")
   return print_hoisted(caller_src, ctx, hoist, replacement)

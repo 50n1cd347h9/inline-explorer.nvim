@@ -1072,6 +1072,68 @@ do
   end
 end
 
+-- Case 33: tree-sitter-c makes a comment a named child wherever it sits. Read
+-- as code, it became the returned expression (`int r = (/* c */);`), a void
+-- callee's return value (`void __ie_ret1;`), the declarator inside parens
+-- (so the caller's `v` was missed and redeclared), or an argument.
+do
+  local twice = [[static int twice(int v)
+{
+    int x = v * 2;
+    return /* doubled */ x;
+}]]
+  local caller = [[static int caller(int n)
+{
+    int r = twice(n);
+    return r;
+}]]
+  local t = transform(caller, twice, "twice", { { N = 1 } })
+  local main = "int main(void){ return (caller(21)==42)?0:1; }\n"
+  check("case33 comment before the returned value compiles", (compiles(twice .. "\n" .. t .. main, "c33a")), t)
+  check("case33 comment before the returned value runs equal", (run_ok(twice .. "\n" .. t .. main, "c33a")), t)
+
+  local set = [[static void set(int v)
+{
+    if (v < 0)
+        return /* nothing to do */;
+    g = v;
+}]]
+  local set_caller = [[static int caller(int n)
+{
+    set(n);
+    return g;
+}]]
+  local prelude = "static int g;\n"
+  local t2 = transform(set_caller, set, "set", { { N = 1 } })
+  local main2 = "int main(void){ g = 3; return (caller(-1)==3 && caller(5)==5)?0:1; }\n"
+  check("case33 void callee's commented return has no value", not t2:find("__ie_ret1", 1, true), t2)
+  check("case33 void callee compiles", (compiles(prelude .. set .. "\n" .. t2 .. main2, "c33b")), t2)
+  check("case33 void callee runs equal", (run_ok(prelude .. set .. "\n" .. t2 .. main2, "c33b")), t2)
+
+  local inc = [[static int inc(int v)
+{
+    int w = v + 1;
+    return w;
+}]]
+  local id = "#define __stdcall\nstatic int id(int q) { return q; }\n"
+  local main3 = "int main(void){ return (caller(41)==49)?0:1; }\n"
+  for i, decl in ipairs({ "int (/* fn */ *v)(int) = id;", "int (__stdcall *v)(int) = id;" }) do
+    local caller3 = ("static int caller(int n)\n{\n    %s\n    int r = inc(n);\n    return r + v(7);\n}"):format(decl)
+    local t3 = transform(caller3, inc, "inc", { { N = 1 } })
+    local label = "case33 caller's `" .. decl .. "`"
+    check(label .. " renames the parameter", t3:find("int v__ie1 = (n);", 1, true) ~= nil, t3)
+    check(label .. " compiles", (compiles(id .. inc .. "\n" .. t3 .. main3, "c33c" .. i)), t3)
+    check(label .. " runs equal", (run_ok(id .. inc .. "\n" .. t3 .. main3, "c33c" .. i)), t3)
+  end
+
+  local add = "static int add(int a, int b)\n{\n    return a + b;\n}"
+  local add_caller = "static int caller(void)\n{\n    int r = add(1, /* two */ 2);\n    return r;\n}"
+  local t4, err4 = S.inline_call(add_caller, add, "add", 1, 1)
+  check("case33 a comment between arguments is not an argument", t4 ~= nil, tostring(err4))
+  local main4 = "int main(void){ return (caller()==3)?0:1; }\n"
+  check("case33 commented argument list runs equal", t4 ~= nil and (run_ok(add .. "\n" .. t4 .. main4, "c33d")), t4)
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be

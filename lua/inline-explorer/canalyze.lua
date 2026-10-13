@@ -143,8 +143,8 @@ function M.analyze_callee(callee_src, fname, N, caller_names)
     returns = returns,
     body_edits = body_edits,
     ret_type = csrc.return_type(fn_def, callee_src),
-    has_value = returns[1] ~= nil and returns[1]:named_child_count() > 0,
-    simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0,
+    has_value = returns[1] ~= nil and #csrc.code_children(returns[1]) > 0,
+    simple = #returns == 1 and last:type() == "return_statement" and #csrc.code_children(last) > 0,
     ret_var = "__ie_ret" .. N,
     end_label = "__ie_end" .. N,
   }
@@ -301,10 +301,9 @@ function M.analyze_call_node(caller_src, callee_src, fname, N, call)
     return nil, nil, err
   end
 
-  local arglist = call:field("arguments")[1]
   local args = {}
-  for i = 0, arglist:named_child_count() - 1 do
-    args[#args + 1] = csrc.text(arglist:named_child(i) --[[@as TSNode]], caller_src)
+  for _, arg in ipairs(csrc.code_children(call:field("arguments")[1])) do
+    args[#args + 1] = csrc.text(arg, caller_src)
   end
   if #args ~= #ir.params then
     return nil, nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)

@@ -93,13 +93,35 @@ function M.query_nodes(node, src, query_text)
   return out
 end
 
--- tree-sitter-c gives parenthesized_declarator no `declarator` field, so its
--- first named child stands in for one.
-local function inner_declarator(d)
-  if d:type() == "parenthesized_declarator" then
-    return d:named_child(0)
+-- The named children of `node` without the extras: tree-sitter-c makes a
+-- comment a named child wherever it sits, as in `return /* c */ x;`.
+---@param node TSNode
+---@return TSNode[]
+function M.code_children(node)
+  local out = {}
+  for i = 0, node:named_child_count() - 1 do
+    local child = node:named_child(i)
+    ---@cast child -nil
+    if not child:extra() then
+      out[#out + 1] = child
+    end
   end
-  return d:field("declarator")[1]
+  return out
+end
+
+-- tree-sitter-c gives parenthesized_declarator no `declarator` field. The
+-- child that stands in for one can follow a comment or a calling convention,
+-- as in `(__stdcall *fp)`.
+local function inner_declarator(d)
+  if d:type() ~= "parenthesized_declarator" then
+    return d:field("declarator")[1]
+  end
+  for _, child in ipairs(M.code_children(d)) do
+    local t = child:type()
+    if t == "identifier" or t:match("declarator$") then
+      return child
+    end
+  end
 end
 
 -- The name that declarator `decl` declares: "p" for `*p`, `p[4]`, `(*p)(int)`
