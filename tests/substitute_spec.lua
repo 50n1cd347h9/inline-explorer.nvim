@@ -1626,6 +1626,24 @@ do
   check("case40 readable compiles", (compiles(sgn .. "\n" .. t3 .. main2, "c40c")), t3)
 end
 
+-- Case 41: a bare `enum { ... };` or `struct s { ... };` keeps its `;` as a
+-- token of the block, not of the statement, so hoisted last it came out as
+-- `enum { A = 2 }` and the caller did not compile.
+do
+  local caller = "static int caller(int n)\n{\n    int r = f(n);\n    return r;\n}"
+  local main = "int main(void){ return (caller(3)==6)?0:1; }\n"
+  for i, body in ipairs({
+    "enum { A = 2 };\n    return x * A;",
+    "struct pt { int a; };\n    return x * (int)sizeof(struct pt) / 2;",
+  }) do
+    local callee = ("static int f(int x)\n{\n    %s\n}"):format(body)
+    local t = transform(caller, callee, "f", { { N = 1 } })
+    local kind = body:match("^%a+")
+    check("case41 hoisted bare " .. kind .. " keeps its ;", t:find("}%s*;") ~= nil, t)
+    check("case41 hoisted bare " .. kind .. " runs equal", (run_ok(callee .. "\n" .. t .. main, "c41" .. i)), t)
+  end
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be

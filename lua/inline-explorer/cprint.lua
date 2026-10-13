@@ -49,7 +49,11 @@ local function body_text(ir, last_i, extra)
   if not ir.src:sub(from + 1, csrc.start_byte(first)):match("^[ \t]*$") then
     from = csrc.start_byte(first)
   end
-  return csrc.apply_edits(ir.src, from, csrc.end_byte(ir.stmts[last_i]), edits)
+  -- A bare `struct s { ... };` or `enum { A };` leaves its `;` to the block.
+  local last = ir.stmts[last_i]
+  local after = last:next_sibling()
+  local stop = csrc.end_byte((after and after:type() == ";") and after or last)
+  return csrc.apply_edits(ir.src, from, stop, edits)
 end
 
 -- print_hoisted where lines cannot go above target: a new block replaces
