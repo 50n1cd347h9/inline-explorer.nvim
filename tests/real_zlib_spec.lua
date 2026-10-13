@@ -145,9 +145,10 @@ real.run({
   -- and warn about.
   --
   -- Measured, not assumed: disabling this gate entirely and rerunning the
-  -- full spec against a real clone reproduces the identical
-  -- 238/28/33/177/169 counts and the identical 8 failures via `make test`'s
-  -- own build -- zlib's default CFLAGS, no `-Werror` anywhere. All 7
+  -- full spec against a real clone reproduced the counts of the time
+  -- (238/28/33/177/169, before fixedtables was refused) and the identical 8
+  -- failures via `make test`'s own build -- zlib's default CFLAGS, no
+  -- `-Werror` anywhere. All 7
   -- non-adler32_z failures are hard, deterministic `error:` (a conflicting
   -- or undeclared identifier) or linker (`undefined reference`) failures
   -- under the plain build too -- none of them depend on what an
