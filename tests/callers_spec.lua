@@ -111,6 +111,55 @@ do
   )
 end
 
+-- 1c. A grep hit counts only where a call of the name begins. A mention in
+-- a call's comment, string or argument used to confirm the enclosing call
+-- again: 9 call sites reported for these 6.
+do
+  local cdir = H.tmpdir()
+  H.writef(cdir .. "/x.c", table.concat({
+    "int foo(int x) { return x; }",
+    "int bar(int (*f)(int)) { return f(1); }",
+    "int use(void)",
+    "{",
+    "    int a = foo(1);", -- 4: one call
+    "    int b = foo(/* foo */ 2);", -- 5: one call, the name also in a comment
+    '    int c = foo(sizeof "foo");', -- 6: one call, the name also in a string
+    "    int d = bar(foo);", -- 7: no call of foo
+    "    int e = foo(foo(3));", -- 8: two calls
+    "    int g = foo(1, foo);", -- 9: one call, the name also an argument
+    "    return a + b + c + d + e + g;",
+    "}",
+  }, "\n") .. "\n")
+  local xbuf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(xbuf, cdir .. "/x.c")
+  local function sites(without_rg)
+    local orig = vim.fn.executable
+    if without_rg then
+      vim.fn.executable = function(n)
+        return n == "rg" and 0 or orig(n)
+      end
+    end
+    local done, got = false, nil
+    callers.get("foo", xbuf, function(items)
+      got, done = items, true
+    end)
+    vim.wait(10000, function()
+      return done
+    end, 10)
+    vim.fn.executable = orig
+    local out = {}
+    for _, it in ipairs(got or {}) do
+      out[#out + 1] = it.range.start.line .. ":" .. it.range.start.character
+    end
+    return table.concat(out, " ")
+  end
+  local want = "4:12 5:12 6:12 8:12 8:16 9:12"
+  local with_rg = sites(false)
+  check("grep fallback: only call sites count, sorted by line and column", with_rg == want, with_rg)
+  local without_rg = sites(true)
+  check("grep(no rg): every match on a line is a hit, only call sites count", without_rg == want, without_rg)
+end
+
 -- 2. In-process LSP server with callHierarchy: LSP wins, labelled so.
 do
   local uri1 = vim.uri_from_fname(vim.fn.resolve(dir .. "/use1.c"))

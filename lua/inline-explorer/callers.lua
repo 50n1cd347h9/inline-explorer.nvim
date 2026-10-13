@@ -28,7 +28,10 @@ local function sort_items(items)
     if a.uri ~= b.uri then
       return a.uri < b.uri
     end
-    return a.range.start.line < b.range.start.line
+    if a.range.start.line ~= b.range.start.line then
+      return a.range.start.line < b.range.start.line
+    end
+    return a.range.start.character < b.range.start.character
   end)
   return items
 end
@@ -44,37 +47,49 @@ local function trimmed_line(path, lnum0)
   return text and vim.trim(text) or ""
 end
 
+-- The 1-based columns of the hits on one line of grep output: rg --vimgrep
+-- prints file:line:col:text, one line per match; grep -rnw prints
+-- file:line:text, one line per matching line, so every match in the text
+-- is a hit.
+local function grep_line(line, name)
+  local file, lnum, col = line:match("^(.-):(%d+):(%d+):")
+  if file then
+    return file, lnum, { tonumber(col) }
+  end
+  local text
+  file, lnum, text = line:match("^(.-):(%d+):(.*)$")
+  if not file then
+    return nil, nil, {}
+  end
+  local cols = {}
+  for start in text:gmatch("()%f[%w_]" .. vim.pesc(name) .. "%f[^%w_]") do
+    cols[#cols + 1] = start
+  end
+  return file, lnum, cols
+end
+
 -- The hits by path, with 0-based lines and byte columns. Keeps the first
 -- M._grep_max hits; `truncated` says whether there were more.
 local function parse_grep_output(stdout, name)
-  local hits_by_file, count, truncated = {}, 0, false
+  local hits_by_file, count = {}, 0
   for line in stdout:gmatch("[^\n]+") do
-    -- rg --vimgrep prints file:line:col:text; grep -rnw prints file:line:text.
-    local file, lnum, col = line:match("^(.-):(%d+):(%d+):")
-    if not file then
-      local text
-      file, lnum, text = line:match("^(.-):(%d+):(.*)$")
-      -- grep prints no column, and tree-sitter confirmation needs one inside the
-      -- call (column 1 of an indented line is whitespace), so find the name.
-      if file and text then
-        local start = text:find("%f[%w_]" .. vim.pesc(name) .. "%f[^%w_]")
-        col = start or 1 -- 1-based, like rg's column
-      end
-    end
+    local file, lnum, cols = grep_line(line, name)
     if file then
-      count = count + 1
-      if count > M._grep_max then
-        truncated = true
-        break
+      for _, col in ipairs(cols) do
+        count = count + 1
+        if count > M._grep_max then
+          return hits_by_file, true
+        end
+        hits_by_file[file] = hits_by_file[file] or {}
+        table.insert(hits_by_file[file], { lnum = tonumber(lnum) - 1, col = col - 1 })
       end
-      hits_by_file[file] = hits_by_file[file] or {}
-      table.insert(hits_by_file[file], { lnum = tonumber(lnum) - 1, col = tonumber(col) - 1 })
     end
   end
-  return hits_by_file, truncated
+  return hits_by_file, false
 end
 
--- Adds to `items` the hits whose innermost call_expression calls `name`.
+-- Adds to `items` the hits that are the callee of a call of `name`. A hit
+-- elsewhere in a call (in an argument, a comment or a string) is not one.
 local function add_confirmed_calls(items, file, hits, name)
   local read_ok, file_lines = pcall(vim.fn.readfile, file)
   if not read_ok then
@@ -85,10 +100,13 @@ local function add_confirmed_calls(items, file, hits, name)
   if not parsed then
     return
   end
+  local callee_at = {}
+  for _, call in ipairs(csrc.find_calls(tree_root, src, name)) do
+    local row, col = call:field("function")[1]:start()
+    callee_at[row .. ":" .. col] = true
+  end
   for _, hit in ipairs(hits) do
-    local call = csrc.ancestor_at(tree_root, hit.lnum, hit.col, "call_expression")
-    local callee = call and call:field("function")[1]
-    if callee and csrc.text(callee, src) == name then
+    if callee_at[hit.lnum .. ":" .. hit.col] then
       local caller_def = csrc.ancestor_at(tree_root, hit.lnum, hit.col, "function_definition")
       items[#items + 1] = {
         name = caller_def and csrc.function_name(caller_def, src) or "?",
@@ -191,7 +209,8 @@ end
 -- Find the call sites of function `name` with the language server that
 -- finds it from `bufnr`, or with grep when no server offers call hierarchy or
 -- the lookup fails (see call_hierarchy). Calls `cb` once, with the items
--- sorted by file, then line, and `note` a message to show with them, or nil.
+-- sorted by file, line and column, and `note` a message to show with them,
+-- or nil.
 ---@param name string
 ---@param bufnr integer
 ---@param cb fun(items: inline_explorer.CallerItem[], provider: "lsp"|"grep", note: string?)
