@@ -89,7 +89,10 @@ Mechanism:
 Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
 
 - **correct** (default) — guaranteed to compile. Hoisting only when the call is
-  reached unconditionally in a plain statement; block-wrap after case/goto labels
+  reached unconditionally in a plain statement, outside any operand that is
+  never evaluated (`sizeof`, `_Generic`, `typeof`, `__builtin_constant_p`, ...)
+  and with nothing in the statement sequenced before it (a comma's left side,
+  an earlier declarator); block-wrap after case/goto labels
   (a declaration cannot follow a bare label); GNU statement expression + `goto`
   for everything else. Parameter bindings reconstruct the declared parameter type
   (arrays decay to pointers) so NULL/`0` arguments keep the right pointer type;

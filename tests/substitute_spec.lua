@@ -1134,6 +1134,53 @@ do
   check("case33 commented argument list runs equal", t4 ~= nil and (run_ok(add .. "\n" .. t4 .. main4, "c33d")), t4)
 end
 
+-- Case 34: a call that runs never, or only after other code in its
+-- statement, must not be hoisted above it. Each site is inlined in turn and
+-- the whole program must print what the original prints. Hoisted, sizeof's
+-- operand ran, the comma's left side ran too late, and the later declarator
+-- read the global a2 instead of the local.
+do
+  local sites = {
+    { "s_sizeof", "int r = sizeof(bump(a));", "r + counter" },
+    { "s_sizeof_bare", "int r = sizeof bump(a);", "r + counter" },
+    { "s_generic", "int r = _Generic(bump(a), int: 1, default: 0);", "r + counter" },
+    { "s_comma", "int r = (counter = 10, bump(a));", "r" },
+    { "s_later", "int a2 = a * 2, r = bump(a2);", "r" },
+    { "s_typeof", "__typeof__(bump(a) + 1) *p = 0;", "(p == 0) + counter" },
+    { "s_constant_p", "int r = __builtin_constant_p(bump(a));", "r + counter" },
+    { "s_choose", "int r = __builtin_choose_expr(1, 7, bump(a));", "r + counter" },
+    { "s_classify", "int r = __builtin_classify_type(bump(a));", "r + counter" },
+    { "s_object_size", "char buf[8];\n    int r = (int)__builtin_object_size(buf + bump(a), 0);", "r + counter" },
+    { "s_first", "int r = bump(a), s = 2;", "r + s" },
+  }
+  local parts = {
+    "#include <stdio.h>\nstatic int counter;\nstatic int a2 = 1000;\n",
+    "static int bump(int x)\n{\n    counter++;\n    return x + counter;\n}\n",
+  }
+  local names = {}
+  for _, site in ipairs(sites) do
+    parts[#parts + 1] = ("static int %s(int a)\n{\n    %s\n    return %s;\n}\n"):format(site[1], site[2], site[3])
+    names[#names + 1] = site[1]
+  end
+  parts[#parts + 1] = "int main(void)\n{\n    int (*sites[])(int) = { "
+    .. table.concat(names, ", ")
+    .. " };\n"
+    .. "    for (unsigned i = 0; i < sizeof sites / sizeof sites[0]; i++) {\n"
+    .. '        counter = 0;\n        printf("%u %d\\n", i, sites[i](1));\n    }\n    return 0;\n}\n'
+  local program = table.concat(parts)
+  local C = require("inline-explorer.csrc")
+  local tree = C.parse(program)
+  local callee = C.text((C.find_function_def(tree, program, "bump")), program)
+  local want = cc.build_run(program, tmp .. "/c34.c", tmp .. "/c34.out")
+  local n_calls = #C.find_calls(tree, program, "bump")
+  check("case34 original builds, one call per site", want ~= nil and n_calls == #sites, n_calls)
+  for occ = 1, n_calls do
+    local t, err = S.inline_call(program, callee, "bump", 1, occ)
+    local got = t and cc.build_run(t, tmp .. "/c34_" .. occ .. ".c", tmp .. "/c34_" .. occ .. ".out")
+    check(("case34 %s prints what the original prints"):format(sites[occ][1]), got ~= nil and got == want, t or err)
+  end
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be

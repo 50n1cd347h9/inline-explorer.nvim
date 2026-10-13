@@ -69,6 +69,26 @@ do
   check("ternary: decision canonical", p.decision == "canonical", p.decision)
 end
 
+-- A call that may not run, or runs after other code in its statement, is not
+-- hoisted. An argument of an ordinary call still is.
+do
+  local shapes = {
+    { "int r = sizeof(acc(n));", "canonical" },
+    { "int r = _Generic(acc(n), int: 1, default: 0);", "canonical" },
+    { "int r = (n = 1, acc(n));", "canonical" },
+    { "int a = n, r = acc(a);", "canonical" },
+    { "int r = __builtin_constant_p(acc(n));", "canonical" },
+    { "__typeof__(acc(n) + 1) *p = 0;", "canonical" },
+    { "int r = acc(n), s = 1;", "pretty" },
+    { "int r = __builtin_expect(acc(n), 1);", "pretty" },
+  }
+  for _, sh in ipairs(shapes) do
+    local p =
+      assert(S._probe(("static int caller(int n)\n{\n    %s\n    return 0;\n}"):format(sh[1]), simple_callee, "acc"))
+    check(("hoist guard: `%s` -> %s"):format(sh[1], sh[2]), p.decision == sh[2], p.decision)
+  end
+end
+
 -- Multi-return callee -> canonical in correct mode, readable_multi in readable.
 do
   local caller = [[static int caller(int n)

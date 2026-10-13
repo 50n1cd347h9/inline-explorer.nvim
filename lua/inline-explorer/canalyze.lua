@@ -181,25 +181,73 @@ local function short_circuits(n, src)
   return false
 end
 
--- Whether the call surely runs whenever target does. Only a return, expression
--- statement or declaration qualifies: a loop header may run the call any
--- number of times, and if and switch headers are excluded as well. A call
--- anywhere inside a ?:, && or || does not, even in the operand that always runs.
+-- Operands that may run never, or only after another part of the node.
+local GUARDING_TYPES = {
+  conditional_expression = true,
+  comma_expression = true,
+  sizeof_expression = true,
+  alignof_expression = true,
+  offsetof_expression = true,
+  generic_expression = true,
+  macro_type_specifier = true, -- `typeof(f(x)) v;`
+}
+
+-- Calls that do not evaluate their arguments (__builtin_choose_expr: all but
+-- the chosen one), checked with gcc, and typeof, which tree-sitter-c reads as
+-- a call in `__typeof__(f(x) + 1) *p;`.
+local UNEVALUATED_CALLS = {
+  __builtin_constant_p = true,
+  __builtin_choose_expr = true,
+  __builtin_types_compatible_p = true,
+  __builtin_object_size = true,
+  __builtin_dynamic_object_size = true,
+  __builtin_classify_type = true,
+  __builtin_has_attribute = true,
+  typeof = true,
+  __typeof = true,
+  __typeof__ = true,
+  typeof_unqual = true,
+  __typeof_unqual = true,
+  __typeof_unqual__ = true,
+}
+
+-- Whether `n`, an ancestor of the call within target, keeps the code under
+-- `child` (its child on the way to the call) from running exactly once, or
+-- runs other code first.
+local function guards(n, child, caller_src)
+  local node_type = n:type()
+  if GUARDING_TYPES[node_type] then
+    return true
+  end
+  if node_type == "binary_expression" then
+    return short_circuits(n, caller_src)
+  end
+  if node_type == "call_expression" and child ~= n:field("function")[1] then
+    local fn = n:field("function")[1]
+    return fn:type() == "identifier" and UNEVALUATED_CALLS[csrc.text(fn, caller_src)] == true
+  end
+  -- A later declarator runs after the earlier ones, and may read them.
+  return node_type == "declaration" and child ~= n:field("declarator")[1]
+end
+
+-- Whether the call surely runs, once, whenever target does, with nothing in
+-- target due to run before it: only then may it be hoisted. Only a return,
+-- expression statement or declaration qualifies: a loop header may run the
+-- call any number of times, and if and switch headers are excluded as well.
+-- Within target, see guards: a call under ?:, && or || does not qualify even
+-- in the operand that always runs.
 local function is_unconditional(call, target, caller_src)
   local target_type = target:type()
   if target_type ~= "return_statement" and target_type ~= "expression_statement" and target_type ~= "declaration" then
     return false
   end
-  local n = call
-  while n and n ~= target do
-    local node_type = n:type()
-    if node_type == "conditional_expression" then
+  local child = call
+  while child ~= target do
+    local n = child:parent()
+    if not n or guards(n, child, caller_src) then
       return false
     end
-    if node_type == "binary_expression" and short_circuits(n, caller_src) then
-      return false
-    end
-    n = n:parent()
+    child = n
   end
   return true
 end
@@ -209,7 +257,7 @@ end
 ---@field target TSNode the statement or declaration that holds the call (see enclosing_statement)
 ---@field can_insert_above boolean lines can go directly above target; if not, a hoist wraps target in a new block
 ---@field wrap_unsafe boolean target is a declaration that lines cannot go above, so it must not be wrapped (see decide)
----@field unconditional boolean target is a return, expression statement or declaration that surely runs the call
+---@field unconditional boolean hoisting the call above target keeps its meaning (see is_unconditional)
 ---@field stmt_bol integer the byte offset of the start of target's line
 ---@field indent string the leading spaces and tabs of that line
 ---@field indent_unit string one level of indentation
