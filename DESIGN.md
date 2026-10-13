@@ -103,9 +103,11 @@ Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
   after case/goto labels (a declaration cannot follow a bare label); GNU
   statement expression + `goto` for everything else. Parameter bindings and
   the result slot keep the callee's declared types (see Mechanism).
-- **readable** — never emits `({...})`/`goto`; hoists the body with `return`→
-  assignment. Cleaner, but not guaranteed to compile or preserve semantics for
-  early-return / labelled / short-circuit code.
+- **readable** — hoists the body with `return`→ assignment and avoids
+  `({...})`/`goto`, except where only they keep the meaning: a declaration
+  that cannot be wrapped in a block, and a statement that does not parse
+  cleanly, get the correct-mode form. Cleaner, but not guaranteed to compile
+  or preserve semantics for early-return / labelled / short-circuit code.
 
 Guarantee: `tests/substitute_spec.lua` (shaped cases) and
 `tests/real_cjson_spec.lua` (every in-file static call in real cJSON) have gcc
