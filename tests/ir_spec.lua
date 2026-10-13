@@ -89,6 +89,17 @@ do
   end
 end
 
+-- A target that does not parse cleanly gets the in-place form in both modes:
+-- WHEN may hide an `if`.
+do
+  local caller = "static int caller(int n)\n{\n    int x = 0;\n    WHEN(n > 0) x = acc(n);\n    return x;\n}"
+  for _, mode in ipairs({ "correct", "readable" }) do
+    local p = assert(S._probe(caller, simple_callee, "acc", 1, mode))
+    check("misparsed target, " .. mode .. ": ctx.parse_error", p.ctx.parse_error == true, p.ctx)
+    check("misparsed target, " .. mode .. ": decision canonical", p.decision == "canonical", p.decision)
+  end
+end
+
 -- Multi-return callee -> canonical in correct mode, readable_multi in readable.
 do
   local caller = [[static int caller(int n)

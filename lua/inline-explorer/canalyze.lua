@@ -285,6 +285,22 @@ local function plan_body_edits(body, callee_src, rename, N)
   return edits
 end
 
+-- Error recovery can leave a `return` outside any return_statement, as the
+-- declared name in `out: __maybe_unused return 0;`: pasted as it is, it
+-- would return from the caller.
+local function has_stray_return(body, src)
+  if #csrc.query_nodes(body, src, '([(identifier) (type_identifier)] @r (#eq? @r "return"))') > 0 then
+    return true
+  end
+  for _, keyword in ipairs(csrc.query_nodes(body, src, '"return" @k')) do
+    local parent = keyword:parent()
+    if not parent or parent:type() ~= "return_statement" then
+      return true
+    end
+  end
+  return false
+end
+
 ---@class inline_explorer.IR
 ---@field src string callee_src, which the nodes and byte offsets below refer to
 ---@field params inline_explorer.Param[]
@@ -319,6 +335,10 @@ function M.analyze_callee(callee_src, fname, N, caller)
   if #csrc.query_nodes(fn_def, callee_src, "(preproc_include) @i") > 0 then
     return nil, fname .. " has an #include in its body"
   end
+  local body = fn_def:field("body")[1]
+  if has_stray_return(body, callee_src) then
+    return nil, "a `return` in " .. fname .. " does not parse as a return statement"
+  end
   -- Pasted into the caller, such a use would mean the caller's declaration.
   for _, nm in ipairs(free_names(fn_def, fn_declarator, callee_src)) do
     if caller.declared[nm] then
@@ -326,7 +346,6 @@ function M.analyze_callee(callee_src, fname, N, caller)
     end
   end
 
-  local body = fn_def:field("body")[1]
   local stmts = {}
   for i = 0, body:named_child_count() - 1 do
     stmts[#stmts + 1] = body:named_child(i)
@@ -462,6 +481,7 @@ end
 ---@field target TSNode the statement or declaration that holds the call (see enclosing_statement)
 ---@field can_insert_above boolean lines can go directly above target; if not, a hoist wraps target in a new block
 ---@field wrap_unsafe boolean target is a declaration that lines cannot go above, so it must not be wrapped (see decide)
+---@field parse_error boolean target does not parse cleanly, so what lines above or around it would do is unknown
 ---@field unconditional boolean hoisting the call above target keeps its meaning (see is_unconditional)
 ---@field stmt_bol integer the byte offset of the start of target's line
 ---@field indent string the leading spaces and tabs of that line
@@ -491,6 +511,7 @@ function M.analyze_context(caller_src, call)
     target = target,
     can_insert_above = can_insert_above,
     wrap_unsafe = target_type == "declaration" and not can_insert_above,
+    parse_error = target:has_error(),
     unconditional = unconditional,
     stmt_bol = stmt_bol,
     indent = indent,
@@ -499,7 +520,8 @@ function M.analyze_context(caller_src, call)
 end
 
 -- The name of the printer to use. A declaration that cannot be wrapped
--- (ctx.wrap_unsafe) gets "canonical" in both modes. Otherwise correct mode
+-- (ctx.wrap_unsafe) and a target that does not parse cleanly
+-- (ctx.parse_error) get "canonical" in both modes. Otherwise correct mode
 -- picks "pretty" for a simple callee whose call is unconditional, else
 -- "canonical", which is valid in any expression context; readable mode avoids
 -- ({...}) and goto: "pretty" for any simple callee, else "readable_multi".
@@ -509,8 +531,10 @@ end
 ---@return "pretty"|"canonical"|"readable_multi"
 function M.decide(ir, ctx, mode)
   -- Wrapping a declaration in a block would end its scope early: later code
-  -- would see whatever it shadowed. Canonical leaves it in place.
-  if ctx.wrap_unsafe then
+  -- would see whatever it shadowed. Canonical leaves it in place. So it does
+  -- with a misparsed target, such as `WHEN(c) x = f(a);` where WHEN expands
+  -- to an `if`: hoisted, f would run whatever c is.
+  if ctx.wrap_unsafe or ctx.parse_error then
     return "canonical"
   end
   if ir.simple and (mode == "readable" or ctx.unconditional) then
@@ -548,6 +572,11 @@ end
 ---@return inline_explorer.Ctx? ctx nil when ir is
 ---@return string? err
 function M.analyze_call_node(caller_src, callee_src, fname, N, call)
+  -- Its arguments cannot be told apart: in `f(a, 2 ADD)` the 2 is in an
+  -- ERROR node.
+  if call:has_error() then
+    return nil, nil, "the call to " .. fname .. " does not parse cleanly"
+  end
   local ir, err = M.analyze_callee(callee_src, fname, N, M.caller_names(call, caller_src))
   if not ir then
     return nil, nil, err

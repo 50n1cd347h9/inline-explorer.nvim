@@ -75,7 +75,8 @@ Mechanism:
   expression spliced in, parenthesised) when the call runs unconditionally;
   readable mode uses it either way. A declaration that lines cannot be inserted
   above gets the canonical form in both modes, since wrapping it in a block
-  would end its scope early.
+  would end its scope early, and so does a statement that does not parse
+  cleanly, since a macro in it may hide an `if`.
 - Everything else renders as a GNU statement expression `({ ... })` with each
   `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }`, and
   `__ie_retN` declared as the value slot with the callee's own declarator
@@ -85,10 +86,12 @@ Mechanism:
   per-expansion id N, and so are its parameters and top-level locals
   (typedefs and enumerators included) whose name appears anywhere in the
   caller's function, so repeated and nested inlining stays correct.
-- Calls the analysis rejects (variadic functions, or a callee that reads a
-  name the caller's function declares too, which a rename cannot keep apart)
-  are not rewritten: the inliner falls back to block-paste (`<leader>ee`)
-  rather than produce wrong code. Macros are expanded through clangd instead.
+- Calls the analysis rejects (variadic functions, a callee that reads a name
+  the caller's function declares too, which a rename cannot keep apart, a
+  callee with an `#include` in its body or a `return` that does not parse as
+  one, a call that does not parse cleanly) are not rewritten: the inliner
+  falls back to block-paste (`<leader>ee`) rather than produce wrong code.
+  Macros are expanded through clangd instead.
 
 Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
 
@@ -96,10 +99,10 @@ Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
   reached unconditionally in a plain statement, outside any operand that is
   never evaluated (`sizeof`, `_Generic`, `typeof`, `__builtin_constant_p`, ...)
   and with nothing in the statement sequenced before it (a comma's left side,
-  an earlier declarator); block-wrap after case/goto labels
-  (a declaration cannot follow a bare label); GNU statement expression + `goto`
-  for everything else. Parameter bindings and the result slot keep the
-  callee's declared types (see Mechanism).
+  an earlier declarator), in a statement that parses cleanly; block-wrap
+  after case/goto labels (a declaration cannot follow a bare label); GNU
+  statement expression + `goto` for everything else. Parameter bindings and
+  the result slot keep the callee's declared types (see Mechanism).
 - **readable** — never emits `({...})`/`goto`; hoists the body with `return`→
   assignment. Cleaner, but not guaranteed to compile or preserve semantics for
   early-return / labelled / short-circuit code.

@@ -1548,6 +1548,60 @@ int main(void)
   end
 end
 
+-- Case 39: code tree-sitter cannot parse cleanly. A callee whose `return`
+-- error recovery read as a declared name was spliced with that `return`
+-- raw, returning from the caller. A misparsed caller statement hid an `if`
+-- in a macro, and hoisting ran the callee whatever the condition. A call
+-- with an ERROR among its arguments lost one of them.
+do
+  local stray = [[static int f(int v)
+{
+    if (!v)
+        goto out;
+    return 1;
+out: __maybe_unused
+    return 0;
+}]]
+  local caller = "static int caller(int v)\n{\n    int r = f(v);\n    return r + 1;\n}"
+  local new, err = S.inline_call(caller, stray, "f", 1, 1)
+  check(
+    "case39 refused: a `return` that is not a return statement",
+    new == nil and tostring(err):find("return", 1, true) ~= nil,
+    new or tostring(err)
+  )
+
+  local prelude = "#define WHEN(c) if (c)\n#define ADD + 1\nstatic int counter;\n"
+  local step = [[static int step(int a, int n)
+{
+    counter++;
+    return a - n;
+}]]
+  local when = [[static int caller(int a)
+{
+    int x = 0;
+    WHEN(a > 0) x = step(a, 2);
+    return x * 100 + counter;
+}]]
+  local main = "int main(void){ counter = 0; if (caller(-1) != 0) return 1; return (caller(5) == 301)?0:1; }\n"
+  for _, mode in ipairs({ "correct", "readable" }) do
+    local t = transform(when, step, "step", { { N = 1, mode = mode } })
+    check("case39 misparsed caller statement, " .. mode .. " mode, stays in place", t:find("({", 1, true) ~= nil, t)
+    check(
+      "case39 misparsed caller statement, " .. mode .. " mode, runs equal",
+      (run_ok(prelude .. step .. "\n" .. t .. main, "c39" .. mode)),
+      t
+    )
+  end
+
+  local added = "static int caller(int a)\n{\n    int r = step(a, 2 ADD);\n    return r;\n}"
+  local new2, err2 = S.inline_call(added, step, "step", 1, 1)
+  check(
+    "case39 refused: a call with an ERROR among its arguments",
+    new2 == nil and tostring(err2):find("parse", 1, true) ~= nil,
+    new2 or tostring(err2)
+  )
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be
