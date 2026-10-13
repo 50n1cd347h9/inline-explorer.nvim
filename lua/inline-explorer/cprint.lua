@@ -111,7 +111,7 @@ local function print_canonical(caller_src, ir, ctx)
     parts[#parts + 1] = inner .. b
   end
   if ir.has_value then
-    parts[#parts + 1] = inner .. ir.ret_type .. " " .. ir.ret_var .. ";"
+    parts[#parts + 1] = inner .. ir.ret_decl .. ";"
   end
   vim.list_extend(parts, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "goto")), inner))
   parts[#parts + 1] = inner .. ir.end_label .. ":;"
@@ -133,7 +133,7 @@ local function print_readable_multi(caller_src, ir, ctx)
   local hoist = {}
   vim.list_extend(hoist, ir.binds)
   if ir.has_value then
-    hoist[#hoist + 1] = ir.ret_type .. " " .. ir.ret_var .. ";"
+    hoist[#hoist + 1] = ir.ret_decl .. ";"
   end
   vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "assign")), ""))
   return print_hoisted(caller_src, ctx, hoist, ir.ret_var)

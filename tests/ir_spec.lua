@@ -38,7 +38,7 @@ do
   check("simple+plain: ctx.unconditional", p.ctx.unconditional == true, p.ctx)
   check("simple+plain: ctx.can_insert_above", p.ctx.can_insert_above == true, p.ctx)
   check("simple+plain: decision pretty", p.decision == "pretty", p.decision)
-  check("ir.ret_type reconstructed", p.ir.ret_type == "int", p.ir.ret_type)
+  check("ir.ret_decl reconstructed", p.ir.ret_decl == "int __ie_ret1", p.ir.ret_decl)
   check("ir.has_value", p.ir.has_value == true)
 end
 

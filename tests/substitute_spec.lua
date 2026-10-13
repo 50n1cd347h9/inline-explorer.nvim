@@ -382,8 +382,8 @@ do
 end
 
 -- Case 15: parameter bindings reconstruct the declared type: a NULL/0 argument
--- keeps its pointer type, arrays decay to pointers, and exotic declarators
--- (function pointers) fall back to __auto_type.
+-- keeps its pointer type, arrays decay to pointers, and a function pointer
+-- keeps its declarator.
 do
   local callee_null = [[static int isnull(char *p)
 {
@@ -428,7 +428,7 @@ static int caller(int n)
 }]]
   local t3 = transform(caller_fp, callee_fp, "apply", { { N = 1 } })
   local main3 = "int main(void){ return (caller(4)==7)?0:1; }\n"
-  check("case15 function-pointer param falls back to __auto_type, name kept", t3:find("__auto_type fp =") ~= nil, t3)
+  check("case15 function-pointer param keeps its declarator", t3:find("int (*fp)(int) = (add2);", 1, true) ~= nil, t3)
   check("case15 fn-pointer compiles", (compiles(callee_fp .. "\n" .. t3 .. main3, "c15c")))
   check("case15 fn-pointer runs equal", (run_ok(callee_fp .. "\n" .. t3 .. main3, "c15c")))
 end
@@ -1412,6 +1412,140 @@ do
     new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
     new or tostring(err)
   )
+end
+
+-- Case 38: types rebuilt from the callee's declarators. Only the array
+-- declarator next to a parameter's name decays (`int m[][4]` bound as
+-- `int **m` read the wrong memory), the declarator text keeps an inner const,
+-- a parameter's type follows another parameter's rename, the result slot is
+-- the callee's declarator around __ie_retN (`char (*f(void))` gave a `char`
+-- slot), and the parameters are those next to the name, not those of a
+-- returned function pointer. Each site must print what the original prints.
+do
+  local program = [[#include <stdio.h>
+#define ZEXPORT
+static int sum_row(int m[][4], int i)
+{
+    int s = 0;
+    for (int j = 0; j < 4; j++)
+        s += m[i][j];
+    return s;
+}
+static int count(const char *const argv[])
+{
+    int k = 0;
+    while (argv[k])
+        k++;
+    return k;
+}
+static int first(const int a[const 4], int b[static 2])
+{
+    int s = a[0];
+    return s + b[1];
+}
+static int apply(int fn(int), int x)
+{
+    if (!fn)
+        return -1;
+    return fn(x);
+}
+static int vla_row(int n, int m[][n])
+{
+    int s = 0;
+    for (int j = 0; j < n; j++)
+        s += m[1][j];
+    return s;
+}
+static char(*skip(char *s))
+{
+    if (*s == ' ')
+        return s + 1;
+    return s;
+}
+static int (*pick(int k))(int)
+{
+    (void)k;
+    return 0;
+}
+static char *const keep(char *s)
+{
+    if (!s)
+        return 0;
+    return s;
+}
+static int (*row(int (*g)[4], int i))[4]
+{
+    if (i < 0)
+        return 0;
+    return g + i;
+}
+static const char * ZEXPORT version(void)
+{
+    if (0)
+        return 0;
+    return "1.3";
+}
+static int twice(int v)
+{
+    return v * 2;
+}
+int main(void)
+{
+    int grid[2][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+    const char *const names[] = {"a", "b", 0};
+    const int arr[4] = {7, 8, 9, 10};
+    int n = 4;
+    int small[2][2] = {{1, 2}, {3, 4}};
+    char text[] = " x";
+    int r = sum_row(grid, 1);
+    int c = count(names);
+    int f = first(arr, grid[0]);
+    int a1 = n > 0 ? apply(twice, 5) : 0;
+    int a2 = n > 0 ? apply(0, 5) : 0;
+    int v = vla_row(2, small);
+    char *p = n > 0 ? skip(text) : 0;
+    int (*fp)(int) = pick(1);
+    char *q = n > 0 ? keep(text) : 0;
+    int (*g)[4] = n > 0 ? row(grid, 1) : 0;
+    const char *ver = n > 0 ? version() : 0;
+    printf("%d %d %d %d %d %d %c %d %c %d %s\n", r, c, f, a1, a2, v, *p, fp == 0, *q, (*g)[0], ver);
+    return 0;
+}
+]]
+  local C = require("inline-explorer.csrc")
+  local tree = C.parse(program)
+  local want = cc.build_run(program, tmp .. "/c38.c", tmp .. "/c38.out")
+  check("case38 original builds", want ~= nil)
+  local expect = {
+    sum_row = "int (*m)[4] = (grid);",
+    count = "const char *const *argv = (names);",
+    first = "const int *const a = (arr);",
+    vla_row = "int (*m)[n__ie1] = (small);",
+    skip = "char (*__ie_ret1);",
+    pick = "int k = (1);",
+    keep = "char *__ie_ret1;",
+    row = "int (*__ie_ret1)[4];",
+    version = "char * __ie_ret1;",
+  }
+  for _, fname in ipairs({ "sum_row", "count", "first", "apply", "vla_row", "skip", "pick", "keep", "row", "version" }) do
+    local def = C.find_function_def(tree, program, fname)
+    check("case38 " .. fname .. " definition found", def ~= nil)
+    local callee = def and C.text(def, program) or ""
+    for occ = 1, #C.find_calls(tree, program, fname) do
+      local label = ("case38 %s (call %d)"):format(fname, occ)
+      local t, err = S.inline_call(program, callee, fname, 1, occ)
+      if expect[fname] then
+        check(
+          label .. " writes `" .. expect[fname] .. "`",
+          t ~= nil and t:find(expect[fname], 1, true) ~= nil,
+          t or err
+        )
+      end
+      local got = t
+        and cc.build_run(t, tmp .. "/c38_" .. fname .. occ .. ".c", tmp .. "/c38_" .. fname .. occ .. ".out")
+      check(label .. " prints what the original prints", got ~= nil and got == want, t or err)
+    end
+  end
 end
 
 -- A buffer's own tree stands in for parsing the caller text. The inliner

@@ -292,7 +292,7 @@ end
 ---@field stmts TSNode[] the body's top-level named nodes, comments and preprocessor blocks included
 ---@field returns TSNode[] every return_statement in the body
 ---@field body_edits inline_explorer.Edit[] the label suffixes and renames on src (see plan_body_edits)
----@field ret_type string the declared return type, rebuilt as text
+---@field ret_decl string the declaration of ret_var, of the callee's return type, without its `;`
 ---@field has_value boolean whether the first return carries a value (false when there is none)
 ---@field simple boolean exactly one return, carrying a value and last of stmts: a trailing comment makes it false
 ---@field ret_var string __ie_retN, which holds the result
@@ -347,7 +347,7 @@ function M.analyze_callee(callee_src, fname, N, caller)
     stmts = stmts,
     returns = returns,
     body_edits = body_edits,
-    ret_type = csrc.return_type(fn_def, callee_src),
+    ret_decl = csrc.result_decl(fn_def, callee_src, "__ie_ret" .. N),
     has_value = returns[1] ~= nil and #csrc.code_children(returns[1]) > 0,
     simple = #returns == 1 and last:type() == "return_statement" and #csrc.code_children(last) > 0,
     ret_var = "__ie_ret" .. N,
@@ -560,9 +560,16 @@ function M.analyze_call_node(caller_src, callee_src, fname, N, call)
   if #args ~= #ir.params then
     return nil, nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
   end
+  -- Only the parameters are in scope in a parameter's declaration.
+  local param_rename = {}
+  for _, p in ipairs(ir.params) do
+    if p.name then
+      param_rename[p.name] = ir.rename[p.name]
+    end
+  end
   ir.binds = {}
   for i, p in ipairs(ir.params) do
-    ir.binds[i] = csrc.build_bind(p, args[i], ir.rename, N, i, callee_src)
+    ir.binds[i] = csrc.build_bind(p, args[i], param_rename, N, i, callee_src)
   end
 
   return ir, M.analyze_context(caller_src, call)

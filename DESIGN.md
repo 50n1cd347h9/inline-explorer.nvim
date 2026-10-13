@@ -65,10 +65,11 @@ and prettier output is only chosen when the analysis proves it safe.
 
 Mechanism:
 
-- Parameters bind by reconstructing each parameter's declared type (arrays
-  decay to pointers), so a NULL/`0` argument keeps the right pointer type;
-  `__auto_type` is a fallback for exotic declarators (e.g. function pointers).
-  This preserves call-by-value.
+- Parameters bind as the callee declares them, with an array or function
+  declarator next to the name adjusted to a pointer as C adjusts parameters
+  (`int m[][4]` binds as `int (*m)[4]`), so a NULL/`0` argument keeps the
+  right pointer type and inner qualifiers survive; `__auto_type` is the
+  fallback for an unnamed parameter. This preserves call-by-value.
 - A callee whose only `return` is its last statement and carries a value
   renders as a *pretty hoist* (setup lifted above the call statement, return
   expression spliced in, parenthesised) when the call runs unconditionally;
@@ -76,9 +77,10 @@ Mechanism:
   above gets the canonical form in both modes, since wrapping it in a block
   would end its scope early.
 - Everything else renders as a GNU statement expression `({ ... })` with each
-  `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and the
-  reconstructed declared return type as `__ie_retN`'s value slot. This makes
-  *any* function inlinable as an expression.
+  `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }`, and
+  `__ie_retN` declared as the value slot with the callee's own declarator
+  around it (`char (*__ie_ret1)` for `char (*f(void))`). This makes *any*
+  function inlinable as an expression.
 - Callee labels (function-scoped) are suffixed `name__ieN`, keyed by a
   per-expansion id N, and so are its parameters and top-level locals
   (typedefs and enumerators included) whose name appears anywhere in the
@@ -96,9 +98,8 @@ Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
   and with nothing in the statement sequenced before it (a comma's left side,
   an earlier declarator); block-wrap after case/goto labels
   (a declaration cannot follow a bare label); GNU statement expression + `goto`
-  for everything else. Parameter bindings reconstruct the declared parameter type
-  (arrays decay to pointers) so NULL/`0` arguments keep the right pointer type;
-  the result slot uses the reconstructed return type.
+  for everything else. Parameter bindings and the result slot keep the
+  callee's declared types (see Mechanism).
 - **readable** — never emits `({...})`/`goto`; hoists the body with `return`→
   assignment. Cleaner, but not guaranteed to compile or preserve semantics for
   early-return / labelled / short-circuit code.
