@@ -170,14 +170,30 @@ local function describe(name, uri)
   return (name or "?") .. " @ " .. vim.fn.fnamemodify(vim.uri_to_fname(uri), ":t")
 end
 
+-- Why `method` cannot be sent from bufnr: no server, or none that supports it.
+local function unsupported(bufnr, method)
+  local names = {}
+  for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+    names[#names + 1] = c.name
+  end
+  if #names == 0 then
+    return "no language server attached to the source buffer"
+  end
+  return ("no language server attached to the source buffer supports %s (attached: %s)"):format(
+    method,
+    table.concat(names, ", ")
+  )
+end
+
 -- Only an exact name match counts.
 ---@param name string
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(loc: inline_explorer.Loc?, err: string?)
 function M.locate(name, source_bufnr, cb)
   local bufnr = source_buf(source_bufnr)
-  if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
-    return cb(nil, "no language server attached to the source buffer")
+  -- Without one, buf_request_all would never call back.
+  if #vim.lsp.get_clients({ bufnr = bufnr, method = "workspace/symbol" }) == 0 then
+    return cb(nil, unsupported(bufnr, "workspace/symbol"))
   end
 
   local key = locate_key(bufnr, name)

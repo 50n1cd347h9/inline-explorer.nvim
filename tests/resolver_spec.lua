@@ -1030,6 +1030,64 @@ do
   end
 end
 
+-- A server attached to the buffer that cannot answer workspace/symbol is no
+-- server for locate. Asking anyway sent nothing, raised Neovim's own "not
+-- supported" error, and reported a timeout once the whole budget had passed.
+do
+  local npath = vim.fn.tempname() .. ".c"
+  H.writef(npath, "int nows_fn(void)\n{\n    return 1;\n}\n")
+  vim.cmd.edit(npath)
+  local nbuf = vim.api.nvim_get_current_buf()
+  local requests = 0
+  local ncid = fake_lsp.start({
+    name = "nows",
+    buf = nbuf,
+    root_dir = vim.fn.fnamemodify(npath, ":h"),
+    capabilities = { hoverProvider = true },
+    handle = function(_, _, callback)
+      requests = requests + 1
+      callback(nil, nil)
+    end,
+    skip = "unsupported-method checks (in-process LSP server unavailable)",
+  })
+  if ncid then
+    resolver.clear_caches()
+    local saved = resolver._timeout_ms
+    resolver._timeout_ms = 10000
+    local notes = {}
+    local orig_notify = vim.notify
+    vim.notify = function(msg)
+      notes[#notes + 1] = tostring(msg)
+    end
+    local done, loc, lerr, t0 = false, nil, nil, vim.uv.hrtime()
+    resolver.locate("nows_fn", nbuf, function(l, e)
+      loc, lerr, done = l, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 5)
+    local waited = (vim.uv.hrtime() - t0) / 1e6
+    vim.notify = orig_notify
+    resolver._timeout_ms = saved
+    check(
+      "locate: no server supporting workspace/symbol fails at once, not at the deadline",
+      done and loc == nil and waited < 2000,
+      ("done=%s waited=%.0fms"):format(tostring(done), waited)
+    )
+    check(
+      "locate: the error names the missing method and the server attached",
+      tostring(lerr):find("workspace/symbol", 1, true) ~= nil and tostring(lerr):find("nows", 1, true) ~= nil,
+      tostring(lerr)
+    )
+    check(
+      "locate: nothing is sent, and Neovim reports no error of its own",
+      requests == 0 and #notes == 0,
+      { requests = requests, notes = notes }
+    )
+    vim.lsp.stop_client(ncid, true)
+  end
+end
+
 -- Position encodings. LSP `character` counts in the encoding negotiated
 -- with the server (utf-16 unless it says otherwise; clangd says utf-8);
 -- cursor columns and tree-sitter count bytes. Every check below sits on a

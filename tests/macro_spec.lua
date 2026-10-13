@@ -605,4 +605,43 @@ do
   end
 end
 
+-- A server that offers no hover is not asked for one. The hover went out
+-- through buf_request_all, which never calls back when no server supports
+-- the method, so the fetch never ended and the inliner held its guard.
+do
+  local fake_lsp = require("tests.lib.fake_lsp")
+  local dir = H.tmpdir()
+  H.writef(dir .. "/n.c", "#define ONE 1\nint f(void) { return ONE; }\n")
+  vim.cmd.edit(dir .. "/n.c")
+  local buf = vim.api.nvim_get_current_buf()
+  local cid = fake_lsp.start({
+    name = "clangd",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { codeActionProvider = true, executeCommandProvider = { commands = { "clangd.applyTweak" } } },
+    handle = function(_, _, callback)
+      callback(nil, {}) -- no code action: the tweak misses
+    end,
+    skip = "hover-capability checks (in-process LSP server unavailable)",
+  })
+  if cid then
+    local orig_notify = vim.notify
+    vim.notify = function() end
+    local done, got = false, nil
+    macro.fetch_expansion({ source_bufnr = buf }, 1, 21, function(lines)
+      got, done = lines, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+    vim.notify = orig_notify
+    check(
+      "hover: a server without hover ends the fetch at once, empty",
+      done and got == nil,
+      { done = done, got = got }
+    )
+    vim.lsp.stop_client(cid, true)
+  end
+end
+
 H.finish("MACRO")

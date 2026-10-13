@@ -378,7 +378,7 @@ end
 -- request error, the timeout) so that the caller can fall back.
 local function fetch_via_tweak(bufnr, row, col, cb)
   prune_dead_clients()
-  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd" })[1]
+  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd", method = "textDocument/codeAction" })[1]
   if not client then
     return cb(nil)
   end
@@ -456,9 +456,9 @@ end
 
 -- Calls cb(lines) once, with expansion_lines' result, or nil with no hover.
 local function fetch_via_hover(bufnr, row, col, cb)
-  -- clangd's position encoding is needed, and with no client attached,
-  -- buf_request_all would never call back.
-  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd" })[1]
+  -- clangd's position encoding is needed, and with no client that supports
+  -- hover, buf_request_all would never call back.
+  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd", method = "textDocument/hover" })[1]
   if not client then
     return cb(nil)
   end

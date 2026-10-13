@@ -203,21 +203,39 @@ do
   end
 end
 
--- 3. A server that never answers: the timeout must hand over to grep,
--- and cb must fire EXACTLY once -- the first version of this module
+-- 3. A call hierarchy that never answers: the timeout must hand over to
+-- grep, and cb must fire EXACTLY once -- the first version of this module
 -- routed the timeout through once_with_timeout, whose internal callback
 -- capture bypassed the sentinel filter, delivering a nil-items callback
--- and then grep's answer on top of it.
+-- and then grep's answer on top of it. The server answers workspace/symbol,
+-- so it is prepareCallHierarchy that times out, not the lookup before it.
 do
+  local prepare_count = 0
   local cid2 = fake_lsp.start({
     name = "wedgehier",
     buf = buf,
     root_dir = dir,
-    capabilities = { callHierarchyProvider = true },
-    -- everything else: swallowed
+    capabilities = { callHierarchyProvider = true, workspaceSymbolProvider = true },
+    handle = function(method, _, callback)
+      if method == "workspace/symbol" then
+        callback(nil, {
+          {
+            name = "target_fn",
+            kind = 12,
+            location = {
+              uri = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c")),
+              range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } },
+            },
+          },
+        })
+      elseif method == "textDocument/prepareCallHierarchy" then
+        prepare_count = prepare_count + 1 -- never answered
+      end
+    end,
     skip = "timeout-fallback checks (in-process LSP server unavailable)",
   })
   if cid2 then
+    require("inline-explorer.resolver").clear_caches()
     local saved = callers._timeout_ms
     callers._timeout_ms = 200
     local calls, items, source = 0, nil, nil
@@ -229,11 +247,58 @@ do
       return calls > 0
     end, 10)
     vim.wait(500) -- room for a buggy second invocation to land
+    check("timeout: the call hierarchy was asked", prepare_count == 1, prepare_count)
     check("timeout: falls back to grep", source == "grep", tostring(source))
     check("timeout: cb fired exactly once", calls == 1, calls)
     check("timeout: grep items intact (never a nil-items callback)", items ~= nil and #items == 3, items and #items)
     callers._timeout_ms = saved
     vim.lsp.stop_client(cid2, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
+  end
+end
+
+-- 3b. A call hierarchy server that cannot look names up: grep answers at
+-- once. Before, locate sent nothing, waited out its whole budget and only
+-- then let grep start.
+do
+  local resolver = require("inline-explorer.resolver")
+  local cid4 = fake_lsp.start({
+    name = "hieronly",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { callHierarchyProvider = true },
+    handle = function(_, _, callback)
+      callback(nil, nil)
+    end,
+    skip = "unsupported-lookup checks (in-process LSP server unavailable)",
+  })
+  if cid4 then
+    resolver.clear_caches()
+    local saved = resolver._timeout_ms
+    resolver._timeout_ms = 10000
+    local orig_notify = vim.notify
+    vim.notify = function() end
+    local done, source, t0 = false, nil, vim.uv.hrtime()
+    callers.get("target_fn", buf, function(_, s2)
+      source, done = s2, true
+    end)
+    vim.wait(15000, function()
+      return done
+    end, 10)
+    local waited = (vim.uv.hrtime() - t0) / 1e6
+    vim.notify = orig_notify
+    resolver._timeout_ms = saved
+    check(
+      "no workspace/symbol: grep answers without waiting for the lookup's budget",
+      done and source == "grep" and waited < 5000,
+      ("source=%s waited=%.0fms"):format(tostring(source), waited)
+    )
+    vim.lsp.stop_client(cid4, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
   end
 end
 
