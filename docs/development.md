@@ -356,10 +356,12 @@ late reply is cached, so looking at the same symbol again gets the server's
 lines without another round trip. You get an instant answer now and the
 server's own answer next time, instead of waiting for the instant answer.
 
-The plugin keeps the last few definition files attached to stay out of the
-first case, and caches resolution results to stay out of the second
-(`:InlineExplorerProfile clear` wipes both the report and the log between
-experiments).
+The plugin attaches a server to a definition file only right before asking
+it about that file, and keeps the last few files it attached or loaded open
+to stay out of the first case; past those it detaches its server, or unloads
+a file it loaded itself so that every server closes it. It caches resolution
+results to stay out of the second (`:InlineExplorerProfile clear` wipes both
+the report and the log between experiments).
 
 Enable it permanently with `setup({ profile = true })`; set
 `require("inline-explorer.profile").logfile = false` to keep it in memory only.

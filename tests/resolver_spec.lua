@@ -1415,6 +1415,160 @@ do
   end
 end
 
+-- Definition files: a server is attached to one only right before it is
+-- asked about it, and eviction from the attach cache puts the file back as
+-- it was. Every extract used to attach the file, and so open it in the
+-- server, even when tree-sitter answered locally; with a FileType autostart
+-- the files stayed open for good, since the cache only recorded files whose
+-- clients it had attached itself.
+do
+  local dir = H.tmpdir()
+  local function header(name)
+    local path = dir .. "/" .. name .. ".h"
+    H.writef(path, "static int " .. name .. "(void)\n{\n    return 1;\n}\n")
+    return path
+  end
+  local function loc_of(path, name)
+    return { uri = vim.uri_from_fname(path), range = range(0, 11, 0, 11 + #name), name = name, kind = 12 }
+  end
+  H.writef(dir .. "/src.c", "int main(void) { return 0; }\n")
+  vim.cmd.edit(dir .. "/src.c")
+  local sbuf = vim.api.nvim_get_current_buf()
+  local cid, log = fake_lsp.start({
+    name = "files",
+    buf = sbuf,
+    root_dir = dir,
+    capabilities = { documentSymbolProvider = true, textDocumentSync = { openClose = true, change = 1 } },
+    handle = function(method, params, callback)
+      if method == "textDocument/documentSymbol" then
+        local name = vim.fn.fnamemodify(vim.uri_to_fname(params.textDocument.uri), ":t:r")
+        callback(nil, { { name = name, kind = 12, range = range(0, 0, 3, 1), selectionRange = range(0, 11, 0, 11) } })
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "definition-file checks (in-process LSP server unavailable)",
+  })
+  local function extract(path, name)
+    local got
+    resolver.extract(loc_of(path, name), sbuf, function(lines)
+      got = lines
+    end)
+    vim.wait(3000, function()
+      return got ~= nil
+    end, 5)
+    vim.wait(50) -- let didOpen/didClose land
+    return vim.fn.bufnr(path)
+  end
+  local function opened(path, method)
+    local uri = vim.uri_from_fname(path)
+    local n = 0
+    for _, e in ipairs(log.notifications) do
+      if e.method == method and e.params.textDocument.uri == uri then
+        n = n + 1
+      end
+    end
+    return n
+  end
+  if cid then
+    resolver.clear_caches()
+    local saved_cap, saved_lf = resolver._attach_cache_max, resolver._local_first
+    resolver._attach_cache_max = 1
+
+    local a = header("lazy_a")
+    local abuf = extract(a, "lazy_a")
+    check(
+      "definition files: a local extraction attaches no server",
+      vim.api.nvim_buf_is_loaded(abuf)
+        and not vim.lsp.buf_is_attached(abuf, cid)
+        and opened(a, "textDocument/didOpen") == 0,
+      log.notifications
+    )
+
+    resolver._local_first = false
+    local b = header("lazy_b")
+    local bbuf = extract(b, "lazy_b")
+    check(
+      "definition files: the server is attached right before it is asked",
+      vim.lsp.buf_is_attached(bbuf, cid) and opened(b, "textDocument/didOpen") == 1,
+      log.notifications
+    )
+    check(
+      "definition files: a file this loaded is unloaded on eviction",
+      not vim.api.nvim_buf_is_loaded(abuf),
+      { a_loaded = vim.api.nvim_buf_is_loaded(abuf) }
+    )
+
+    local c = header("lazy_c")
+    extract(c, "lazy_c")
+    check(
+      "definition files: unloading closes the file in the server",
+      not vim.api.nvim_buf_is_loaded(bbuf) and opened(b, "textDocument/didClose") == 1,
+      log.notifications
+    )
+
+    -- A file the user has open (listed) is only detached, and without the
+    -- "Cannot detach" message when the client went away from it meanwhile.
+    local d = header("lazy_d")
+    vim.cmd.edit(d)
+    vim.cmd.edit(dir .. "/src.c")
+    local dbuf = vim.fn.bufnr(d)
+    extract(d, "lazy_d")
+    local attached_d = vim.lsp.buf_is_attached(dbuf, cid)
+    vim.lsp.buf_detach_client(dbuf, cid)
+    local notes = {}
+    local orig_notify = vim.notify
+    vim.notify = function(msg)
+      notes[#notes + 1] = tostring(msg)
+    end
+    extract(header("lazy_e"), "lazy_e")
+    vim.notify = orig_notify
+    check(
+      "definition files: a file the user has open stays loaded, and eviction says nothing",
+      attached_d and vim.api.nvim_buf_is_loaded(dbuf) and #notes == 0,
+      { attached_d = attached_d, notes = notes }
+    )
+
+    -- A file a reading view reads from keeps its server: the view looks
+    -- names up through it.
+    local f = header("lazy_f")
+    local fbuf = extract(f, "lazy_f")
+    local v = require("inline-explorer.view").open(fbuf) -- shown, not fbuf
+    extract(header("lazy_g"), "lazy_g")
+    check(
+      "definition files: the source of a reading view is left alone",
+      vim.api.nvim_buf_is_loaded(fbuf) and vim.lsp.buf_is_attached(fbuf, cid),
+      { loaded = vim.api.nvim_buf_is_loaded(fbuf) }
+    )
+    vim.cmd.edit(dir .. "/src.c")
+    pcall(vim.api.nvim_buf_delete, v, { force = true })
+
+    -- With an autostart, loading the file attaches the server. The plugin
+    -- attaches nothing then, but it loaded the file, so eviction still
+    -- unloads it and the server closes it.
+    resolver._local_first = true
+    vim.api.nvim_create_autocmd("BufReadPost", {
+      pattern = dir .. "/auto_*.h",
+      callback = function(ev)
+        vim.lsp.buf_attach_client(ev.buf, cid)
+      end,
+    })
+    local h1, h2 = header("auto_one"), header("auto_two")
+    local h1buf = extract(h1, "auto_one")
+    local autostarted = vim.lsp.buf_is_attached(h1buf, cid)
+    extract(h2, "auto_two")
+    check(
+      "definition files: a file an autostart opened is closed once evicted",
+      autostarted and not vim.api.nvim_buf_is_loaded(h1buf) and opened(h1, "textDocument/didClose") == 1,
+      { autostarted = autostarted, notifications = log.notifications }
+    )
+
+    resolver._attach_cache_max, resolver._local_first = saved_cap, saved_lf
+    resolver.clear_caches()
+    vim.lsp.stop_client(cid, true)
+  end
+end
+
 -- Position encodings. LSP `character` counts in the encoding negotiated
 -- with the server (utf-16 unless it says otherwise; clangd says utf-8);
 -- cursor columns and tree-sitter count bytes. Every check below sits on a

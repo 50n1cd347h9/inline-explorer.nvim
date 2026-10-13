@@ -11,7 +11,7 @@
 --                     the brace counter, or a server symbol's kind_label.
 --   local extraction  M.extract_sync: tree-sitter, else the brace counter
 --                     (M.extract_heuristic). It needs no server.
---   cold              attach_clients newly attached a client to the
+--   cold              step 6 of M.extract newly attached its client to the
 --                     definition file, so the server must build that file's
 --                     preamble before it can answer. A FileType autostart
 --                     (vim.lsp.enable, lspconfig) can attach first, during
@@ -509,53 +509,97 @@ function M.extract_heuristic(bufnr, srow)
   return out
 end
 
--- Clients this module attached, keyed by definition-file bufnr. They stay
--- attached after the request because re-attaching a file makes the server
--- rebuild its preamble.
+-- Definition files this module loaded, or attached a client to, keyed by
+-- bufnr: `ids` are the clients it attached, `loaded` says whether it loaded
+-- the buffer. A client stays attached after its request, because
+-- re-attaching a file makes the server rebuild its preamble. Eviction puts
+-- the file back as it was: the clients this module attached are detached,
+-- and a buffer it loaded is unloaded, which closes the file in every server,
+-- also in one that a FileType autostart attached during the load.
 M._attach_cache_max = 8
----@type table<integer, {ids: integer[], at: integer}>
+---@type table<integer, {ids: integer[], loaded: boolean, at: integer}>
 M._attach_cache = {}
 
--- A buffer whose client was attached already is not recorded, so eviction
--- only detaches clients this module attached.
-local function cache_attachment(target, newly_attached_id)
-  local cache = M._attach_cache
-  local entry = cache[target]
-  if not entry and newly_attached_id then
-    entry = { ids = {} }
-    cache[target] = entry
+-- Whether a window shows buf, or a reading view reads from it: a view looks
+-- names up through its source buffer's clients.
+local function in_use(buf)
+  if #vim.fn.win_findbuf(buf) > 0 then
+    return true
+  end
+  for _, st in pairs(require("inline-explorer.view").state) do
+    if st.source_bufnr == buf then
+      return true
+    end
+  end
+  return false
+end
+
+local function release(buf, entry)
+  if not vim.api.nvim_buf_is_valid(buf) or in_use(buf) then
+    return
+  end
+  if entry.loaded and not vim.bo[buf].modified and not vim.bo[buf].buflisted then
+    pcall(vim.api.nvim_buf_delete, buf, { unload = true })
+    return
+  end
+  for _, id in ipairs(entry.ids) do
+    -- The client may be gone, or detached by someone else.
+    if vim.lsp.buf_is_attached(buf, id) then
+      vim.lsp.buf_detach_client(buf, id)
+    end
+  end
+end
+
+-- Marks target's entry as just used, recording that this module loaded the
+-- buffer or attached `attached_id`, and evicts the least recently used
+-- entries past the cap. A buffer this module did nothing to is not recorded.
+-- hrtime, not the loop's millisecond clock: a tie with an older entry could
+-- evict the file in use.
+local function remember(target, loaded, attached_id)
+  local entry = M._attach_cache[target]
+  if not entry and (loaded or attached_id) then
+    entry = { ids = {}, loaded = false, at = 0 }
+    M._attach_cache[target] = entry
   end
   if entry then
-    entry.at = vim.uv.now()
-    entry.ids[#entry.ids + 1] = newly_attached_id
-  end
-  util.evict_lru(cache, M._attach_cache_max, function(evicted_buf, evicted)
-    if vim.api.nvim_buf_is_valid(evicted_buf) and #vim.fn.win_findbuf(evicted_buf) == 0 then
-      for _, id in ipairs(evicted.ids) do
-        pcall(vim.lsp.buf_detach_client, evicted_buf, id)
-      end
+    entry.at = vim.uv.hrtime()
+    entry.loaded = entry.loaded or loaded
+    if attached_id then
+      entry.ids[#entry.ids + 1] = attached_id
     end
-  end)
+  end
+  util.evict_lru(M._attach_cache, M._attach_cache_max, release)
 end
 
--- True when client was not attached to target yet.
+-- True when this call loaded target.
+local function load_buffer(target)
+  local loaded = not vim.api.nvim_buf_is_loaded(target)
+  if loaded then
+    vim.fn.bufload(target)
+  end
+  remember(target, loaded, nil)
+  return loaded
+end
+
+-- True when client was not attached to target, which must be loaded.
 local function attach_client(target, client)
-  vim.fn.bufload(target)
-  local newly_attached = not client.attached_buffers[target]
-  if newly_attached then
+  local attached = not client.attached_buffers[target]
+  if attached then
     vim.lsp.buf_attach_client(target, client.id)
   end
-  cache_attachment(target, newly_attached and client.id or nil)
-  return newly_attached
+  remember(target, false, attached and client.id or nil)
+  return attached
 end
 
--- Attaches `client` to uri's file, since clangd answers position requests
--- only about documents it has open.
+-- Attaches `client` to uri's file, loading it if needed. Called right
+-- before a request about the file: clangd answers position requests only
+-- about documents it has open.
 ---@param uri string
 ---@param client vim.lsp.Client
 ---@return integer target the file's bufnr
 function M.ensure_attached(uri, client)
   local target = vim.uri_to_bufnr(uri)
+  load_buffer(target)
   attach_client(target, client)
   return target
 end
@@ -596,13 +640,13 @@ end
 -- Calls cb exactly once on every path, possibly synchronously.
 -- The steps, in order:
 --   1. no client on source_bufnr -> local extraction
---   2. load the definition file and attach the documentSymbol client
---      (M.client_for)
+--   2. load the definition file
 --   3. cached lines              -> done
 --   4. C/C++                     -> local extraction, if tree-sitter finds a node
---   5. no documentSymbol client  -> local extraction
---   6. ask the server. Use local extraction when the reply has no usable
---      range, and on timeout (a late reply then fills the cache).
+--   5. no documentSymbol client  -> local extraction (see M.client_for)
+--   6. attach that client to the file and ask it. Use local extraction when
+--      the reply has no usable range, and on timeout (a late reply then
+--      fills the cache).
 ---@param loc inline_explorer.Loc
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(lines: string[], label: string)
@@ -631,22 +675,8 @@ function M.extract(loc, source_bufnr, cb)
   end
 
   local load_span = profile.start()
-  local was_loaded = vim.api.nvim_buf_is_loaded(target)
-  vim.fn.bufload(target)
-  if not was_loaded then
+  if load_buffer(target) then
     load_span("extract:bufload", detail())
-  end
-
-  -- Attach even on a cache hit (step 3): the attach cache may have detached
-  -- this file since its lines were cached (detaching keeps the changedtick).
-  local client = M.client_for(loc, src, "textDocument/documentSymbol")
-  local cold = false
-  if client then
-    local attach_span = profile.start()
-    cold = attach_client(target, client)
-    if cold then
-      attach_span("extract:attach", detail())
-    end
   end
 
   local key = extract_key(loc)
@@ -674,11 +704,18 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
 
-  -- 5.
+  local client = M.client_for(loc, src, "textDocument/documentSymbol")
   if not client then
     local lines, label = M.extract_sync(loc)
     span("extract:no-capability", detail())
     return cb(lines, label)
+  end
+
+  -- 6. Attached only now: a file read locally needs no server.
+  local attach_span = profile.start()
+  local cold = attach_client(target, client)
+  if cold then
+    attach_span("extract:attach", detail())
   end
 
   local params = { textDocument = { uri = loc.uri } }
