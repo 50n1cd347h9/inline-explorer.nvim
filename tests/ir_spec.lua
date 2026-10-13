@@ -36,7 +36,7 @@ do
   ))
   check("simple+plain: ir.simple", p.ir.simple == true, p.ir)
   check("simple+plain: ctx.unconditional", p.ctx.unconditional == true, p.ctx)
-  check("simple+plain: ctx.braced", p.ctx.braced == true, p.ctx)
+  check("simple+plain: ctx.can_insert_above", p.ctx.can_insert_above == true, p.ctx)
   check("simple+plain: decision pretty", p.decision == "pretty", p.decision)
   check("ir.ret_type reconstructed", p.ir.ret_type == "int", p.ir.ret_type)
   check("ir.has_value", p.ir.has_value == true)
@@ -98,7 +98,7 @@ do
   check("readable overrides unsafe hoist: pretty", p.decision == "pretty", p.decision)
 end
 
--- Unbraced if body -> ctx.braced false (printer must wrap).
+-- Unbraced if body -> ctx.can_insert_above false (printer must wrap).
 do
   local p = assert(S._probe(
     [[static int caller(int a)
@@ -110,7 +110,7 @@ do
     simple_callee,
     "acc"
   ))
-  check("unbraced if: ctx.braced false", p.ctx.braced == false, p.ctx)
+  check("unbraced if: ctx.can_insert_above false", p.ctx.can_insert_above == false, p.ctx)
   check("unbraced if: still pretty (wrap is layout, not decision)", p.decision == "pretty", p.decision)
 end
 
@@ -132,10 +132,10 @@ do
   check("collision: rename planned", p.ir.rename.t == "t__ie1", p.ir.rename)
 end
 
--- Tab-indented caller -> unit is a tab.
+-- Tab-indented caller -> ctx.indent_unit is a tab.
 do
   local p = assert(S._probe("static int caller(int n)\n{\n\treturn acc(n) + 1;\n}", simple_callee, "acc"))
-  check("tab caller: ctx.unit is tab", p.ctx.unit == "\t", p.ctx.unit)
+  check("tab caller: ctx.indent_unit is tab", p.ctx.indent_unit == "\t", p.ctx.indent_unit)
 end
 
 -- Errors surface as nil, err.

@@ -1,16 +1,11 @@
--- Undo/redo for the reading view, on Neovim's own undo. Every change to the
--- view goes through view.change, which makes it one undo step; the view is
--- nomodifiable, so `u`/`<C-r>` lift that for the duration of the undo.
--- Undo restores the text and the origin marks; the expansion blocks are
--- rebuilt from what view.change recorded for the undo state reached.
+-- Undo and redo in a reading view: Neovim's own :undo and :redo, after which
+-- view.restore_blocks() rebuilds the expansion blocks.
 local view = require("inline-explorer.view")
 local util = require("inline-explorer.util")
 
 local M = {}
 
--- Run `:undo` or `:redo` in the current view. Reports when there was
--- nothing to do -- the undo state did not move.
-local function step(cmd, nothing)
+local function step(cmd, nothing_to_do_msg)
   local st = view.current()
   if not st then
     return
@@ -21,9 +16,10 @@ local function step(cmd, nothing)
   pcall(vim.cmd, "silent " .. cmd)
   vim.bo[bufnr].modifiable = false
   if vim.fn.undotree().seq_cur == before then
-    return util.notify(nothing, vim.log.levels.INFO)
+    util.notify(nothing_to_do_msg, vim.log.levels.INFO)
+    return
   end
-  view.restore_nodes(st, bufnr)
+  view.restore_blocks(st, bufnr)
 end
 
 function M.undo()

@@ -1090,7 +1090,7 @@ do
 }]]
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(caller, "\n", { plain = true }))
-  local root = vim.treesitter.get_parser(buf, "c"):parse()[1]:root()
+  local tree = vim.treesitter.get_parser(buf, "c"):parse()[1]:root()
   local col = ("    int b = g(a);"):find("g%(") - 1
 
   local from_string = S.inline_in_buffer(caller, 3, col, callee, 1)
@@ -1101,8 +1101,8 @@ do
     return real(text, ...)
   end
   C._parse_cache = {}
-  local from_tree = S.inline_in_buffer(caller, 3, col, callee, 1, nil, root)
-  local name_from_tree = S.call_name_at(caller, 3, col, root)
+  local from_tree = S.inline_in_buffer(caller, 3, col, callee, 1, nil, tree)
+  local name_from_tree = S.call_name_at(caller, 3, col, tree)
   vim.treesitter.get_string_parser = real
   check("buffer tree: same transform as parsing the text", from_tree ~= nil and from_tree == from_string, from_tree)
   check("buffer tree: call_name_at finds the call", name_from_tree == "g", name_from_tree)
@@ -1160,8 +1160,8 @@ do
   )
 
   -- Capacity is honoured rather than growing without bound.
-  local saved = C._parse_cache_n
-  C._parse_cache_n = 2
+  local saved = C._parse_cache_max
+  C._parse_cache_max = 2
   C._parse_cache = {}
   for i = 1, 5 do
     C.parse(("int f%d(void) { return %d; }\n"):format(i, i))
@@ -1171,7 +1171,7 @@ do
     n = n + 1
   end
   check("parse cache: bounded by its capacity", n <= 2, ("entries=%d"):format(n))
-  C._parse_cache_n = saved
+  C._parse_cache_max = saved
   C._parse_cache = {}
 
   vim.treesitter.get_string_parser = real

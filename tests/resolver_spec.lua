@@ -465,6 +465,76 @@ do
           end
         end
       end
+      -- A retry whose reply cannot be read is logged as retry-failed. The
+      -- label came from pcall's second value, which is the error message
+      -- when reading the reply raises, so a failed retry was logged as a
+      -- success.
+      do
+        local dpath4 = vim.fn.tempname() .. ".h"
+        H.writef(dpath4, "static int bad_fn(void)\n{\n    return 5;\n}\n")
+        local uri4 = vim.uri_from_fname(vim.fn.resolve(dpath4))
+        local ds4 = 0
+        vim.cmd.edit(dpath4)
+        local src4 = vim.api.nvim_get_current_buf()
+        local cid4 = fake_lsp.start({
+          name = "malformed",
+          buf = src4,
+          root_dir = vim.fn.fnamemodify(dpath4, ":h"),
+          capabilities = {
+            documentSymbolProvider = true,
+            workspaceSymbolProvider = true,
+          },
+          handle = function(method, _, callback)
+            if method == "textDocument/documentSymbol" then
+              ds4 = ds4 + 1
+              -- The first request is never answered; the retry gets a
+              -- symbol whose ranges have no positions.
+              if ds4 > 1 then
+                callback(nil, { { name = "bad_fn", kind = 12, range = {}, selectionRange = {} } })
+              end
+            else
+              callback(nil, nil)
+            end
+          end,
+          skip = "malformed-retry checks (in-process LSP server unavailable)",
+        })
+        if cid4 then
+          resolver.clear_caches()
+          profile.clear()
+          resolver._cold_timeout_ms = 100
+          resolver._timeout_ms = 100
+          local done6 = false
+          resolver.extract(
+            {
+              uri = uri4,
+              range = { start = { line = 0, character = 11 }, ["end"] = { line = 0, character = 17 } },
+              kind = 12,
+              name = "bad_fn",
+            },
+            src4,
+            function()
+              done6 = true
+            end
+          )
+          vim.wait(4000, function()
+            return done6
+          end, 5)
+          vim.wait(2000, function()
+            return ds4 >= 2
+          end, 10)
+          vim.wait(200)
+          local labels = {}
+          for _, e in ipairs(profile.events) do
+            labels[e.name] = true
+          end
+          check(
+            "retry: a reply that cannot be read is logged as retry-failed",
+            ds4 >= 2 and labels["extract:retry-failed"] and not labels["extract:retry-after-timeout"],
+            ("ds4=%d labels=%s"):format(ds4, vim.inspect(vim.tbl_keys(labels)))
+          )
+          vim.lsp.stop_client(cid4, true)
+        end
+      end
       resolver._cold_timeout_ms = saved_cold
       resolver._timeout_ms = 300
       profile.enabled, profile.logfile = was, wasfile
@@ -478,8 +548,8 @@ do
     -- Attachment hygiene: definition-file attachments are cached (dropping
     -- them makes clangd rebuild the header's preamble on every repeat), and
     -- the least recently used entry beyond the capacity is detached.
-    local saved_cap = resolver._attach_cache_n
-    resolver._attach_cache_n = 1
+    local saved_cap = resolver._attach_cache_max
+    resolver._attach_cache_max = 1
     local function extract_temp_header(name, body)
       local hp = vim.fn.tempname() .. ".h"
       H.writef(hp, body)
@@ -507,7 +577,7 @@ do
       evicted == 0 and newest > 0,
       ("old=%d new=%d"):format(evicted, newest)
     )
-    resolver._attach_cache_n = saved_cap
+    resolver._attach_cache_max = saved_cap
 
     resolver._timeout_ms = saved
     resolver._local_first = saved_lf
@@ -639,8 +709,8 @@ do
     )
 
     -- Capacity is honoured rather than growing without bound.
-    local saved_n = resolver._locate_cache_n
-    resolver._locate_cache_n = 2
+    local saved_n = resolver._locate_cache_max
+    resolver._locate_cache_max = 2
     resolver.clear_caches()
     for i = 1, 5 do
       local done = false
@@ -656,7 +726,7 @@ do
       n = n + 1
     end
     check("cache: locate cache is bounded by its capacity", n <= 2, ("entries=%d"):format(n))
-    resolver._locate_cache_n = saved_n
+    resolver._locate_cache_max = saved_n
     resolver._local_first = saved_lf2
     resolver.clear_caches()
 

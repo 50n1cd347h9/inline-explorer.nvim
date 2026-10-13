@@ -1,61 +1,55 @@
--- Trail: the navigation stack behind callers and definition jumps.
---
--- One primitive -- goto_location -- switches the window to a reading view
--- for a target file and pushes the view it left. Views stay alive
--- (bufhidden=hide) while they are on the stack, so going back shows the
--- same buffer with its expansions, folds and undo history intact: nothing
--- is snapshotted, it simply is not destroyed. Views fall out of the stack
--- (depth cap, or clear()) before they are wiped.
---
--- Named trail because nav.lua already exists (block navigation inside one
--- view); this module never touches it.
+-- Trail: the reading views visited through definition and caller jumps, as a
+-- stack that back() and forward() step through like a browser's history.
+-- Stacked views stay alive (bufhidden=hide) while hidden, so going back finds
+-- their expansions, folds and undo history intact. The trail wipes a view only
+-- when its last entry is evicted or on clear(), never while a window shows it.
 local view = require("inline-explorer.view")
 local util = require("inline-explorer.util")
 
 local M = {}
 
--- Entries are { buf = view_bufnr, cursor = { row, col } }. _pos is the
--- index of the entry the window currently shows; entries above _pos are
--- forward history. Capacity is a module field so tests can shrink it.
+---@class inline_explorer.TrailEntry
+---@field buf integer the view buffer
+---@field cursor integer[] { row, col }, 1-based row and 0-based col
+
+-- The stack, oldest first. A revisited file reuses its view, so one buffer can
+-- have several entries. A view is pushed when the window leaves it: right after
+-- goto_location(), _pos is the top entry, the view just left, not the one on
+-- screen. back() first pushes the view on screen; from then on _pos is the
+-- entry on screen, and the entries above it are forward history.
+---@type inline_explorer.TrailEntry[]
 M._stack = {}
 M._pos = 0
-M._stack_n = 8
+-- The most entries; a module field so that tests can lower it.
+M._stack_max = 8
 
-local function wipe(buf)
-  -- The state entry goes unconditionally: an INVALID buffer's entry is
-  -- exactly the leak -- the buffer died (e.g. a :b switch wiped a fresh
-  -- view) but the entry, with its full origin array and undo snapshots,
-  -- stayed behind a validity guard that skipped it forever.
+local function wipe_unless_shown(buf)
   if not vim.api.nvim_buf_is_valid(buf) then
-    view.state[buf] = nil
+    view.forget(buf)
     return
   end
   if #vim.fn.win_findbuf(buf) == 0 then
-    view.state[buf] = nil
+    view.forget(buf)
     pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end
 end
 
--- Drop everything and wipe every view that is not on screen -- including
--- views that fell out of forward history and so appear in view.state but
--- no longer on the stack. Without sweeping view.state those would outlive
--- the journey they belonged to.
+-- Empty the trail and wipe every view in view.state that no window shows, not
+-- only the stacked ones: a view dropped from forward history would otherwise
+-- outlive the trail.
 function M.clear()
   for v in pairs(view.state) do
-    wipe(v)
+    wipe_unless_shown(v)
   end
   local cur = vim.api.nvim_get_current_buf()
   M._stack, M._pos = {}, 0
-  -- The view being looked at survives clear(); closing it is view.close's
-  -- job, not the trail's.
-  if view.state[cur] then
+  -- The stack no longer protects the view on screen: let it be wiped once the
+  -- window leaves it.
+  if view.is_view(cur) then
     vim.bo[cur].bufhidden = "wipe"
   end
 end
 
--- The view buffer for a source file, if one already exists. Reuse is by
--- BUFFER: the same view (with its expansions) is shown again. It is not a
--- rewind -- the stack may hold the same buffer at several positions.
 local function view_of(source_buf)
   for v, st in pairs(view.state) do
     if st.source_bufnr == source_buf and vim.api.nvim_buf_is_valid(v) then
@@ -64,39 +58,33 @@ local function view_of(source_buf)
   end
 end
 
+local function on_stack(buf)
+  for _, entry in ipairs(M._stack) do
+    if entry.buf == buf then
+      return true
+    end
+  end
+  return false
+end
+
 local function push_current()
   local cur = vim.api.nvim_get_current_buf()
-  if not view.state[cur] then
+  if not view.is_view(cur) then
     return
   end
-  -- A new navigation from a back-state drops forward history -- browser and
-  -- jumplist rule. The ENTRIES are dropped; the buffers are not wiped. The
-  -- spec wipes only on depth eviction and on close, and for good reason: a
-  -- view that fell out of forward history is still the reuse target the
-  -- next time its file is visited, expansions intact. clear() reclaims
-  -- whatever never gets revisited.
+  -- Pushing after going back drops forward history, as in a browser. Only the
+  -- entries go: their views are reused if their file is visited again.
   for i = #M._stack, M._pos + 1, -1 do
     table.remove(M._stack, i)
   end
-  vim.bo[cur].bufhidden = "hide" -- survives leaving the window while stacked
-  local c = vim.api.nvim_win_get_cursor(0)
-  M._stack[#M._stack + 1] = { buf = cur, cursor = c }
+  vim.bo[cur].bufhidden = "hide"
+  M._stack[#M._stack + 1] = { buf = cur, cursor = vim.api.nvim_win_get_cursor(0) }
   M._pos = #M._stack
-  -- Depth cap: evict from the bottom. An evicted buffer may still appear
-  -- higher in the stack (buffer reuse), so only wipe it when it does not.
-  while #M._stack > M._stack_n do
-    local e = table.remove(M._stack, 1)
+  while #M._stack > M._stack_max do
+    local evicted = table.remove(M._stack, 1)
     M._pos = M._pos - 1
-    local still_referenced = false
-    for _, r in ipairs(M._stack) do
-      if r.buf == e.buf then
-        still_referenced = true
-        break
-      end
-    end
-    -- wipe() spares any buffer on screen, the current one included.
-    if not still_referenced then
-      wipe(e.buf)
+    if not on_stack(evicted.buf) then
+      wipe_unless_shown(evicted.buf)
     end
   end
 end
@@ -110,9 +98,11 @@ local function show(entry)
   return true
 end
 
--- Switch to the reading view for `loc` ({ uri, range }), pushing the view
--- we leave. Files that cannot be read leave the current view and the stack
--- untouched.
+-- Show the reading view of `loc`'s file in the current window, on `loc`'s
+-- source row (expansions above it in a reused view shift it), and push the
+-- view the window leaves.
+---@param loc inline_explorer.Loc|inline_explorer.CallerItem
+---@return boolean ok false, changing nothing, if the file cannot be read
 function M.goto_location(loc)
   local path = vim.uri_to_fname(loc.uri)
   if vim.fn.filereadable(path) == 0 then
@@ -120,22 +110,22 @@ function M.goto_location(loc)
     return false
   end
 
-  -- Entering trail-land from a plain buffer opens its view first, so the
-  -- journey is view-to-view from the very first hop.
+  -- From a plain file, open its view first, so that push_current() stacks the
+  -- file and back() can return to it.
   local cur = vim.api.nvim_get_current_buf()
-  if not view.state[cur] and vim.api.nvim_buf_get_name(cur) ~= "" then
+  if not view.is_view(cur) and vim.api.nvim_buf_get_name(cur) ~= "" then
     view.open()
   end
   push_current()
 
-  local sb = vim.fn.bufadd(path)
-  vim.fn.bufload(sb)
-  local target = view_of(sb) or view.open(sb)
+  local src_buf = vim.fn.bufadd(path)
+  vim.fn.bufload(src_buf)
+  local target = view_of(src_buf) or view.open(src_buf)
   vim.api.nvim_set_current_buf(target)
-  vim.bo[target].bufhidden = "hide" -- stacked or shown, it must survive switches
-  -- An LSP location counts in its server's encoding; the cursor in bytes.
+  -- Stacked or only shown, a view on the trail must survive buffer switches.
+  vim.bo[target].bufhidden = "hide"
   local row = loc.range.start.line
-  local line = vim.api.nvim_buf_get_lines(sb, row, row + 1, false)[1] or ""
+  local line = vim.api.nvim_buf_get_lines(src_buf, row, row + 1, false)[1] or ""
   pcall(vim.api.nvim_win_set_cursor, 0, { row + 1, util.byte_col(line, loc.range.start.character, loc.encoding) })
   return true
 end
@@ -146,10 +136,7 @@ local function step(delta, edge_msg)
     util.notify(edge_msg, vim.log.levels.INFO)
     return false
   end
-  -- Where we are now must be re-enterable from the other direction, so the
-  -- current position's cursor is refreshed in place (the entry already
-  -- exists at _pos when moving back; moving forward from the top entry
-  -- means _pos points at the shown buffer's own entry).
+  -- Save the cursor of the entry on screen, to restore it on return.
   local cur = vim.api.nvim_get_current_buf()
   if M._stack[M._pos] and M._stack[M._pos].buf == cur then
     M._stack[M._pos].cursor = vim.api.nvim_win_get_cursor(0)
@@ -162,12 +149,9 @@ local function step(delta, edge_msg)
   return true
 end
 
+---@return boolean moved
 function M.back()
-  -- The shown view may sit ABOVE _pos (it was never pushed -- pushing
-  -- happens on leaving). Entering back-navigation pushes it so forward can
-  -- return to it.
-  -- It is the same push as leaving's, depth cap included; a hand copy here
-  -- once skipped the cap and grew a full stack past it.
+  -- So that forward() can return to the view on screen (see M._stack).
   local cur = vim.api.nvim_get_current_buf()
   if M._stack[M._pos] == nil or M._stack[M._pos].buf ~= cur then
     push_current()
@@ -175,22 +159,21 @@ function M.back()
   return step(-1, "already at the start of the trail")
 end
 
+---@return boolean moved
 function M.forward()
   return step(1, "already at the end of the trail")
 end
 
--- The whole trail in the location list -- the vertical counterpart of the
--- breadcrumb.
 function M.list()
   local items = {}
-  for i, e in ipairs(M._stack) do
-    if vim.api.nvim_buf_is_valid(e.buf) then
-      local st = view.state[e.buf]
-      local name = st and vim.api.nvim_buf_get_name(st.source_bufnr) or vim.api.nvim_buf_get_name(e.buf)
+  for i, entry in ipairs(M._stack) do
+    if vim.api.nvim_buf_is_valid(entry.buf) then
+      local st = view.state[entry.buf]
+      local name = st and vim.api.nvim_buf_get_name(st.source_bufnr) or vim.api.nvim_buf_get_name(entry.buf)
       items[#items + 1] = {
-        bufnr = e.buf,
-        lnum = e.cursor[1],
-        col = e.cursor[2] + 1,
+        bufnr = entry.buf,
+        lnum = entry.cursor[1],
+        col = entry.cursor[2] + 1,
         text = ((i == M._pos) and "> " or "  ") .. vim.fn.fnamemodify(name, ":t"),
       }
     end

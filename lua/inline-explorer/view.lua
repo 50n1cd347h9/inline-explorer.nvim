@@ -1,44 +1,64 @@
--- View: a read-only copy of the source file where expansions are inserted as
--- real (cursor-navigable) text, so they can be expanded again in turn.
+-- View (a "reading view"): a read-only copy of the source file where
+-- expansions are inserted as real (cursor-navigable) text, so they can be
+-- expanded again in turn.
+local config = require("inline-explorer.config")
+local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
+-- history, nav, pick and trail require this module, so they are required
+-- where they are used: requiring them here would be a require loop.
+
+---@class inline_explorer.Block
+---@field name string the expanded symbol
+---@field s_mark integer extmark id in M.block_ns, on the block's first row
+---@field e_mark integer extmark id in M.block_ns, on the block's last row
+
+---@class inline_explorer.BlockRange
+---@field name string
+---@field s integer first row, 0-based
+---@field e integer last row, 0-based, inclusive
+
+---@class inline_explorer.ViewState
+---@field bufnr integer the view buffer
+---@field source_bufnr integer the buffer the view was opened from
+---@field blocks inline_explorer.Block[]
+---@field ranges_at table<integer, inline_explorer.BlockRange[]> the blocks of each undo state, by seq (see M.change)
+---@field fetch_started? integer vim.uv.now() when the lookup in flight began (see M.begin_fetch)
+---@field subst_n? integer calls inlined so far; inliner.lua numbers the names it injects with it
 
 local M = {}
 
-M.ns = vim.api.nvim_create_namespace("inline_explorer")
--- One extmark per line of the source, id = source row + 1, placed when the
--- view opens. Neovim moves them with every edit, invalidates the ones on
--- lines that get replaced, and restores them on undo -- which is exactly
--- "which source line is this view line", with no bookkeeping of our own.
+M.block_ns = vim.api.nvim_create_namespace("inline_explorer")
+
+-- One mark per source line, placed when the view opens, with id = source
+-- row + 1 (ids must be positive). Neovim moves the marks with edits,
+-- invalidates one when its line is replaced and restores it on undo, so a
+-- view line's source row needs no bookkeeping of our own (see M.src_line).
 M.origin_ns = vim.api.nvim_create_namespace("inline_explorer_origin")
 
--- view_bufnr -> {
---   bufnr, source_bufnr,
---   nodes = { { name, s_mark, e_mark }, ... }  -- live expansion blocks
---   nodes_at = { [undo seq] = { { name, s, e }, ... } }
--- }
--- Undo is Neovim's own (see history.lua). It restores the text and the
--- origin marks, but a block's marks do not come back on redo, so the
--- blocks are recorded per undo state and rebuilt from there.
+-- Open views, by view bufnr.
+---@type table<integer, inline_explorer.ViewState>
 M.state = {}
 
--- Open a reading view and switch to it. `src` selects the source buffer;
--- omitted, the current buffer is used. The guard is not decoration: user
--- commands (InlineExplorerOpen) call this with the command-opts TABLE as
--- the first argument, so anything that is not a buffer number must mean
--- "current buffer".
-function M.open(src)
-  if type(src) ~= "number" then
-    src = vim.api.nvim_get_current_buf()
-  end
-  if M.state[src] then
-    util.notify("already in a reading view", vim.log.levels.INFO)
-    return
-  end
+---@param buf integer
+---@return boolean
+function M.is_view(buf)
+  return M.state[buf] ~= nil
+end
 
+---@return inline_explorer.ViewState?
+function M.current()
+  return M.state[vim.api.nvim_get_current_buf()]
+end
+
+---@param buf integer
+function M.forget(buf)
+  M.state[buf] = nil
+end
+
+local function create_view_buffer(src)
   local name = vim.api.nvim_buf_get_name(src)
   local ft = vim.bo[src].filetype
   local lines = vim.api.nvim_buf_get_lines(src, 0, -1, false)
-  local cursor = vim.api.nvim_win_get_cursor(0)
 
   local view = vim.api.nvim_create_buf(false, true)
   -- Loading the copy is not an undoable change: undo stops at the file.
@@ -52,211 +72,250 @@ function M.open(src)
   vim.bo[view].buftype = "nofile"
   vim.bo[view].bufhidden = "wipe"
   vim.bo[view].modifiable = false
+  -- Fails (E95) while another view has this name: same file name, other directory.
   pcall(vim.api.nvim_buf_set_name, view, "inline-explorer://" .. vim.fn.fnamemodify(name, ":t"))
 
-  -- The view is a detached copy, so no language server attaches and its
-  -- semantic-token highlighting is absent. Start tree-sitter explicitly so the
-  -- buffer keeps rich highlighting instead of falling back to bare regex syntax.
+  -- No language server attaches to the copy (no semantic tokens), so start
+  -- tree-sitter rather than leave its highlighting to regex syntax.
   local lang = vim.treesitter.language.get_lang(ft) or ft
   pcall(vim.treesitter.start, view, lang)
+  return view
+end
 
-  M.state[view] = { bufnr = view, source_bufnr = src, nodes = {}, nodes_at = { [0] = {} } }
-  -- The state entry dies with the buffer. Without this, a view abandoned
-  -- by a plain buffer switch (bufhidden=wipe) left its entry in M.state
-  -- forever: close() requires the view to be current, and the trail's
-  -- sweep skipped invalid buffers.
+local function set_keymaps(view)
+  local hist = require("inline-explorer.history")
+  local nav = require("inline-explorer.nav")
+  local trail = require("inline-explorer.trail")
+  local pick = require("inline-explorer.pick")
+  local km = config.options.keymaps or {}
+  local maps = {
+    { key = km.undo, fn = hist.undo, desc = "undo expansion" },
+    { key = km.redo, fn = hist.redo, desc = "redo expansion" },
+    { key = km.next_block, fn = nav.next, desc = "next expansion block" },
+    { key = km.prev_block, fn = nav.prev, desc = "previous expansion block" },
+    { key = km.list_blocks, fn = nav.list, desc = "list expansion blocks" },
+    {
+      key = km.callers,
+      fn = function()
+        pick.callers()
+      end,
+      desc = "callers of the function under the cursor",
+    },
+    {
+      key = km.goto_def,
+      fn = function()
+        pick.definition()
+      end,
+      desc = "go to the definition, in a view of its file",
+    },
+    { key = km.trail_back, fn = trail.back, desc = "back along the trail" },
+    { key = km.trail_forward, fn = trail.forward, desc = "forward along the trail" },
+  }
+  for _, map in ipairs(maps) do
+    if map.key then
+      vim.keymap.set("n", map.key, map.fn, { buffer = view, desc = "Inline Explorer: " .. map.desc })
+    end
+  end
+end
+
+-- Open a reading view of `src` in the current window.
+---@param src? integer|vim.api.keyset.create_user_command.command_args a table or nil means the current buffer
+---@return integer? view nil if `src` is itself a view
+function M.open(src)
+  if type(src) ~= "number" then
+    src = vim.api.nvim_get_current_buf()
+  end
+  if M.is_view(src) then
+    util.notify("already in a reading view", vim.log.levels.INFO)
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local view = create_view_buffer(src)
+
+  M.state[view] = { bufnr = view, source_bufnr = src, blocks = {}, ranges_at = { [0] = {} } }
+  -- bufhidden=wipe also wipes the view, without M.close(), once it is hidden.
   vim.api.nvim_create_autocmd("BufWipeout", {
     buffer = view,
     once = true,
     callback = function()
-      M.state[view] = nil
+      M.forget(view)
     end,
   })
 
   vim.api.nvim_set_current_buf(view)
-  -- Local to the view in this window (`:setlocal`). Plain vim.wo acts like
-  -- `:set` and changed the user's global foldmethod too.
   vim.wo[0][0].foldmethod = "manual"
   vim.wo[0][0].foldenable = true
   pcall(vim.api.nvim_win_set_cursor, 0, cursor)
 
-  -- Buffer-local undo/redo, so `u`/`<C-r>` only rebind inside the view.
-  local hist = require("inline-explorer.history")
-  local km = require("inline-explorer.config").options.keymaps or {}
-  if km.undo then
-    vim.keymap.set("n", km.undo, hist.undo, { buffer = view, desc = "Inline Explorer: undo expansion" })
-  end
-  if km.redo then
-    vim.keymap.set("n", km.redo, hist.redo, { buffer = view, desc = "Inline Explorer: redo expansion" })
-  end
-  local nav = require("inline-explorer.nav")
-  if km.next_block then
-    vim.keymap.set("n", km.next_block, nav.next, { buffer = view, desc = "Inline Explorer: next expansion block" })
-  end
-  if km.prev_block then
-    vim.keymap.set("n", km.prev_block, nav.prev, { buffer = view, desc = "Inline Explorer: previous expansion block" })
-  end
-  if km.list_blocks then
-    vim.keymap.set("n", km.list_blocks, nav.list, { buffer = view, desc = "Inline Explorer: list expansion blocks" })
-  end
-  local trail = require("inline-explorer.trail")
-  local pick = require("inline-explorer.pick")
-  if km.callers then
-    vim.keymap.set("n", km.callers, function()
-      pick.callers()
-    end, { buffer = view, desc = "Inline Explorer: callers of the function under the cursor" })
-  end
-  if km.goto_def then
-    vim.keymap.set("n", km.goto_def, function()
-      pick.definition()
-    end, { buffer = view, desc = "Inline Explorer: jump the view to the definition" })
-  end
-  if km.trail_back then
-    vim.keymap.set("n", km.trail_back, trail.back, { buffer = view, desc = "Inline Explorer: back along the trail" })
-  end
-  if km.trail_forward then
-    vim.keymap.set(
-      "n",
-      km.trail_forward,
-      trail.forward,
-      { buffer = view, desc = "Inline Explorer: forward along the trail" }
-    )
-  end
+  set_keymaps(view)
   return view
 end
 
--- Close the reading view the cursor is in.
 function M.close()
   local view = vim.api.nvim_get_current_buf()
-  if not M.state[view] then
+  if not M.is_view(view) then
     util.notify("not in a reading view", vim.log.levels.WARN)
     return
   end
-  -- Closing the view ends the journey: every stacked view goes with it.
   require("inline-explorer.trail").clear()
-  M.state[view] = nil
+  M.forget(view)
   vim.api.nvim_buf_delete(view, { force = true })
 end
 
--- Return the state for the current buffer, or nil if it is not a view.
-function M.current()
-  return M.state[vim.api.nvim_get_current_buf()]
-end
-
--- Source line (0-based) a view line originates from, or nil for inserted
--- or rewritten text.
+-- The source row of view row `row`.
+---@param st inline_explorer.ViewState
+---@param row integer 0-based
+---@return integer? src_row 0-based; nil for inserted or rewritten text
 function M.src_line(st, row)
   local marks = vim.api.nvim_buf_get_extmarks(st.bufnr, M.origin_ns, { row, 0 }, { row, -1 }, { details = true })
-  for _, m in ipairs(marks) do
-    if not m[4].invalid then
-      return m[1] - 1
+  for _, mark in ipairs(marks) do
+    local id, details = mark[1], mark[4]
+    if not details.invalid then
+      return id - 1 -- see M.origin_ns
     end
   end
   return nil
 end
 
--- Expansion blocks whose extmarks are both still valid, as { name, s, e }
--- (0-based rows), in st.nodes order. A block whose first or last line was
--- replaced has an invalid mark.
-local function node_range(bufnr, node)
-  local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.s_mark, { details = true })
-  local e = vim.api.nvim_buf_get_extmark_by_id(bufnr, M.ns, node.e_mark, { details = true })
-  if s[1] and e[1] and not s[3].invalid and not e[3].invalid then
-    return s[1], e[1]
+-- Expansion blocks. In functions that take (st, bufnr), bufnr is st.bufnr.
+
+local function mark_row(bufnr, id)
+  local row, _, details = unpack(vim.api.nvim_buf_get_extmark_by_id(bufnr, M.block_ns, id, { details = true }))
+  if row and not details.invalid then
+    return row
   end
+  return nil
 end
 
-function M.live_nodes(st, bufnr)
+-- `block`'s first and last rows, or nil if either line has been replaced.
+local function block_range(bufnr, block)
+  local s, e = mark_row(bufnr, block.s_mark), mark_row(bufnr, block.e_mark)
+  if s and e then
+    return s, e
+  end
+  return nil
+end
+
+-- The blocks whose first and last lines are both still there, in st.blocks order.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@return inline_explorer.BlockRange[]
+function M.block_ranges(st, bufnr)
   local out = {}
-  for _, node in ipairs(st.nodes) do
-    local s, e = node_range(bufnr, node)
+  for _, block in ipairs(st.blocks) do
+    local s, e = block_range(bufnr, block)
     if s then
-      out[#out + 1] = { name = node.name, s = s, e = e }
+      out[#out + 1] = { name = block.name, s = s, e = e }
     end
   end
   return out
 end
 
--- The undo state `bufnr` is in (undotree() of that buffer).
 local function undo_seq(bufnr)
   return vim.api.nvim_buf_call(bufnr, function()
     return vim.fn.undotree().seq_cur
   end)
 end
 
--- The view is nomodifiable; every write goes through here.
+-- The view is 'nomodifiable', so every write goes through here.
+---@param bufnr integer
+---@param s integer first row, 0-based
+---@param e integer end row, 0-based, exclusive
+---@param lines string[]
 function M.set_lines(bufnr, s, e, lines)
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, s, e, false, lines)
   vim.bo[bufnr].modifiable = false
 end
 
--- Forget every expansion block: extmarks, manual folds, and the node list.
-function M.reset_marks(st, bufnr)
-  vim.api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
+-- Fold helpers act on the current window, which must show the view. They are
+-- best effort: fold commands fail, for example, where 'foldmethod' is not manual.
+
+local function delete_folds()
   pcall(vim.cmd, "silent! normal! zE")
-  st.nodes = {}
 end
 
-local function fold_open(s, e)
+local function create_open_fold(s, e)
   pcall(vim.cmd, string.format("%d,%dfold", s + 1, e + 1))
   pcall(vim.cmd, string.format("%d,%dfoldopen", s + 1, e + 1))
 end
 
--- Track rows s..e (0-based) as expansion block `name`, folded and open.
--- The fold commands act on the current window, which shows `bufnr`.
-function M.add_node(st, bufnr, name, s, e)
-  st.nodes[#st.nodes + 1] = {
-    name = name,
-    s_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, s, 0, { invalidate = true }),
-    e_mark = vim.api.nvim_buf_set_extmark(bufnr, M.ns, e, 0, { invalidate = true }),
-  }
-  fold_open(s, e)
+local function clear_blocks(st, bufnr)
+  vim.api.nvim_buf_clear_namespace(bufnr, M.block_ns, 0, -1)
+  delete_folds()
+  st.blocks = {}
 end
 
--- One undoable change to the view: `fn` edits it (set_lines, add_node).
--- Starts a new undo step first -- edits made from separate callbacks would
--- otherwise join the previous one -- and afterwards records the blocks
--- that are live in the resulting undo state.
+-- Record rows s..e as block `name`, with an open fold in the current window,
+-- which must show bufnr.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param name string
+---@param s integer first row, 0-based
+---@param e integer last row, 0-based, inclusive
+function M.add_block(st, bufnr, name, s, e)
+  st.blocks[#st.blocks + 1] = {
+    name = name,
+    s_mark = vim.api.nvim_buf_set_extmark(bufnr, M.block_ns, s, 0, { invalidate = true }),
+    e_mark = vim.api.nvim_buf_set_extmark(bufnr, M.block_ns, e, 0, { invalidate = true }),
+  }
+  create_open_fold(s, e)
+end
+
+-- Setting 'undolevels', even to its own value, closes the undo block, so the
+-- next edit starts a new undo step (:help undo-blocks).
+local function start_undo_step(bufnr)
+  vim.bo[bufnr].undolevels = vim.bo[bufnr].undolevels
+end
+
+-- Make what `fn` does with M.set_lines and M.add_block one undo step, and drop
+-- the blocks whose first or last line it replaced. The new step is started
+-- first: edits from separate callbacks would otherwise join the previous one.
+--
+-- Neovim's undo and redo (run by history.lua) restore the text and the origin
+-- marks, but not st.blocks: redo re-inserts a block's lines without its marks,
+-- and undo does not bring back the blocks dropped here. So the blocks of each
+-- undo state are recorded in st.ranges_at, for M.restore_blocks().
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param fn fun()
 function M.change(st, bufnr, fn)
-  vim.bo[bufnr].undolevels = vim.bo[bufnr].undolevels -- closes the previous undo step
+  start_undo_step(bufnr)
   fn()
-  local nodes, live = {}, {}
-  for _, node in ipairs(st.nodes) do
-    local s, e = node_range(bufnr, node)
-    if s then
-      nodes[#nodes + 1] = node
-      live[#live + 1] = { name = node.name, s = s, e = e }
+  local kept = {}
+  for _, block in ipairs(st.blocks) do
+    if block_range(bufnr, block) then
+      kept[#kept + 1] = block
     end
   end
-  st.nodes = nodes
-  st.nodes_at[undo_seq(bufnr)] = live
+  st.blocks = kept
+  st.ranges_at[undo_seq(bufnr)] = M.block_ranges(st, bufnr)
 end
 
--- After undo/redo: rebuild the blocks recorded for the undo state the
--- buffer is now in.
-function M.restore_nodes(st, bufnr)
-  M.reset_marks(st, bufnr)
-  for _, node in ipairs(st.nodes_at[undo_seq(bufnr)] or {}) do
-    M.add_node(st, bufnr, node.name, node.s, node.e)
+-- After an undo or redo, rebuild the blocks recorded for the undo state reached.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+function M.restore_blocks(st, bufnr)
+  clear_blocks(st, bufnr)
+  for _, range in ipairs(st.ranges_at[undo_seq(bufnr)] or {}) do
+    M.add_block(st, bufnr, range.name, range.s, range.e)
   end
 end
 
--- Re-entrancy guard: one resolver round trip per view at a time, so two quick
--- keypresses on a slow server cannot interleave their splices. The stamp
--- goes stale after FETCH_GUARD_MS so a leaked flag cannot wedge the view
--- forever -- but the stale-out must outlast the resolver's WORST case, not
--- its typical one. fetch chains up to four sequential budgets (locate,
--- extract, definition chase, second extract), so the previous fixed 5000ms
--- re-armed the guard mid-flight: measured 9.6s on a stubbed slow server,
--- with the guard re-granted at 5.2s -- reopening the exact interleaved-
--- splice hazard it exists to prevent. Derived, not guessed, so a timeout
--- tuning cannot silently outgrow it again. M.FETCH_GUARD_MS, when set, is
--- an override -- the stale-out tests use it to force expiry without
--- waiting sixteen real seconds; production leaves it nil and derives.
+-- Re-entrancy guard: while a lookup is in flight for a view, M.begin_fetch()
+-- refuses another, so two quick keypresses cannot interleave their splices.
+-- It expires after guard_ms(), so a missed M.end_fetch() cannot lock a view.
+
+-- Tests set this (ms) to override guard_ms().
 M.FETCH_GUARD_MS = nil
 
-function M.fetch_guard_ms()
+-- resolver.fetch makes up to four requests in a row (locate, extract, chase,
+-- extract), and either extract can be cold. 3 * timeout + max(cold, timeout)
+-- covers them while cold <= timeout (the defaults are 2000 and 4000); one
+-- second of slack is added. An inline that goes on to macro.fetch_expansion
+-- can outlast the guard: its hover request has no timeout.
+local function guard_ms()
   if M.FETCH_GUARD_MS then
     return M.FETCH_GUARD_MS
   end
@@ -264,46 +323,60 @@ function M.fetch_guard_ms()
   return 3 * r._timeout_ms + math.max(r._cold_timeout_ms, r._timeout_ms) + 1000
 end
 
+---@param st inline_explorer.ViewState
+---@return boolean taken false while an earlier lookup holds the guard
 function M.begin_fetch(st)
   local now = vim.uv.now()
-  if st.fetch_started and (now - st.fetch_started) < M.fetch_guard_ms() then
+  if st.fetch_started and (now - st.fetch_started) < guard_ms() then
     return false
   end
   st.fetch_started = now
   return true
 end
 
+---@param st inline_explorer.ViewState
 function M.end_fetch(st)
   st.fetch_started = nil
 end
 
--- Turn the view's text into `new_src` (used by in-place transforms) by
--- replacing only the lines that differ, bottom-up so earlier hunks keep
--- their row numbers. Untouched lines keep their extmarks: their origin,
--- and the blocks around them. A block whose first or last line is
--- replaced is dropped.
-function M.rewrite(st, bufnr, new_src, row)
-  local span = require("inline-explorer.profile").start()
+-- Replace the view's text with `new_src`, changing only the lines that
+-- differ, so the others keep their origin and block marks. Then put the
+-- cursor on `cursor_row`.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param new_src string
+---@param cursor_row? integer 0-based, default 0
+function M.rewrite(st, bufnr, new_src, cursor_row)
+  local stop_timer = profile.start()
   local old_src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
   local new_lines = vim.split(new_src, "\n", { plain = true })
+  -- vim.diff tells a last line without "\n" from the same line with one, so
+  -- without the final "\n" appending would also replace the old last line.
   local hunks = vim.diff(old_src .. "\n", new_src .. "\n", { result_type = "indices" }) or {}
   M.change(st, bufnr, function()
+    -- Bottom-up, so each hunk leaves the rows of the hunks above it unchanged.
     for i = #hunks, 1, -1 do
-      local sa, ca, sb, cb = unpack(hunks[i])
-      -- A count of 0 means "insert after line start".
-      local first = ca > 0 and sa - 1 or sa
-      M.set_lines(bufnr, first, first + ca, vim.list_slice(new_lines, sb, sb + cb - 1))
+      local old_start, old_count, new_start, new_count = unpack(hunks[i])
+      -- vim.diff counts rows from 1, but a pure insertion's old_start is the
+      -- row it goes below (0: the top).
+      local first
+      if old_count == 0 then
+        first = old_start
+      else
+        first = old_start - 1
+      end
+      M.set_lines(bufnr, first, first + old_count, vim.list_slice(new_lines, new_start, new_start + new_count - 1))
     end
   end)
-  -- Manual folds do not follow line replacements reliably; rebuild them
+  -- Manual folds do not follow line replacements reliably, so rebuild them
   -- for the blocks that survived.
-  pcall(vim.cmd, "silent! normal! zE")
-  for _, node in ipairs(M.live_nodes(st, bufnr)) do
-    fold_open(node.s, node.e)
+  delete_folds()
+  for _, range in ipairs(M.block_ranges(st, bufnr)) do
+    create_open_fold(range.s, range.e)
   end
-  local n = vim.api.nvim_buf_line_count(bufnr)
-  pcall(vim.api.nvim_win_set_cursor, 0, { math.min((row or 0) + 1, n), 0 })
-  span("rewrite")
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  pcall(vim.api.nvim_win_set_cursor, 0, { math.min((cursor_row or 0) + 1, line_count), 0 })
+  stop_timer("rewrite")
 end
 
 return M

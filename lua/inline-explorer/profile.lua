@@ -1,57 +1,34 @@
--- Opt-in latency instrumentation. Off by default and near-free when off: the
--- span factory hands back a no-op, so instrumented call sites cost one table
--- lookup and one call.
---
--- Enable with :InlineExplorerProfile on (or profile = true in setup), drive
--- the plugin, then :InlineExplorerProfile to see where the time went. Every
--- span is also appended to a log file (:InlineExplorerProfile path) so a slow
--- session can be inspected afterwards -- or tailed live from another shell.
+-- Profile: opt-in latency instrumentation (usage: docs/development.md). A span
+-- times one stage of the work (see M.start); while profiling is off, the
+-- default, it costs two calls, plus the stop call's arguments, which the call
+-- site still evaluates.
 local M = {}
 
 M.enabled = false
-M.max_events = 200
 
--- Ring buffer of { name, ms, at } for the most recent spans (the report reads
--- this; the log file keeps everything).
+-- The last max_events spans, oldest first, for the report; the log file keeps
+-- every span. `at` is vim.uv.now() when the span stopped.
+M.max_events = 200
+---@type { name: string, ms: number, at: integer, detail?: string, action: integer }[]
 M.events = {}
 
--- Where spans are appended. Set to false to keep profiling in memory only.
+-- Where spans are appended; false keeps profiling in memory only.
 M.logfile = vim.fs.joinpath(vim.fn.stdpath("log"), "inline-explorer-profile.log")
 
-local function noop() end
-
--- Monotonically increasing id for one user action, so spans can be grouped
--- from the log with certainty instead of by adjacency. os.date resolves to
--- whole seconds, and a whole action often lands inside one -- the ordering
--- that mattered had to be inferred from the order lines happened to be
--- written in.
+-- Id of the current user action. Every span records it, so that the spans of
+-- one keypress can be grouped in the log.
 M.action = 0
 
--- Server identity, logged once per client per session. The flags a server
--- was started with, and its version, decide how it behaves on a first touch
--- of a header -- and they are exactly what a log from someone else's machine
--- cannot otherwise reveal. Without this, reproducing a stall means guessing
--- at another environment's configuration one variable at a time.
-M._identified = {}
-
-function M.identify(client)
-  if not M.enabled or not client or M._identified[client.id] then
-    return
-  end
-  M._identified[client.id] = true
-  local info = client.server_info or {}
-  local cmd = client.config and client.config.cmd
-  local cmdstr = type(cmd) == "table" and table.concat(cmd, " ")
-    or (type(cmd) == "function" and "<in-process>" or tostring(cmd))
-  local sp = M.start()
-  sp("server", ("%s %s | %s"):format(info.name or client.name or "?", info.version or "?", cmdstr))
-end
-
+---@return integer action
 function M.begin_action()
   M.action = M.action + 1
   return M.action
 end
 
+-- Append a span to the log file as a line like
+--   2026-01-31T12:00:00.123 #7    extract:cold                    35.2ms  foo.h
+-- Seconds and milliseconds come from one gettimeofday() reading, so the
+-- timestamp never mixes two clocks.
 local function append(name, ms, detail)
   if not M.logfile then
     return
@@ -60,12 +37,6 @@ local function append(name, ms, detail)
   if not f then
     return
   end
-  -- Seconds and milliseconds must come from the SAME clock. Taking the
-  -- seconds from os.date and the fraction from hrtime's nanosecond part --
-  -- which is what this did first -- pairs a wall clock with an unrelated
-  -- monotonic one, and the result runs backwards within an action:
-  -- extract:attach at .544 followed by extract:cold at .036. gettimeofday
-  -- gives both halves of one reading.
   local sec, usec = vim.uv.gettimeofday()
   f:write(
     ("%s.%03d #%-4d %-26s %9.1fms%s\n"):format(
@@ -80,20 +51,20 @@ local function append(name, ms, detail)
   f:close()
 end
 
--- Start a span. The returned function stops it and records the elapsed time
--- under the name given AT STOP TIME, so a call site can label itself by what
--- actually happened (e.g. "extract:cached" vs "extract:cold").
+local function noop() end
+
+---@alias inline_explorer.StopTimer fun(name: string, detail?: string): number?
+
+-- Start a span. The function returned (a no-op while profiling is off) stops
+-- and records it and returns its duration in ms. Naming the span there lets
+-- the name say what happened ("extract:cached", "extract:cold"). `detail`
+-- (symbol, file, size) goes to the log and the slowest spans, not the totals.
+---@return inline_explorer.StopTimer
 function M.start()
   if not M.enabled then
     return noop
   end
   local t0 = vim.uv.hrtime()
-  -- `detail` is free-form context -- which symbol, which file, how big --
-  -- recorded in the log but NOT part of the aggregation key, so identifying
-  -- the slow site does not fragment the report into one row per symbol.
-  -- Without it a 4-second extract and a 240ms one are indistinguishable
-  -- rows, and the first question anyone asks (which header was that?) has
-  -- no answer in the data.
   return function(name, detail)
     local ms = (vim.uv.hrtime() - t0) / 1e6
     M.events[#M.events + 1] = { name = name, ms = ms, at = vim.uv.now(), detail = detail, action = M.action }
@@ -105,8 +76,33 @@ function M.start()
   end
 end
 
--- Clear the in-memory ring. The log file is left alone (it is the durable
--- record); pass true to truncate it too.
+M._identified = {}
+
+-- Log each LSP client's name, version and command line once per session, so
+-- that a log from another machine shows which server setup produced it.
+---@param client? vim.lsp.Client
+function M.identify(client)
+  if not M.enabled or not client or M._identified[client.id] then
+    return
+  end
+  M._identified[client.id] = true
+  local info = client.server_info or {}
+  local cmd = client.config and client.config.cmd
+  local cmdstr
+  if type(cmd) == "table" then
+    cmdstr = table.concat(cmd, " ")
+  elseif type(cmd) == "function" then
+    cmdstr = "<in-process>"
+  else
+    cmdstr = tostring(cmd)
+  end
+  -- A span of about zero length, so it shows in the log and the report.
+  local stop_timer = M.start()
+  stop_timer("server", ("%s %s | %s"):format(info.name or client.name or "?", info.version or "?", cmdstr))
+end
+
+-- Forget the recorded spans; with `also_logfile`, empty the log file too.
+---@param also_logfile? boolean
 function M.clear(also_logfile)
   M.events = {}
   if also_logfile and M.logfile then
@@ -117,7 +113,11 @@ function M.clear(also_logfile)
   end
 end
 
--- Aggregate the recorded spans: one row per name, slowest total first.
+local WORST_SHOWN = 8
+
+-- The report, as text with two tables: the totals per span name (slowest
+-- total first), then the WORST_SHOWN slowest single spans with their detail.
+---@return string
 function M.report()
   if #M.events == 0 then
     return M.enabled and "[inline-explorer] profiling on, no spans recorded yet"
@@ -155,10 +155,6 @@ function M.report()
       a.last
     )
   end
-  -- The aggregate answers "which stage costs most across the session"; it
-  -- cannot answer "which single call was the 4-second one", which is the
-  -- question a slow session actually raises. List the worst individual
-  -- spans, with their detail, alongside it.
   local worst = {}
   for _, e in ipairs(M.events) do
     worst[#worst + 1] = e
@@ -166,11 +162,10 @@ function M.report()
   table.sort(worst, function(x, y)
     return x.ms > y.ms
   end)
-  -- Never empty: an empty event list returned early above.
   lines[#lines + 1] = ""
   lines[#lines + 1] = ("%-6s %-26s %9s  %s"):format("action", "span", "ms", "detail")
   lines[#lines + 1] = string.rep("-", 78)
-  for i = 1, math.min(8, #worst) do
+  for i = 1, math.min(WORST_SHOWN, #worst) do
     local e = worst[i]
     lines[#lines + 1] = ("#%-5d %-26s %8.1fms  %s"):format(e.action or 0, e.name, e.ms, e.detail or "")
   end

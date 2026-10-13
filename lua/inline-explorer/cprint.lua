@@ -1,50 +1,59 @@
--- Printers: pure layout for the three expansion forms (pretty / canonical
--- statement-expression / readable-multi). No judgements here.
-local C = require("inline-explorer.csrc")
+-- Printers: layout only, for the three forms canalyze.decide picks from.
+local csrc = require("inline-explorer.csrc")
+local simplify = require("inline-explorer.simplify")
 
 local M = {}
 
 local function splice(caller_src, edits)
-  return C.apply_edits(caller_src, 0, #caller_src, edits)
+  return csrc.apply_edits(caller_src, 0, #caller_src, edits)
 end
 
--- Rewrite `return E;` inside the body region.
--- style "goto":   `return E;` -> `{ ret = E; goto end; }` (self-contained)
--- style "assign": `return E;` -> `ret = E;`               (no control flow)
+-- Edits on ir.src that rewrite each `return`. Only the `return` keyword and,
+-- for "goto", the `;` are replaced, so E stays in place with its body_edits:
+--   "goto":    `return E;` -> `{ __ie_retN = E; goto __ie_endN; }`
+--              `return;`   -> `{ goto __ie_endN; }`
+--   "assign":  `return E;` -> `__ie_retN = E;`
+--              `return;`   -> `(void)0;`
 local function return_edits(ir, style)
-  local eds = {}
+  local edits = {}
+  local function replace(node, text)
+    edits[#edits + 1] = { csrc.start_byte(node), csrc.end_byte(node), text }
+  end
   for _, r in ipairs(ir.returns) do
-    local kw = r:child(0)
-    local semi = r:child(r:child_count() - 1)
+    local keyword = r:child(0)
+    local semicolon = r:child(r:child_count() - 1)
     local has_expr = r:named_child_count() > 0
     if style == "assign" then
-      eds[#eds + 1] = { C.sb(kw), C.eb(kw), has_expr and (ir.ret_var .. " =") or "(void)0" }
+      replace(keyword, has_expr and (ir.ret_var .. " =") or "(void)0")
     elseif has_expr then
-      eds[#eds + 1] = { C.sb(kw), C.eb(kw), "{ " .. ir.ret_var .. " =" }
-      eds[#eds + 1] = { C.sb(semi), C.eb(semi), "; goto " .. ir.end_label .. "; }" }
+      replace(keyword, "{ " .. ir.ret_var .. " =")
+      replace(semicolon, "; goto " .. ir.end_label .. "; }")
     else
-      eds[#eds + 1] = { C.sb(kw), C.eb(kw), "{ goto " .. ir.end_label .. ";" }
-      eds[#eds + 1] = { C.sb(semi), C.eb(semi), " }" }
+      replace(keyword, "{ goto " .. ir.end_label .. ";")
+      replace(semicolon, " }")
     end
   end
-  return eds
+  return edits
 end
 
--- Body statements [1..last_i] with `extra` edits applied, dedented to "".
+-- Statements 1..last_i with ir.body_edits and `extra` applied, from the start
+-- of the first one's line, so that csrc.reindent sees the callee's indentation.
 local function body_text(ir, last_i, extra)
   local edits = {}
   vim.list_extend(edits, ir.body_edits)
   vim.list_extend(edits, extra or {})
-  local rstart = C.bol(ir.stmts[1])
-  return C.apply_edits(ir.src, rstart, C.eb(ir.stmts[last_i]), edits)
+  local from = csrc.line_start_byte(ir.stmts[1])
+  return csrc.apply_edits(ir.src, from, csrc.end_byte(ir.stmts[last_i]), edits)
 end
 
--- Replace the whole target statement with `{ hoist...; modified target }`.
+-- print_hoisted where lines cannot go above target: a new block replaces
+-- target and holds the `hoist` lines, then target.
 local function print_wrapped(caller_src, ctx, hoist, replacement)
-  local ttext = C.text(ctx.target, caller_src)
-  local off = C.sb(ctx.call) - C.sb(ctx.target)
-  local modified = ttext:sub(1, off) .. replacement .. ttext:sub(C.eb(ctx.call) - C.sb(ctx.target) + 1)
-  local inner = ctx.indent .. ctx.unit
+  local target_start = csrc.start_byte(ctx.target)
+  local target_end = csrc.end_byte(ctx.target)
+  local call_edit = { csrc.start_byte(ctx.call), csrc.end_byte(ctx.call), replacement }
+  local modified = csrc.apply_edits(caller_src, target_start, target_end, { call_edit })
+  local inner = ctx.indent .. ctx.indent_unit
   local out = { "{" }
   for _, l in ipairs(hoist) do
     out[#out + 1] = inner .. l
@@ -53,13 +62,11 @@ local function print_wrapped(caller_src, ctx, hoist, replacement)
     out[#out + 1] = inner .. l
   end
   out[#out + 1] = ctx.indent .. "}"
-  return splice(caller_src, { { C.sb(ctx.target), C.eb(ctx.target), table.concat(out, "\n") } })
+  return splice(caller_src, { { target_start, target_end, table.concat(out, "\n") } })
 end
 
--- Insert `hoist` lines above the target statement and swap the call for
--- `replacement`; wraps in a block when the target is not directly braced.
 local function print_hoisted(caller_src, ctx, hoist, replacement)
-  if not ctx.braced then
+  if not ctx.can_insert_above then
     return print_wrapped(caller_src, ctx, hoist, replacement)
   end
   local block = {}
@@ -68,30 +75,38 @@ local function print_hoisted(caller_src, ctx, hoist, replacement)
   end
   return splice(caller_src, {
     { ctx.stmt_bol, ctx.stmt_bol, table.concat(block, "\n") .. "\n" },
-    { C.sb(ctx.call), C.eb(ctx.call), replacement },
+    { csrc.start_byte(ctx.call), csrc.end_byte(ctx.call), replacement },
   })
 end
 
--- Pretty hoist: setup lifted above the statement, the returned expression
--- spliced in place (parenthesised, so precedence is preserved).
+-- Pretty: the bindings and all statements but the last are hoisted above
+-- target, and E of the final `return E;`, parenthesised to keep its
+-- precedence, replaces the call. Only for a simple callee (see decide).
+---@param caller_src string
+---@param ir inline_explorer.IR with binds
+---@param ctx inline_explorer.Ctx
+---@return string new_src
 local function print_pretty(caller_src, ir, ctx)
   local hoist = {}
   vim.list_extend(hoist, ir.binds)
   if #ir.stmts >= 2 then
-    vim.list_extend(hoist, C.rebase(body_text(ir, #ir.stmts - 1), ""))
+    vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts - 1), ""))
   end
   local expr = ir.stmts[#ir.stmts]:named_child(0)
-  local expr_text = C.apply_edits(ir.src, C.sb(expr), C.eb(expr), ir.body_edits)
-  -- The precedence parens double up when the return expression was already
-  -- parenthesised; collapse the redundant nest (semantics-preserving).
-  local replacement = require("inline-explorer.simplify").parens("(" .. expr_text .. ")")
+  ---@cast expr -nil
+  local expr_text = csrc.apply_edits(ir.src, csrc.start_byte(expr), csrc.end_byte(expr), ir.body_edits)
+  local replacement = simplify.parens("(" .. expr_text .. ")")
   return print_hoisted(caller_src, ctx, hoist, replacement)
 end
 
--- Canonical form: GNU statement expression + return->goto. Legal in any
--- expression context, so it needs no wrapping and no safety analysis.
+-- Canonical: a GNU statement expression replaces the call, every return
+-- becoming a goto to its end.
+---@param caller_src string
+---@param ir inline_explorer.IR with binds
+---@param ctx inline_explorer.Ctx
+---@return string new_src
 local function print_canonical(caller_src, ir, ctx)
-  local inner = ctx.indent .. ctx.unit
+  local inner = ctx.indent .. ctx.indent_unit
   local parts = { "({" }
   for _, b in ipairs(ir.binds) do
     parts[#parts + 1] = inner .. b
@@ -99,24 +114,29 @@ local function print_canonical(caller_src, ir, ctx)
   if ir.has_value then
     parts[#parts + 1] = inner .. ir.ret_type .. " " .. ir.ret_var .. ";"
   end
-  vim.list_extend(parts, C.rebase(body_text(ir, #ir.stmts, return_edits(ir, "goto")), inner))
+  vim.list_extend(parts, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "goto")), inner))
   parts[#parts + 1] = inner .. ir.end_label .. ":;"
   if ir.has_value then
     parts[#parts + 1] = inner .. ir.ret_var .. ";"
   end
   parts[#parts + 1] = ctx.indent .. "})"
-  return splice(caller_src, { { C.sb(ctx.call), C.eb(ctx.call), table.concat(parts, "\n") } })
+  return splice(caller_src, { { csrc.start_byte(ctx.call), csrc.end_byte(ctx.call), table.concat(parts, "\n") } })
 end
 
--- Readable general form: body hoisted with return -> assignment, no ({})/goto.
--- Reads top-to-bottom; not faithful for functions with early returns.
+-- Readable: the body is hoisted with every return turned into an assignment,
+-- and __ie_retN replaces the call. An early return no longer stops the rest
+-- of the body, so this is unfaithful to a callee that has one.
+---@param caller_src string
+---@param ir inline_explorer.IR with binds
+---@param ctx inline_explorer.Ctx
+---@return string new_src
 local function print_readable_multi(caller_src, ir, ctx)
   local hoist = {}
   vim.list_extend(hoist, ir.binds)
   if ir.has_value then
     hoist[#hoist + 1] = ir.ret_type .. " " .. ir.ret_var .. ";"
   end
-  vim.list_extend(hoist, C.rebase(body_text(ir, #ir.stmts, return_edits(ir, "assign")), ""))
+  vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "assign")), ""))
   return print_hoisted(caller_src, ctx, hoist, ir.ret_var)
 end
 

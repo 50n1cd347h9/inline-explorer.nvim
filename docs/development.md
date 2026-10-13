@@ -28,6 +28,15 @@ Formatting is checked in CI with [StyLua](https://github.com/JohnnyMorganz/StyLu
 stylua --check lua tests
 ```
 
+[luacheck](https://github.com/lunarmodules/luacheck) lints the code and caps
+each function's cyclomatic complexity at 15 (`.luacheckrc` at the root). A
+function over the cap is split into helpers rather than exempted; specs
+under `tests/` are linted without the cap.
+
+```sh
+luacheck lua tests
+```
+
 ## How it works
 
 - **View** — a scratch copy of the source buffer, `nomodifiable`,

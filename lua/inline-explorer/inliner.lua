@@ -1,22 +1,132 @@
--- Smart inline: the primary expansion action. In a C buffer it prefers
--- in-place substitution (functions -> compiler-style inline, macros -> clangd
--- expansion) and only falls back to block-paste (`expander.expand`) when
--- in-place is not possible. Non-C buffers always use block-paste.
+-- Smart inline, the primary expansion action. In a C buffer a function call
+-- is substituted in place and a macro use replaced by clangd's expansion of
+-- it. Anything else, or a failure, block-pastes the definition
+-- (expander.expand), as in any other language.
 local resolver = require("inline-explorer.resolver")
 local substitute = require("inline-explorer.substitute")
 local macro = require("inline-explorer.macro")
 local expander = require("inline-explorer.expander")
 local view = require("inline-explorer.view")
 local config = require("inline-explorer.config")
+local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
 
 local M = {}
 
 local function has_c_parser()
-  return pcall(vim.treesitter.get_string_parser, "int __ie;", "c")
+  local ok = pcall(vim.treesitter.get_string_parser, "int __ie;", "c")
+  return ok
 end
 
--- Try in-place substitution first; fall back to block-paste.
+-- The view buffer's tree, which the highlighter keeps parsed incrementally,
+-- so a keypress does not parse the whole file. nil on failure; substitute and
+-- macro then parse the text themselves.
+local function buffer_root(bufnr)
+  local ok, root = pcall(function()
+    return vim.treesitter.get_parser(bufnr, "c"):parse()[1]:root()
+  end)
+  if not ok then
+    return nil
+  end
+  return root
+end
+
+-- The profile span name for a failed substitution. The keys are words of the
+-- reasons that canalyze and substitute return.
+local function rejection_label(reason)
+  local message = tostring(reason)
+  for _, key in ipairs({ "variadic", "arity", "not found", "empty" }) do
+    if message:find(key, 1, true) then
+      return "substitute:rejected-" .. (key:gsub(" ", "-"))
+    end
+  end
+  return "substitute:rejected-other"
+end
+
+-- One smart-inline keypress, as M.smart sets it up.
+---@class inline_explorer.InlineAction
+---@field st inline_explorer.ViewState
+---@field bufnr integer the view buffer
+---@field row integer the cursor row, 0-based
+---@field col integer the cursor's byte column, 0-based
+---@field view_text string the view buffer's text
+---@field root TSNode? the tree of view_text
+---@field ident string the name being inlined
+---@field finish_total inline_explorer.StopTimer ends the keypress's span
+
+-- The fetch guard is released first: without `prefetched`, expand fetches and
+-- takes the guard itself.
+local function block_fallback(action, prefetched)
+  action.finish_total("total:block-fallback", action.ident)
+  view.end_fetch(action.st)
+  vim.schedule(function()
+    expander.expand(prefetched)
+  end)
+end
+
+local function inline_function(action, prefetched)
+  local st = action.st
+  local expansion_id = (st.subst_n or 0) + 1
+  local finish_substitute = profile.start()
+  local callee_src = table.concat(prefetched.body, "\n")
+  local ok, result, reason = pcall(
+    substitute.inline_in_buffer,
+    action.view_text,
+    action.row,
+    action.col,
+    callee_src,
+    expansion_id,
+    config.options.mode,
+    action.root
+  )
+  local new_text, failure
+  if ok then
+    new_text, failure = result, reason
+  else
+    failure = result
+  end
+  finish_substitute(
+    new_text and "substitute:ok" or rejection_label(failure),
+    ("%s (caller %dL)"):format(action.ident, vim.api.nvim_buf_line_count(st.source_bufnr))
+  )
+  if not new_text then
+    block_fallback(action, prefetched)
+    return
+  end
+  vim.schedule(function()
+    view.end_fetch(st)
+    st.subst_n = expansion_id
+    view.rewrite(st, action.bufnr, new_text, action.row)
+    action.finish_total("total:inline-function", action.ident)
+  end)
+end
+
+local function expand_macro(action, prefetched)
+  local st = action.st
+  -- clangd knows only the source file.
+  local src_row = view.src_line(st, action.row)
+  macro.fetch_expansion(st, src_row, action.col, function(expansion)
+    if not expansion or #expansion == 0 then
+      block_fallback(action, prefetched)
+      return
+    end
+    vim.schedule(function()
+      local ok, new_text = pcall(macro.replace_in_src, action.view_text, action.row, action.col, expansion, action.root)
+      if ok and new_text then
+        view.end_fetch(st)
+        view.rewrite(st, action.bufnr, new_text, action.row)
+        action.finish_total("total:inline-macro", action.ident)
+      else
+        -- As block_fallback, but under its own span name, and calling expand
+        -- directly: this callback already runs scheduled.
+        action.finish_total("total:macro-splice-failed")
+        view.end_fetch(st)
+        expander.expand(prefetched)
+      end
+    end)
+  end)
+end
+
 function M.smart()
   local st = view.current()
   if not st then
@@ -24,117 +134,58 @@ function M.smart()
     return
   end
   if vim.bo.filetype ~= "c" or not has_c_parser() then
-    return expander.expand() -- non-C / no parser: block only
+    expander.expand()
+    return
   end
 
   local bufnr = vim.api.nvim_get_current_buf()
-  local cur = vim.api.nvim_win_get_cursor(0)
-  local row, col = cur[1] - 1, cur[2]
-  local src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  -- The view's own tree for that text: the highlighter keeps it parsed,
-  -- incrementally, so nothing re-parses the whole file per keypress. Nil
-  -- (and a string parse downstream) if the buffer has no c parser.
-  local ok_root, root = pcall(function()
-    return vim.treesitter.get_parser(bufnr, "c"):parse()[1]:root()
-  end)
-  root = ok_root and root or nil
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local row, col = cursor[1] - 1, cursor[2]
+  local view_text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  local root = buffer_root(bufnr)
 
-  local fname = substitute.call_name_at(src, row, col, root) -- non-nil only on a call
-  local ident = fname
+  local call_name = substitute.call_name_at(view_text, row, col, root)
+  local ident = call_name
   if not ident or ident == "" then
     ident = vim.fn.expand("<cword>")
   end
   if not ident or ident == "" then
-    return util.notify("nothing under the cursor", vim.log.levels.WARN)
+    util.notify("nothing under the cursor", vim.log.levels.WARN)
+    return
   end
 
   if not view.begin_fetch(st) then
-    return util.notify("a lookup is already in flight", vim.log.levels.INFO)
+    util.notify("a lookup is already in flight", vim.log.levels.INFO)
+    return
   end
 
-  local profile = require("inline-explorer.profile")
-  -- Number this action before anything is recorded, so every span it
-  -- produces carries the same id and the log can be grouped with certainty
-  -- rather than by which lines happen to sit next to each other.
+  -- Before resolver.fetch, so its spans carry this action's id too.
   profile.begin_action()
-  local total = profile.start()
-
-  -- Hand whatever we already resolved to the block-paste path instead of
-  -- making it repeat the round trip. The guard is released first: expand
-  -- acquires its own when it does have to fetch.
-  local function block_fallback(prefetched)
-    total("total:block-fallback", ident)
-    view.end_fetch(st)
-    vim.schedule(function()
-      expander.expand(prefetched)
-    end)
-  end
-
-  -- Aggregate rejections by cause, not as one opaque bucket.
-  local function reject_stage(err)
-    local e = tostring(err)
-    for _, pat in ipairs({ "variadic", "arity", "not found", "empty" }) do
-      if e:find(pat, 1, true) then
-        return "substitute:rejected-" .. pat:gsub(" ", "-")
-      end
-    end
-    return "substitute:rejected-other"
-  end
+  ---@type inline_explorer.InlineAction
+  local action = {
+    st = st,
+    bufnr = bufnr,
+    row = row,
+    col = col,
+    view_text = view_text,
+    root = root,
+    ident = ident,
+    finish_total = profile.start(),
+  }
 
   resolver.fetch(ident, st.source_bufnr, function(lines, label)
     if not lines then
-      return block_fallback() -- expand re-resolves and reports if the name is unknown
+      block_fallback(action) -- expand looks up <cword> itself, and reports a failure
+      return
     end
     local prefetched = { name = ident, body = lines, label = label }
-    if fname and label == "function_definition" then
-      local N = (st.subst_n or 0) + 1
-      -- substitute covers parse, analysis (including enclosing_scope's
-      -- whole-translation-unit walk) and printing. Kept as one span
-      -- deliberately -- splitting it further would need the boundary
-      -- inside substitute itself -- but it now says which callee and how
-      -- big the caller was, which is what distinguishes a slow site from
-      -- a slow engine.
-      local sspan = profile.start()
-      local ok, new, serr =
-        pcall(substitute.inline_in_buffer, src, row, col, table.concat(lines, "\n"), N, config.options.mode, root)
-      sspan(
-        ok and new and "substitute:ok" or reject_stage(ok and serr or new),
-        ("%s (caller %dL)"):format(ident, vim.api.nvim_buf_line_count(st.source_bufnr))
-      )
-      if ok and new then
-        return vim.schedule(function()
-          view.end_fetch(st)
-          st.subst_n = N
-          view.rewrite(st, bufnr, new, row)
-          total("total:inline-function", ident)
-        end)
-      end
-      return block_fallback(prefetched) -- e.g. variadic function
+    if call_name and label == "function_definition" then
+      inline_function(action, prefetched)
+    else
+      -- For anything but a macro, clangd has no expansion, and expand_macro
+      -- block-pastes the definition.
+      expand_macro(action, prefetched)
     end
-
-    -- Not a confirmed function (macro, or heuristic-extracted from a header):
-    -- try an in-place macro expansion via clangd (tweak, then hover); block-paste
-    -- only if that yields nothing (so a plain function-signature hover never gets
-    -- spliced). The clangd query runs against the ORIGINAL file, so map the
-    -- view row back to its source line; inserted text has no source position
-    -- and skips straight to the fallback.
-    macro.fetch_expansion(st, view.src_line(st, row), col, function(exp)
-      if not exp or #exp == 0 then
-        return block_fallback(prefetched)
-      end
-      vim.schedule(function()
-        local ok, new = pcall(macro.replace_in_src, src, row, col, exp, root)
-        if ok and new then
-          view.end_fetch(st)
-          view.rewrite(st, bufnr, new, row)
-          total("total:inline-macro", ident)
-        else
-          total("total:macro-splice-failed")
-          view.end_fetch(st)
-          expander.expand(prefetched)
-        end
-      end)
-    end)
   end)
 end
 

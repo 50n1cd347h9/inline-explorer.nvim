@@ -204,7 +204,7 @@ end
 -- Why the sum, and why only `total:` spans. Each `total:` span already covers
 -- one whole phase of the action, end to end: `expander.expand` starts its
 -- span immediately before `resolver.fetch` and stops it after the splice, and
--- `inliner.smart` starts `total` before its own fetch and stops it after the
+-- `inliner.smart` starts its `total:` span (`action.finish_total`) before its own fetch and stops it after the
 -- rewrite. A single-phase action therefore has exactly one `total:` span
 -- whose ms IS the latency; a multi-phase action's phases run one after
 -- another and never overlap (the block-paste fallback stops
@@ -225,7 +225,7 @@ end
 -- all, so there is no clock mixing and no millisecond quantization.
 --
 -- What this does NOT cover. `inliner.smart` does its whole-buffer concat and
--- its `substitute.call_name_at` tree-sitter parse BEFORE starting the `total`
+-- its `substitute.call_name_at` tree-sitter parse BEFORE starting its `total:`
 -- span, so an `ei` (smart-inline) measurement EXCLUDES that parse -- measured
 -- at roughly 7ms on a large real file, i.e. not negligible. Read an
 -- `inline:*` number as "from the fetch onwards", not as the whole keypress.

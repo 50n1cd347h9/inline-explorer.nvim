@@ -55,7 +55,7 @@ check("header comment present", text:find("/* v helper (function_definition) */"
 check("footer comment present", text:find("/* ^ helper */", 1, true) ~= nil, text)
 check("body indented one level past the call line", text:find("\n      static int helper", 1, true) ~= nil, text)
 check("view stays nomodifiable", vim.bo[vbuf].modifiable == false)
-check("one expansion node tracked", #view.current().nodes == 1)
+check("one expansion block tracked", #view.current().blocks == 1)
 
 -- Recursion guard: cursor inside the expansion, same name -> no second splice.
 local before = vim.api.nvim_buf_line_count(vbuf)
@@ -79,15 +79,23 @@ require("inline-explorer.history").undo()
 check("undo restores the original view", vim.api.nvim_buf_line_count(vbuf) == 4)
 require("inline-explorer.history").redo()
 check("redo brings the expansion back", vim.api.nvim_buf_line_count(vbuf) == before)
-check("redo brings it back as a tracked block", #view.current().nodes == 1, #view.current().nodes)
+check("redo brings it back as a tracked block", #view.current().blocks == 1, #view.current().blocks)
 require("inline-explorer.history").undo()
 
 -- Line-origin bookkeeping: after undo the map is identity again; a splice
 -- marks the inserted rows as origin-less and shifts the tail; a rewrite keeps
--- origins for unchanged lines and re-anchors surviving expansion nodes.
+-- origins for unchanged lines and re-anchors surviving expansion blocks.
 do
   local st = view.current()
-  check("origin: identity after undo", view.src_line(st, 0) == 0 and view.src_line(st, 3) == 3, vim.inspect(st.origin))
+  -- The source row of every view row ("-" for none), for failure messages.
+  local function origins()
+    local out = {}
+    for row = 0, vim.api.nvim_buf_line_count(st.bufnr) - 1 do
+      out[#out + 1] = tostring(view.src_line(st, row) or "-")
+    end
+    return table.concat(out, " ")
+  end
+  check("origin: identity after undo", view.src_line(st, 0) == 0 and view.src_line(st, 3) == 3, origins())
 
   vim.api.nvim_win_set_cursor(0, { 3, col })
   expander.expand()
@@ -98,31 +106,31 @@ do
   check(
     "origin: spliced rows have no source line",
     view.src_line(st, 3) == nil and view.src_line(st, 2 + inserted) == nil,
-    vim.inspect(st.origin)
+    origins()
   )
-  check("origin: tail shifted to its old source line", view.src_line(st, 3 + inserted) == 3, vim.inspect(st.origin))
+  check("origin: tail shifted to its old source line", view.src_line(st, 3 + inserted) == 3, origins())
 
   -- Rewrite that only touches the call line: unchanged lines keep their
-  -- origins and the expansion node survives with its rows intact.
+  -- origins and the expansion block survives with its rows intact.
   local lines_now = vim.api.nvim_buf_get_lines(vbuf, 0, -1, false)
   lines_now[3] = "    int r = (0);"
   view.rewrite(st, vbuf, table.concat(lines_now, "\n"), 2)
-  check("rewrite: node survives an unrelated line change", #st.nodes == 1, #st.nodes)
-  check("rewrite: changed line loses its origin", view.src_line(st, 2) == nil, vim.inspect(st.origin))
+  check("rewrite: block survives an unrelated line change", #st.blocks == 1, #st.blocks)
+  check("rewrite: changed line loses its origin", view.src_line(st, 2) == nil, origins())
   check(
     "rewrite: unchanged lines keep origins",
     view.src_line(st, 0) == 0 and view.src_line(st, 3 + inserted) == 3,
-    vim.inspect(st.origin)
+    origins()
   )
 
   -- Undoing the rewrite gives the changed line its origin back; redoing it
   -- takes it away again. The block survives both.
   require("inline-explorer.history").undo()
   check("undo of a rewrite restores the line's origin", view.src_line(st, 2) == 2, view.src_line(st, 2))
-  check("undo of a rewrite keeps the block", #st.nodes == 1, #st.nodes)
+  check("undo of a rewrite keeps the block", #st.blocks == 1, #st.blocks)
   require("inline-explorer.history").redo()
   check("redo of a rewrite drops the origin again", view.src_line(st, 2) == nil, view.src_line(st, 2))
-  check("redo of a rewrite keeps the block", #st.nodes == 1, #st.nodes)
+  check("redo of a rewrite keeps the block", #st.blocks == 1, #st.blocks)
 
   -- A rewrite replaces only the lines that differ.
   check(
@@ -201,7 +209,7 @@ do
     "prefetched body is what got spliced",
     table.concat(vim.api.nvim_buf_get_lines(vbuf, 0, -1, false), "\n"):find("prefetched_fn(void)", 1, true) ~= nil
   )
-  check("prefetched splice is tracked as a node", #st.nodes >= 1, #st.nodes)
+  check("prefetched splice is tracked as a block", #st.blocks >= 1, #st.blocks)
   check(
     "prefetched expand records a total:expand span",
     (function()
@@ -380,12 +388,12 @@ end
 -- -- had its expansion spliced between the two lines, splitting the
 -- statement. A statement with a body stops where the body begins.
 do
-  local function expand_at(lines, row, word)
+  local function expand_at(src, row, word)
     vim.cmd("enew")
     vim.bo.filetype = "c"
-    vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, src)
     local v = view.open()
-    vim.api.nvim_win_set_cursor(0, { row, lines[row]:find(word, 1, true) - 1 })
+    vim.api.nvim_win_set_cursor(0, { row, src[row]:find(word, 1, true) - 1 })
     local n = vim.api.nvim_buf_line_count(v)
     expander.expand()
     vim.wait(1000, function()
@@ -416,10 +424,10 @@ do
   check("statement: indented from the statement's first line", pad == "      ", out)
   at, pad, out = expand_at(stmt, 4, "reqsize")
   check("statement: from a continuation line, the same place and indent", at == 5 and pad == "      ", out)
-  at, _, out = expand_at(stmt, 5, "cond")
-  check("statement: an if expands below its condition, inside the braces", at == 7, out)
-  at, _, out = expand_at(stmt, 7, "work")
-  check("statement: a one-line statement keeps the row below", at == 8, out)
+  at, pad, out = expand_at(stmt, 5, "cond")
+  check("statement: an if expands below its condition, inside the braces", at == 7 and pad == "      ", out)
+  at, pad, out = expand_at(stmt, 7, "work")
+  check("statement: a one-line statement keeps the row below", at == 8 and pad == "          ", out)
   view.close()
 end
 

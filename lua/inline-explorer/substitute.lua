@@ -1,88 +1,92 @@
--- C inline substitution: replace a call `f(args)` with the effect of f's body,
--- as a compilable source transform (GNU C).
---
---   * parameters      -> bindings that reconstruct each parameter's declared
---                        type (arrays decay to pointers, handles pointers/
---                        fn-ptrs); falls back to `__auto_type` for exotic
---                        declarators
---   * single-return    -> "pretty" hoist: setup statements lifted above the call
---     straight-line       statement, the returned expression spliced in place
---   * anything else    -> GNU statement expression `({ ... })` with each
---                        `return E;` rewritten to `{ __ie_retN = E; goto end; }`
---                        and the reconstructed declared return type as
---                        `__ie_retN`'s slot
---   * callee labels    -> suffixed `label__ieN` (labels are function-scoped, so
---                        inlining twice would otherwise collide)
---   * name collisions  -> hoisted locals that clash with the caller scope are
---                        suffixed `name__ieN`
---
--- The transform is pure text/tree-sitter and language-specific to C. `N` is a
--- per-expansion id that keeps injected/renamed names unique.
---
--- Structure: csrc (tree-sitter/text helpers) -> canalyze (analyze_callee -> IR,
--- analyze_context -> ctx, the single decide()) -> cprint (one of three
--- layout-only printers: pretty / canonical statement-expression /
--- readable-multi). This module is the facade: it keeps the public API and
--- test hooks stable while delegating to those three.
-local C = require("inline-explorer.csrc")
-local A = require("inline-explorer.canalyze")
-local P = require("inline-explorer.cprint")
+-- C inline substitution: rewrites a call `f(args)` into the effect of f's
+-- body, as a GNU C source transform on text and tree-sitter trees. canalyze
+-- analyses the call and decides on a layout, cprint prints it, and this module
+-- holds the public API and the test hooks. `N`, an id unique to each
+-- expansion, suffixes the names it injects or renames. See DESIGN.md.
+local csrc = require("inline-explorer.csrc")
+local canalyze = require("inline-explorer.canalyze")
+local cprint = require("inline-explorer.cprint")
 
 local M = {}
 
--- Build the transform. Returns (new_caller_src, err).
--- mode: "correct" (default, guaranteed to compile) or "readable" (cleaner
--- output that skips ({...})/goto and may not compile in edge cases).
-local function print_call(caller_src, ir, ctx, err, mode)
+local function print_call(caller_src, ir, ctx, mode)
+  local printer_name = canalyze.decide(ir, ctx, mode or "correct")
+  return cprint.PRINTERS[printer_name](caller_src, ir, ctx)
+end
+
+-- Inlines the occ-th call to fname in caller_src; callee_src holds fname's
+-- definition.
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param N? integer default 1
+---@param occ? integer default 1
+---@param mode? "correct"|"readable" default "correct"
+---@return string? new_src
+---@return string? err
+function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
+  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
   if not ir then
     return nil, err
   end
-  return P.PRINTERS[A.decide(ir, ctx, mode or "correct")](caller_src, ir, ctx)
+  return print_call(caller_src, ir, ctx, mode)
 end
 
-function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
-  local ir, ctx, err = A.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
-  return print_call(caller_src, ir, ctx, err, mode)
-end
-
--- Test/introspection hook: run the analysis without printing.
+-- Test hook: analyses the occ-th call to fname without printing it. Unlike
+-- analyze_call it binds no arguments: no arity check, and ir.binds is nil.
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param occ? integer default 1
+---@param mode? "correct"|"readable" default "correct"
+---@return { ir: inline_explorer.IR, ctx: inline_explorer.Ctx, decision: string }?
+---@return string? err
 function M._probe(caller_src, callee_src, fname, occ, mode)
-  local call = C.find_calls(C.parse(caller_src), caller_src, fname, occ or 1)[occ or 1]
+  occ = occ or 1
+  local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ)[occ]
   if not call then
     return nil, "call to '" .. fname .. "' not found"
   end
-  local ir, err = A.analyze_callee(callee_src, fname, 1, A.enclosing_scope(call, caller_src))
+  local expansion_id = 1
+  local caller_names = canalyze.names_in_scope(call, caller_src)
+  local ir, err = canalyze.analyze_callee(callee_src, fname, expansion_id, caller_names)
   if not ir then
     return nil, err
   end
-  local ctx = A.analyze_context(caller_src, call)
-  return { ir = ir, ctx = ctx, decision = A.decide(ir, ctx, mode or "correct") }
+  local ctx = canalyze.analyze_context(caller_src, call)
+  return { ir = ir, ctx = ctx, decision = canalyze.decide(ir, ctx, mode or "correct") }
 end
 
--- Test hooks for the property suites: the layout helpers, and a renderer that
--- forces a named printer, bypassing decide() -- used to check that canonical
--- and pretty output of the same call are semantically identical.
-M._rebase = C.rebase
-M._common_ws_prefix = C.common_ws_prefix
+-- The property suites test csrc's layout helpers through these hooks.
+M._rebase = csrc.reindent
+M._common_ws_prefix = csrc.common_ws_prefix
 
-function M._render(caller_src, callee_src, fname, N, occ, printer)
-  local p = P.PRINTERS[printer]
-  if not p then
-    return nil, "unknown printer '" .. tostring(printer) .. "'"
+-- Test hook: inline_call with the printer named printer_name, not decide()'s.
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param N? integer default 1
+---@param occ? integer default 1
+---@param printer_name string
+---@return string? new_src
+---@return string? err
+function M._render(caller_src, callee_src, fname, N, occ, printer_name)
+  local printer = cprint.PRINTERS[printer_name]
+  if not printer then
+    return nil, "unknown printer '" .. tostring(printer_name) .. "'"
   end
-  local ir, ctx, err = A.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
+  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
   if not ir then
     return nil, err
   end
-  return p(caller_src, ir, ctx)
+  ---@cast ctx -nil
+  return printer(caller_src, ir, ctx)
 end
 
--- The innermost call at (row, col) and the plain function name it calls;
--- nil and a reason when there is no call or its target is not a name.
--- `root`, when given, is caller_src's tree already (a buffer's own parse);
--- otherwise caller_src is parsed.
+-- The innermost call at (row, col) and the name it calls, or nil and the
+-- reason when there is no call there or it calls no plain name.
 local function named_call_at(caller_src, row, col, root)
-  local call = C.ancestor_at(root or C.parse(caller_src), row, col, "call_expression")
+  local call = csrc.ancestor_at(root or csrc.parse(caller_src), row, col, "call_expression")
   if not call then
     return nil, "no call under the cursor"
   end
@@ -90,26 +94,44 @@ local function named_call_at(caller_src, row, col, root)
   if not fn or fn:type() ~= "identifier" then
     return nil, "call target is not a plain function name"
   end
-  return call, C.text(fn, caller_src)
+  return call, csrc.text(fn, caller_src)
 end
 
--- Name of the function called at (row, col), or nil.
+-- The name of the function called at (row, col), or nil.
+---@param caller_src string
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param root? TSNode caller_src's tree, if already parsed
+---@return string?
 function M.call_name_at(caller_src, row, col, root)
-  local call, fname = named_call_at(caller_src, row, col, root)
-  return call and fname or nil
+  local call, name_or_reason = named_call_at(caller_src, row, col, root)
+  if not call then
+    return nil
+  end
+  return name_or_reason
 end
 
--- Inline the call under the cursor (row, col are 0-indexed). The located
--- call node goes straight to the analysis; numbering it as an occurrence
--- only for analyze_call to walk the file again and find it was a second
--- and third search for a node already in hand.
+-- inline_call for the call at (row, col); see named_call_at.
+---@param caller_src string
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param callee_src string
+---@param N? integer default 1
+---@param mode? "correct"|"readable" default "correct"
+---@param root? TSNode caller_src's tree, if already parsed
+---@return string? new_src
+---@return string? err
 function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)
-  local call, fname = named_call_at(caller_src, row, col, root)
+  local call, name_or_reason = named_call_at(caller_src, row, col, root)
   if not call then
-    return nil, fname
+    return nil, name_or_reason
   end
-  local ir, ctx, err = A.analyze_call_node(caller_src, callee_src, fname, N or 1, call)
-  return print_call(caller_src, ir, ctx, err, mode)
+  local fname = name_or_reason
+  local ir, ctx, err = canalyze.analyze_call_node(caller_src, callee_src, fname, N or 1, call)
+  if not ir then
+    return nil, err
+  end
+  return print_call(caller_src, ir, ctx, mode)
 end
 
 return M
