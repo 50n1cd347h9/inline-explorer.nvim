@@ -154,6 +154,22 @@ local function pos_in_range(pos, range)
   return at_or_after(pos, range.start) and at_or_after(range["end"], pos)
 end
 
+-- The edit that replaces the text at `pos`, else one that ends or inserts
+-- there. clangd formats the tweak's output, so the expansion can come with
+-- whitespace edits around it, and an edit's place in the list means nothing.
+local function edit_at(edits, pos)
+  local touching
+  for _, e in ipairs(edits) do
+    if type(e) == "table" and pos_in_range(pos, e.range) then
+      if not at_or_after(pos, e.range["end"]) then
+        return e
+      end
+      touching = touching or e
+    end
+  end
+  return touching
+end
+
 -- The text edits of `workspace_edit`, if it edits document `uri` and nothing
 -- else: no other document, and no file created, renamed or deleted.
 local function edits_only_for(workspace_edit, uri)
@@ -195,21 +211,17 @@ local function edit_matches(workspace_edit, uri, pos)
   if type(edits) ~= "table" then
     return false
   end
-  for _, e in ipairs(edits) do
-    if type(e) == "table" and pos_in_range(pos, e.range) then
-      return true
-    end
-  end
-  return false
+  return edit_at(edits, pos) ~= nil
 end
 
--- The newText of the first text edit for `uri`, without blank edge lines. It
--- reads only edits that edit_matches accepted, so other documents are not
--- checked again.
+-- The newText of the edit at `pos` in document `uri` (see edit_at), without
+-- blank edge lines. It reads only edits that edit_matches accepted, so other
+-- documents are not checked again.
 ---@param workspace_edit lsp.WorkspaceEdit?
 ---@param uri string
+---@param pos lsp.Position
 ---@return string[]? lines nil when there is no text
-local function edit_lines(workspace_edit, uri)
+local function edit_lines(workspace_edit, uri, pos)
   if type(workspace_edit) ~= "table" then
     return nil
   end
@@ -224,10 +236,11 @@ local function edit_lines(workspace_edit, uri)
       end
     end
   end
-  if type(edits) ~= "table" or #edits == 0 or type(edits[1].newText) ~= "string" then
+  local edit = type(edits) == "table" and edit_at(edits, pos)
+  if not edit or type(edit.newText) ~= "string" then
     return nil
   end
-  local out = trim_blank_lines(vim.split(edits[1].newText, "\n", { plain = true }))
+  local out = trim_blank_lines(vim.split(edit.newText, "\n", { plain = true }))
   if #out == 0 then
     return nil
   end
@@ -417,7 +430,7 @@ local function fetch_via_tweak(bufnr, row, col, cb)
       uri = uri,
       pos = pos,
       on_edit = function(edit)
-        finish(edit_lines(edit, uri))
+        finish(edit_lines(edit, uri, pos))
       end,
     }
     add_claim(client.id, claim)

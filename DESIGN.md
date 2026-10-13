@@ -131,11 +131,12 @@ preprocessor. `macro.lua` therefore delegates to the live clangd, preferring its
 `ExpandMacro` tweak: the tweak is discovered via `textDocument/codeAction`,
 executed via `workspace/executeCommand`, and the `workspace/applyEdit` it sends
 back is intercepted — kept out of the real file (a reply straggling past the
-timeout + grace window, ~5 s, is the one exception) — with its `newText` taken
-as the expansion. When the tweak is unavailable (older clangd, no action at the
-position, errors, timeout) the fallback scrapes `textDocument/hover` markdown
-(clangd puts `#define` and the expansion in one code block separated by an
-"Expands to" marker; we take the part after it).
+timeout + grace window, ~5 s, is the one exception) — with the `newText` of its
+edit at the macro use taken as the expansion (clangd formats the result, so the
+other edits only change whitespace). When the tweak is unavailable (older
+clangd, no action at the position, errors, timeout) the fallback scrapes
+`textDocument/hover` markdown (clangd puts `#define` and the expansion in one
+code block separated by an "Expands to" marker; we take the part after it).
 
 The smart `ei` action splices that expansion **in place** of the macro use (the
 same fetch→replace path as functions, with the fetch preferring the tweak and

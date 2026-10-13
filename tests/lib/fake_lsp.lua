@@ -10,10 +10,12 @@ local M = {}
 --   opts.buf           buffer the client must attach to
 --   opts.root_dir      root_dir for vim.lsp.start
 --   opts.capabilities  server capabilities answered to `initialize`
---   opts.handle        function(method, params, callback) for every request
---                      but `initialize`. Not calling `callback` leaves the
---                      request unanswered forever -- the way a wedged server
---                      behaves. Omit it to swallow every such request.
+--   opts.handle        function(method, params, callback, server) for every
+--                      request but `initialize`. Not calling `callback` leaves
+--                      the request unanswered forever -- the way a wedged
+--                      server behaves. Omit it to swallow every such request.
+--                      server.request(method, params) sends a request to the
+--                      client (workspace/applyEdit, say) and returns its reply.
 --   opts.skip          what is skipped if the server never attaches; printed
 --                      as "SKIP  <skip>"
 --
@@ -25,13 +27,18 @@ function M.start(opts)
     name = opts.name,
     cmd = function(dispatchers)
       local closing, next_id = false, 0
+      local server = {
+        request = function(method, params)
+          return dispatchers.server_request(method, params)
+        end,
+      }
       return {
         request = function(method, params, callback)
           next_id = next_id + 1
           if method == "initialize" then
             callback(nil, { capabilities = opts.capabilities })
           else
-            handle(method, params, callback)
+            handle(method, params, callback, server)
           end
           return true, next_id
         end,
