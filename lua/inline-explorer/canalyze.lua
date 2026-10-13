@@ -205,9 +205,30 @@ end
 -- enum_specifier.
 local TOP_LEVEL_DECLARING = { declaration = true, type_definition = true, enum_specifier = true }
 
--- Builds ir.rename. Only parameters and top-level locals count: those are the
--- names a hoist declares in the caller's block. Locals inside a top-level #if
--- block are hoisted too but not checked yet, so they can collide.
+local PREPROC_BLOCKS = {
+  preproc_if = true,
+  preproc_ifdef = true,
+  preproc_elif = true,
+  preproc_elifdef = true,
+  preproc_else = true,
+}
+
+-- `stmts` with the statements of every #if, #ifdef, #elif and #else block
+-- among them in place of the block: those share the top-level scope.
+local function flatten_preproc(stmts, out)
+  for _, s in ipairs(stmts) do
+    if PREPROC_BLOCKS[s:type()] then
+      flatten_preproc(csrc.code_children(s), out)
+    else
+      out[#out + 1] = s
+    end
+  end
+  return out
+end
+
+-- Builds ir.rename. Only parameters and top-level locals count, those in
+-- #if blocks included: those are the names a hoist declares in the caller's
+-- block.
 local function plan_renames(params, stmts, callee_src, spelled, N)
   local rename = {}
   local function maybe_rename(nm)
@@ -219,7 +240,7 @@ local function plan_renames(params, stmts, callee_src, spelled, N)
     maybe_rename(p.name)
   end
   local _, used = split_names(stmts, callee_src)
-  for _, s in ipairs(stmts) do
+  for _, s in ipairs(flatten_preproc(stmts, {})) do
     if TOP_LEVEL_DECLARING[s:type()] then
       for _, d in ipairs(csrc.query_nodes(s, callee_src, LOCAL_DECLARATIONS)) do
         maybe_rename(csrc.decl_name(d, callee_src))
@@ -267,7 +288,7 @@ end
 ---@class inline_explorer.IR
 ---@field src string callee_src, which the nodes and byte offsets below refer to
 ---@field params inline_explorer.Param[]
----@field rename table<string, string> parameter or top-level local named in caller.spelled -> name__ieN; not yet in #if
+---@field rename table<string, string> parameter or top-level local, #if blocks included, in caller.spelled -> name__ieN
 ---@field stmts TSNode[] the body's top-level named nodes, comments and preprocessor blocks included
 ---@field returns TSNode[] every return_statement in the body
 ---@field body_edits inline_explorer.Edit[] the label suffixes and renames on src (see plan_body_edits)
@@ -293,6 +314,10 @@ function M.analyze_callee(callee_src, fname, N, caller)
   local params, variadic = csrc.get_params(fn_declarator, callee_src)
   if variadic then
     return nil, "cannot inline variadic function '" .. fname .. "'"
+  end
+  -- What it declares is out of sight: no name in it can be checked or renamed.
+  if #csrc.query_nodes(fn_def, callee_src, "(preproc_include) @i") > 0 then
+    return nil, fname .. " has an #include in its body"
   end
   -- Pasted into the caller, such a use would mean the caller's declaration.
   for _, nm in ipairs(free_names(fn_def, fn_declarator, callee_src)) do

@@ -17,8 +17,9 @@
 -- `#ifdef DYNAMIC_CRC_TABLE`/`MAKECRCH`, which this harness's `./configure`
 -- never defines; also crc32.c's `crc_word`/`crc_word_big` braid-combining
 -- calls gated by an always-false `#if N > 5` in this build). That leaves 177
--- sites the engine actually compiles and runs. Of those, 169 build and pass;
--- the remaining 8 are engine defects (not harness artifacts; see
+-- sites the engine is asked to inline. It refuses one, inflate.c's call to
+-- fixedtables, whose body #includes inffixed.h; of the other 176, 168 build
+-- and pass; the remaining 8 are engine defects (not harness artifacts; see
 -- `known_failures` below, which pins this exact set), including gzwrite.c's
 -- `gzvprintf`, whose va_list argument gets an invalid copy initializer --
 -- code the harness only reaches once the skip rule stops declining every

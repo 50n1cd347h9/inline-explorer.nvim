@@ -159,7 +159,7 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
   The summary line each spec prints is not just "how many passed":
 
   ```
-  real zlib: sites=238  skipped-ambiguous=28  dead-branch=33  engine-accepted=177  built+passed=169  unverifiable-files=0  unverifiable-dead-sites=0
+  real zlib: sites=238  skipped-ambiguous=28  dead-branch=33  engine-accepted=176  built+passed=168  unverifiable-files=0  unverifiable-dead-sites=0
   ```
 
   - **`sites`** — every in-file call to an in-file function the harness

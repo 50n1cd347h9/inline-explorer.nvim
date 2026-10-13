@@ -1353,6 +1353,67 @@ do
   )
 end
 
+-- Case 37: a callee local declared in a top-level #if block is hoisted like
+-- any other, so it needs the rename too: unrenamed, `int t` shadowed the
+-- caller's parameter `t` for the rest of its block, and `sel(t) + t` read the
+-- callee's t. A caller's own declarations in #if blocks count as well.
+do
+  local blocks = {
+    { "#ifdef/#else", "#ifdef FAST\n    int t = v * 2;\n#else\n    int t = v * 3;\n#endif" },
+    {
+      "#if/#elif/#else",
+      "#if defined(FAST)\n    int t = v * 2;\n#elif defined(MEDIUM)\n    int t = v * 4;\n#else\n    int t = v * 3;\n#endif",
+    },
+  }
+  local caller = [[static int caller(int t)
+{
+    int r = 0;
+    if (t > 0) {
+        r = sel(t) + t;
+    }
+    return r;
+}]]
+  local main = "int main(void){ return (caller(2)==9 && caller(-1)==0)?0:1; }\n"
+  for i, b in ipairs(blocks) do
+    local callee = ("static int sel(int v)\n{\n%s\n    return t + 1;\n}"):format(b[2])
+    for _, mode in ipairs({ "correct", "readable" }) do
+      local t = transform(caller, callee, "sel", { { N = 1, mode = mode } })
+      local label = ("case37 %s local, %s mode,"):format(b[1], mode)
+      check(label .. " renamed in every branch", select(2, t:gsub("int t__ie1 = v", "")) == (i + 1), t)
+      check(label .. " runs equal", (run_ok(callee .. "\n" .. t .. main, "c37" .. i .. mode)), t)
+    end
+  end
+
+  -- zlib's fixedtables declares its tables in one branch and #includes them
+  -- in the other: the included names cannot be renamed along with the rest.
+  local tables = [[static int fixed(int v)
+{
+#ifdef BUILDFIXED
+    static int lenfix[2] = { 1, 2 };
+#else
+#   include "inffixed.h"
+#endif
+    return lenfix[v];
+}]]
+  local tables_caller = "static int caller(int v)\n{\n    int lenfix = fixed(v);\n    return lenfix;\n}"
+  local tnew, terr = S.inline_call(tables_caller, tables, "fixed", 1, 1)
+  check(
+    "case37 refused: an #include in the callee's body",
+    tnew == nil and tostring(terr):find("#include", 1, true) ~= nil,
+    tnew or tostring(terr)
+  )
+
+  local get = "static int get(void)\n{\n    return limit;\n}"
+  local caller2 =
+    "static int caller(int x)\n{\n#ifdef WIDE\n    long limit = 7;\n#else\n    int limit = 7;\n#endif\n    return get() + limit + x;\n}"
+  local new, err = S.inline_call(caller2, get, "get", 1, 1)
+  check(
+    "case37 refused: the caller declares the name in an #if block",
+    new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
+    new or tostring(err)
+  )
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be
