@@ -739,13 +739,36 @@ do
   end
   stop_all()
 
-  clangd = start("clangd", tweak_caps, hover_only(nil))
+  local log
+  clangd, log = start("clangd", tweak_caps, hover_only(nil))
   if clangd then
     local got, ms = fetch()
-    check("hover: an unanswered hover ends the fetch, empty, at its timeout", got == false and ms < 4500, {
-      got = got,
-      ms = ms,
-    })
+    vim.wait(100)
+    check(
+      "hover: an unanswered hover ends the fetch, empty, at its timeout, and is cancelled",
+      got == false and ms < 4500 and fake_lsp.count(log.notifications, "$/cancelRequest") == 1,
+      { got = got, ms = ms, notifications = log.notifications }
+    )
+  end
+  stop_all()
+
+  -- A codeAction that never comes back is cancelled at the tweak's timeout,
+  -- and the hover still answers.
+  clangd, log = start("clangd", tweak_caps, function(method, _, callback)
+    if method == "textDocument/hover" then
+      callback(nil, clangd_hover)
+    end
+  end)
+  if clangd then
+    local got = fetch()
+    check(
+      "tweak: an unanswered codeAction is cancelled, and the hover answers",
+      got
+        and got[1] == "((a) * 2)"
+        and fake_lsp.count(log.notifications, "$/cancelRequest") == 1
+        and fake_lsp.count(log.requests, "workspace/executeCommand") == 0,
+      { got = got, log = log }
+    )
   end
   stop_all()
 

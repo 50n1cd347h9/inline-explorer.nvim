@@ -30,6 +30,7 @@
 ---@field encoding? string offset_encoding of the server that answered; nil counts as bytes
 ---@field client_id? integer the server that answered; requests about the loc go to it
 
+local async = require("inline-explorer.async")
 local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
 
@@ -47,10 +48,6 @@ M._cold_timeout_ms = 2000
 
 -- Step 4 of M.extract. Tests turn it off to reach the server path.
 M._local_first = true
-
-local function once_with_timeout(cb, on_timeout, ms)
-  return require("inline-explorer.async").once_with_timeout(cb, on_timeout, ms or M._timeout_ms)
-end
 
 -- LRU caches (util.evict_lru), each bounded by its *_max field. Locate keys
 -- are client ids + name, extract keys uri + range. An entry is valid while
@@ -217,7 +214,9 @@ end
 -- Only an exact name match counts. Every server that supports
 -- workspace/symbol is asked; the answer comes once all have replied, or at
 -- the deadline from the replies that have arrived, so a server that hangs
--- cannot hide another's answer.
+-- cannot hide another's answer. Requests still out once the answer is known
+-- are cancelled. A deadline without a match cancels nothing: a match that
+-- arrives later goes to the cache, so the next lookup gets it at once.
 ---@param name string
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(loc: inline_explorer.Loc?, err: string?)
@@ -237,13 +236,27 @@ function M.locate(name, source_bufnr, cb)
   end
 
   local span = profile.start()
-  local replies = {}
-  local finish = once_with_timeout(function(loc, err)
+  local replies, ids = {}, {}
+  -- Set when the deadline finds no match: a reply can still bring one.
+  local late_span
+  local settled = false -- the answer is known; no reply can change it
+
+  local function settle(loc)
+    settled = true
+    locate_cache_put(key, loc)
+    for i, client in ipairs(clients) do
+      if replies[i] == nil then
+        async.cancel(client, ids[i])
+      end
+    end
+  end
+
+  local finish = async.once_with_timeout(function(loc, err)
     if loc then
       span("locate:ok", describe(loc.name or name, loc.uri))
-      locate_cache_put(key, loc)
+      settle(loc)
     else
-      span("locate:miss", name)
+      span(late_span and "locate:timeout" or "locate:miss", name)
     end
     cb(loc, err)
   end, function()
@@ -251,21 +264,32 @@ function M.locate(name, source_bufnr, cb)
     if loc then
       return loc, nil
     end
+    late_span = profile.start()
     return nil, "workspace/symbol timed out (server busy or stuck?)"
-  end)
+  end, M._timeout_ms)
 
   local unanswered = #clients
   local function on_reply(i, result)
+    if settled or replies[i] ~= nil then
+      return
+    end
     replies[i] = result or {}
     unanswered = unanswered - 1
-    if unanswered == 0 then
+    if late_span then
+      local loc = pick_symbol(name, clients, replies)
+      if loc then
+        late_span("locate:late", describe(loc.name, loc.uri))
+        settle(loc)
+      end
+    elseif unanswered == 0 then
       finish(pick_symbol(name, clients, replies))
     end
   end
   for i, client in ipairs(clients) do
-    local sent = client:request("workspace/symbol", { query = name }, function(_, result)
+    local sent, id = client:request("workspace/symbol", { query = name }, function(_, result)
       on_reply(i, result)
     end, bufnr)
+    ids[i] = id
     if not sent then
       on_reply(i, nil)
     end
@@ -578,7 +602,7 @@ end
 --   4. C/C++                     -> local extraction, if tree-sitter finds a node
 --   5. no documentSymbol client  -> local extraction
 --   6. ask the server. Use local extraction when the reply has no usable
---      range, and on timeout (then retry in the background).
+--      range, and on timeout (a late reply then fills the cache).
 ---@param loc inline_explorer.Loc
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(lines: string[], label: string)
@@ -659,11 +683,12 @@ function M.extract(loc, source_bufnr, cb)
 
   local params = { textDocument = { uri = loc.uri } }
   local budget = cold and M._cold_timeout_ms or M._timeout_ms
-  -- True in on_reply only for on_timeout's local result.
-  local timed_out = false
+  -- Started at the timeout, so it is set once the deadline has passed. With
+  -- profiling on, it shows how much longer than the budget the server needed.
+  local late_span
 
   local function on_reply(lines, label)
-    if timed_out then
+    if late_span then
       span("extract:timeout", detail())
     elseif cold then
       span("extract:cold", detail())
@@ -671,35 +696,15 @@ function M.extract(loc, source_bufnr, cb)
       span("extract:warm", detail())
     end
     -- Also caches the local result for a reply without a usable range, but
-    -- nothing after a timeout: the next look should get the server's lines.
-    if lines and tick and not timed_out then
+    -- not the timeout's: the server's own lines are still to come.
+    if lines and tick and not late_span then
       extract_cache_put(key, lines, label, tick)
     end
     cb(lines, label)
   end
 
-  -- With profiling on, the retry's span shows how much longer than the
-  -- budget the server needed.
-  local function retry_in_background()
-    local probe = profile.enabled and profile.start() or nil
-    client:request("textDocument/documentSymbol", params, function(_, result)
-      local ok, lines, label = pcall(lines_from_symbols, result, loc, target)
-      local got_lines = ok and lines ~= nil
-      if got_lines then
-        local now_tick = tick_of(target)
-        if now_tick then
-          extract_cache_put(key, lines, label, now_tick)
-        end
-      end
-      if probe then
-        probe(got_lines and "extract:retry-after-timeout" or "extract:retry-failed", detail())
-      end
-    end, target)
-  end
-
   local function on_timeout()
-    timed_out = true
-    retry_in_background()
+    late_span = profile.start()
     util.notify(
       ("%s: no answer within %dms for %s; extracted locally. Looking again will use the server."):format(
         loc.name or "?",
@@ -711,17 +716,35 @@ function M.extract(loc, source_bufnr, cb)
     return M.extract_sync(loc)
   end
 
-  local finish = once_with_timeout(on_reply, on_timeout, budget)
-  client:request("textDocument/documentSymbol", params, function(_, result)
-    -- pcall: on a malformed reply, extract locally now rather than at the
-    -- timeout.
+  -- The request is neither cancelled nor sent again on timeout: its reply,
+  -- however late, goes to the cache for the next look. Like a reply in time,
+  -- it is stored under the changedtick it was asked about, so an edit made
+  -- meanwhile keeps it from being served.
+  local function on_late_reply(lines, label)
+    if lines and tick then
+      extract_cache_put(key, lines, label, tick)
+    end
+    late_span(lines and "extract:late" or "extract:late-unusable", detail())
+  end
+
+  local finish = async.once_with_timeout(on_reply, on_timeout, budget)
+  local sent = client:request("textDocument/documentSymbol", params, function(_, result)
+    -- pcall: a malformed reply counts as one without a usable range.
     local ok, lines, label = pcall(lines_from_symbols, result, loc, target)
-    if ok and lines then
+    if not ok then
+      lines, label = nil, nil
+    end
+    if late_span then
+      on_late_reply(lines, label)
+    elseif lines then
       finish(lines, label)
     else
       finish(M.extract_sync(loc))
     end
   end, target)
+  if not sent then
+    finish(M.extract_sync(loc))
+  end
 end
 
 -- Where loc.name appears as a whole word in the 4 lines from loc's start
@@ -760,7 +783,7 @@ function M._chase_definition(loc, source_bufnr, cb)
   local pos = M.name_position(target, loc, encoding)
 
   local span = profile.start()
-  local finish = once_with_timeout(function(dloc, why)
+  local function finish(dloc, why)
     local where = describe(loc.name, loc.uri)
     if dloc then
       span("locate:definition-chase", where)
@@ -768,13 +791,9 @@ function M._chase_definition(loc, source_bufnr, cb)
       span("locate:chase-miss", where .. " (" .. (why or "?") .. ")")
     end
     cb(dloc)
-  end, function()
-    return nil, "timeout"
-  end)
-  client:request("textDocument/definition", {
-    textDocument = { uri = loc.uri },
-    position = pos,
-  }, function(err, result)
+  end
+  local params = { textDocument = { uri = loc.uri }, position = pos }
+  async.request(client, "textDocument/definition", params, target, M._timeout_ms, function(err, result)
     if err then
       return finish(nil, "err: " .. tostring(err.message or err):sub(1, 60))
     end
@@ -800,7 +819,7 @@ function M._chase_definition(loc, source_bufnr, cb)
       return finish(nil, "self -- the index does not know the defining file (compile_commands.json missing?)")
     end
     finish({ uri = uri, range = range, kind = loc.kind, name = loc.name, encoding = encoding, client_id = client.id })
-  end, target)
+  end)
 end
 
 -- Caches the chased definition under `name`, so a repeat lookup skips the

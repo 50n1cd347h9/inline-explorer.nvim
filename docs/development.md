@@ -329,6 +329,20 @@ of the labels:
   round trip. Same measurement: p50 11ms.
 - `extract:cached` — the plugin had already resolved this symbol and
   answered from its result cache. p50 0.1ms.
+- `extract:timeout` — server path, no answer within the budget: the lines
+  came from local extraction. The request is not cancelled; when its reply
+  arrives it goes to the cache and is logged as `extract:late` (or
+  `extract:late-unusable` when it has no usable range), timed from the
+  timeout, so the span says how much longer than the budget the server
+  needed.
+
+The `locate:` spans say the same about `workspace/symbol`: `locate:ok` (from
+every server's answer, or at the deadline from those that answered),
+`locate:miss` (every server answered, none with an exact match),
+`locate:timeout` (the deadline found no match) and `locate:late` (a match
+that arrived after it, cached for the next lookup). A request whose answer
+can no longer matter is cancelled, as is a chase, call hierarchy or macro
+request that times out.
 
 The server path's first-touch case gets a shorter budget than the rest of the
 plugin's LSP calls
@@ -337,12 +351,10 @@ is the opposite of what it looks like it should be. A first touch normally
 answers in 380–650ms, but occasionally a small header does not answer at all
 within seconds — and the only thing a long budget bought there was four
 seconds of waiting before the same tree-sitter fallback a short one reaches
-at once. Cutting it is safe because the attachment survives the timeout and a
-timed-out result is never cached, so looking at the same symbol again asks
-the server against a preamble it has meanwhile finished building (measured at
-1.3ms, then 0.5ms, after a forced timeout on the first). You get an instant
-answer now and the server's own answer next time, instead of waiting for the
-instant answer.
+at once. Cutting it is safe because the request survives the timeout and its
+late reply is cached, so looking at the same symbol again gets the server's
+lines without another round trip. You get an instant answer now and the
+server's own answer next time, instead of waiting for the instant answer.
 
 The plugin keeps the last few definition files attached to stay out of the
 first case, and caches resolution results to stay out of the second

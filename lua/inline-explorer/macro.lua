@@ -400,6 +400,7 @@ local function fetch_via_tweak(bufnr, row, col, cb)
 
   local uri = vim.uri_from_bufnr(bufnr)
   local pos = source_position(bufnr, row, col, client)
+  local deadline = vim.uv.now() + TIMEOUT_MS
 
   local claim -- set once codeAction offers the tweak
   local finished = false
@@ -414,28 +415,15 @@ local function fetch_via_tweak(bufnr, row, col, cb)
     end
     cb(lines)
   end
-  vim.defer_fn(function()
-    finish(nil)
-  end, TIMEOUT_MS)
 
-  local code_action_params = {
-    textDocument = { uri = uri },
-    range = { start = pos, ["end"] = pos },
-    context = { diagnostics = {} },
-  }
-  local sent = client:request("textDocument/codeAction", code_action_params, function(err, actions)
-    if finished then
-      return
-    end
-    if err then
-      return finish(nil)
-    end
-    local cmd = pick_expand_action(actions)
+  local function on_actions(err, actions)
+    local cmd = not err and pick_expand_action(actions)
     if not cmd then
       return finish(nil)
     end
-
-    -- Before executeCommand: clangd sends the applyEdit before it replies.
+    -- Before executeCommand: clangd sends the applyEdit first and replies
+    -- only once it is answered, so the reply comes after our claim took the
+    -- edit, if it did, and ends the fetch either way.
     claim = {
       uri = uri,
       pos = pos,
@@ -444,24 +432,19 @@ local function fetch_via_tweak(bufnr, row, col, cb)
       end,
     }
     add_claim(client.id, claim)
-
-    local exec_sent = client:request("workspace/executeCommand", {
-      command = cmd.command,
-      arguments = cmd.arguments,
-    }, function(exec_err)
-      -- A success reply carries no edit and follows the applyEdit, which has
-      -- ended the fetch if our claim took it; otherwise the timeout will.
-      if exec_err then
-        finish(nil)
-      end
-    end, bufnr)
-    if not exec_sent then
+    local exec_params = { command = cmd.command, arguments = cmd.arguments }
+    local remaining = math.max(deadline - vim.uv.now(), 0)
+    async.request(client, "workspace/executeCommand", exec_params, bufnr, remaining, function()
       finish(nil)
-    end
-  end, bufnr)
-  if not sent then
-    finish(nil)
+    end)
   end
+
+  local code_action_params = {
+    textDocument = { uri = uri },
+    range = { start = pos, ["end"] = pos },
+    context = { diagnostics = {} },
+  }
+  async.request(client, "textDocument/codeAction", code_action_params, bufnr, TIMEOUT_MS, on_actions)
 end
 
 -- Calls cb(lines) once, with expansion_lines' result, or nil with no hover,
@@ -475,21 +458,14 @@ local function fetch_via_hover(bufnr, row, col, cb)
     textDocument = { uri = vim.uri_from_bufnr(bufnr) },
     position = source_position(bufnr, row, col, client),
   }
-  local finish = async.once_with_timeout(cb, function()
-    return nil
-  end, TIMEOUT_MS)
-  local sent = client:request("textDocument/hover", params, function(err, result)
+  async.request(client, "textDocument/hover", params, bufnr, TIMEOUT_MS, function(err, result)
     local contents = not err and type(result) == "table" and result.contents
     local md = contents and hover_markdown(contents)
     if md and md ~= "" then
-      finish(expansion_lines(md))
-    else
-      finish(nil)
+      return cb(expansion_lines(md))
     end
-  end, bufnr)
-  if not sent then
-    finish(nil)
-  end
+    cb(nil)
+  end)
 end
 
 -- Calls cb(lines) exactly once: nil when neither the tweak nor the hover has

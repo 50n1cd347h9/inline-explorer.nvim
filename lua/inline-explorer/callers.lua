@@ -4,6 +4,7 @@
 -- while grep sees calls written anywhere, in #if 0 blocks and macro arguments
 -- too (but not in #define bodies), and cannot tell same-named static functions
 -- apart.
+local async = require("inline-explorer.async")
 local csrc = require("inline-explorer.csrc")
 local resolver = require("inline-explorer.resolver")
 
@@ -17,7 +18,7 @@ local M = {}
 ---@field text string the call's line, trimmed
 ---@field encoding? string the server's offset encoding; nil (grep) means bytes
 
--- How long the call hierarchy requests may take before grep starts as well.
+-- How long each call hierarchy request may take before grep answers instead.
 M._timeout_ms = 4000
 -- The most grep hits checked; with more, the answer is marked as truncated.
 M._grep_max = 200
@@ -165,45 +166,26 @@ local function items_from_calls(calls, encoding)
   return items
 end
 
--- prepareCallHierarchy, then incomingCalls. Grep answers instead on an error or
--- an empty answer. After M._timeout_ms grep starts as well, and the first answer
--- wins. Calls cb once.
+-- prepareCallHierarchy, then incomingCalls. Grep answers instead on an error,
+-- an empty answer or a timeout, which also cancels the request. Calls cb once.
 local function call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
-  -- Not async.once_with_timeout: that needs the timeout's result at once, but
-  -- the grep started on a timeout answers later.
-  local answered = false
-  local function finish(items, provider, note)
-    if answered then
-      return
-    end
-    answered = true
-    cb(items, provider, note)
-  end
   local function fall_back_to_grep()
-    grep_callers(name, root_dir, finish)
+    grep_callers(name, root_dir, cb)
   end
-  vim.defer_fn(function()
-    if not answered then
-      fall_back_to_grep()
-    end
-  end, M._timeout_ms)
-
   local function on_incoming_calls(err, calls)
-    if err or not calls or #calls == 0 then
-      fall_back_to_grep()
-      return
+    if err or type(calls) ~= "table" or #calls == 0 then
+      return fall_back_to_grep()
     end
-    finish(sort_items(items_from_calls(calls, client.offset_encoding)), "lsp", nil)
+    cb(sort_items(items_from_calls(calls, client.offset_encoding)), "lsp", nil)
   end
-  local function on_prepared(err, result)
-    if err or not result or #result == 0 then
-      fall_back_to_grep()
-      return
+  local function on_prepared(err, items)
+    if err or type(items) ~= "table" or #items == 0 then
+      return fall_back_to_grep()
     end
-    local request = { item = result[1] }
-    client:request("callHierarchy/incomingCalls", request, on_incoming_calls, target_bufnr)
+    local request = { item = items[1] }
+    async.request(client, "callHierarchy/incomingCalls", request, target_bufnr, M._timeout_ms, on_incoming_calls)
   end
-  client:request("textDocument/prepareCallHierarchy", params, on_prepared, target_bufnr)
+  async.request(client, "textDocument/prepareCallHierarchy", params, target_bufnr, M._timeout_ms, on_prepared)
 end
 
 -- Find the call sites of function `name` with the language server that

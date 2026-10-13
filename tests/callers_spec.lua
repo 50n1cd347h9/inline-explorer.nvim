@@ -211,7 +211,7 @@ end
 -- so it is prepareCallHierarchy that times out, not the lookup before it.
 do
   local prepare_count = 0
-  local cid2 = fake_lsp.start({
+  local cid2, log2 = fake_lsp.start({
     name = "wedgehier",
     buf = buf,
     root_dir = dir,
@@ -248,11 +248,69 @@ do
     end, 10)
     vim.wait(500) -- room for a buggy second invocation to land
     check("timeout: the call hierarchy was asked", prepare_count == 1, prepare_count)
+    check(
+      "timeout: the unanswered request is cancelled",
+      log2 and fake_lsp.count(log2.notifications, "$/cancelRequest") == 1,
+      log2 and log2.notifications
+    )
     check("timeout: falls back to grep", source == "grep", tostring(source))
     check("timeout: cb fired exactly once", calls == 1, calls)
     check("timeout: grep items intact (never a nil-items callback)", items ~= nil and #items == 3, items and #items)
     callers._timeout_ms = saved
     vim.lsp.stop_client(cid2, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
+  end
+end
+
+-- 3a. An empty call hierarchy hands over to grep exactly once. A timer
+-- outliving that answer started a second grep over the whole tree whenever
+-- the first took longer than the timeout.
+do
+  local resolver = require("inline-explorer.resolver")
+  local liburi = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c"))
+  local cid5 = fake_lsp.start({
+    name = "emptyhier",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { callHierarchyProvider = true, workspaceSymbolProvider = true },
+    handle = function(method, _, callback)
+      if method == "workspace/symbol" then
+        local name_range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } }
+        callback(nil, { { name = "target_fn", kind = 12, location = { uri = liburi, range = name_range } } })
+      else
+        callback(nil, {}) -- no call hierarchy item
+      end
+    end,
+    skip = "double-grep checks (in-process LSP server unavailable)",
+  })
+  if cid5 then
+    resolver.clear_caches()
+    local greps = 0
+    local orig_system = vim.system
+    vim.system = function(cmd, opts, on_exit)
+      greps = greps + 1
+      return orig_system({ "sh", "-c", "sleep 0.4; " .. cmd[#cmd] }, opts, on_exit)
+    end
+    local saved = callers._timeout_ms
+    callers._timeout_ms = 50
+    local calls, source = 0, nil
+    callers.get("target_fn", buf, function(_, s2)
+      calls, source = calls + 1, s2
+    end)
+    vim.wait(5000, function()
+      return calls > 0
+    end, 10)
+    vim.wait(800) -- room for a second grep to start and finish
+    vim.system = orig_system
+    callers._timeout_ms = saved
+    check(
+      "empty call hierarchy: one grep, one answer",
+      source == "grep" and calls == 1 and greps == 1,
+      ("source=%s calls=%d greps=%d"):format(tostring(source), calls, greps)
+    )
+    vim.lsp.stop_client(cid5, true)
     vim.wait(1000, function()
       return #vim.lsp.get_clients({ bufnr = buf }) == 0
     end, 20)

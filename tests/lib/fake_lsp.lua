@@ -19,30 +19,63 @@ local M = {}
 --   opts.skip          what is skipped if the server never attaches; printed
 --                      as "SKIP  <skip>"
 --
+-- Like a real transport, a reply reaches the client on a later turn of the
+-- event loop, and a request the client cancels ($/cancelRequest) while it is
+-- unanswered is acknowledged and gets no reply: its `callback` does nothing.
+--
 -- Returns the client id once attached, or nil (after printing the SKIP line)
--- when it did not attach within 2s.
+-- when it did not attach within 2s. The second value is the server's log:
+--   log.requests       { method, id, params } for every request but initialize
+--   log.notifications  { method, params } for every notification
 function M.start(opts)
   local handle = opts.handle or function(_, _, _) end
+  local log = { requests = {}, notifications = {} }
   local cid = vim.lsp.start({
     name = opts.name,
     cmd = function(dispatchers)
       local closing, next_id = false, 0
+      -- Request id -> what to call once it is answered: the client's
+      -- notify_reply, which ends the request's "pending" state.
+      local unanswered = {}
+      local function answer(id)
+        local notify_reply = unanswered[id]
+        unanswered[id] = nil
+        if type(notify_reply) == "function" then
+          notify_reply(id)
+        end
+      end
       local server = {
         request = function(method, params)
           return dispatchers.server_request(method, params)
         end,
       }
       return {
-        request = function(method, params, callback)
+        request = function(method, params, callback, notify_reply)
           next_id = next_id + 1
+          local id = next_id
           if method == "initialize" then
             callback(nil, { capabilities = opts.capabilities })
-          else
-            handle(method, params, callback, server)
+            return true, id
           end
-          return true, next_id
+          log.requests[#log.requests + 1] = { method = method, id = id, params = params }
+          unanswered[id] = notify_reply or true
+          handle(method, params, function(err, result)
+            vim.schedule(function()
+              if unanswered[id] then
+                answer(id)
+                callback(err, result)
+              end
+            end)
+          end, server)
+          return true, id
         end,
-        notify = function()
+        notify = function(method, params)
+          log.notifications[#log.notifications + 1] = { method = method, params = params }
+          if method == "$/cancelRequest" and unanswered[params.id] then
+            vim.schedule(function()
+              answer(params.id)
+            end)
+          end
           return true
         end,
         is_closing = function()
@@ -66,7 +99,19 @@ function M.start(opts)
     print("SKIP  " .. opts.skip)
     return nil
   end
-  return cid
+  return cid, log
+end
+
+-- How many entries of `list` (log.requests or log.notifications) are for
+-- `method`.
+function M.count(list, method)
+  local n = 0
+  for _, e in ipairs(list) do
+    if e.method == method then
+      n = n + 1
+    end
+  end
+  return n
 end
 
 return M
