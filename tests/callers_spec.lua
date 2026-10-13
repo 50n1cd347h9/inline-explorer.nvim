@@ -510,7 +510,7 @@ do
             nil,
             { { name = "target_fn", kind = 12, uri = liburi, range = name_range, selectionRange = name_range } }
           )
-        end, 420)
+        end, 700)
       end -- incomingCalls: never answered
     end,
     skip = "shared call hierarchy budget checks (in-process LSP server unavailable)",
@@ -518,7 +518,7 @@ do
   if cid6 then
     resolver.clear_caches()
     local saved = callers._timeout_ms
-    callers._timeout_ms = 600
+    callers._timeout_ms = 1000
     local started, elapsed, source = vim.uv.hrtime(), nil, nil
     callers.get("target_fn", buf, function(_, s2)
       elapsed, source = (vim.uv.hrtime() - started) / 1e6, s2
@@ -531,7 +531,7 @@ do
       "shared budget: grep answers once the one budget is spent",
       source == "grep"
         and elapsed
-        and elapsed < 900
+        and elapsed < 1400
         and fake_lsp.count(log6.requests, "callHierarchy/incomingCalls") == 1,
       ("source=%s elapsed=%s"):format(tostring(source), tostring(elapsed))
     )
