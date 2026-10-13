@@ -16,7 +16,8 @@ nvim --headless --clean -u NONE -c "luafile tests/substitute_spec.lua" -c "qa!"
 ```
 
 The fast suites (the list CI runs is in `.github/workflows/test.yml`) need
-only Neovim and gcc. The real-source specs additionally need `git`, network
+only Neovim and gcc. CI runs them on the pinned release (0.11.3) and on the
+oldest supported one (0.11.0). The real-source specs additionally need `git`, network
 access and `make`; `bench_spec` needs clangd (`IE_BENCH_CLANGD`), and
 `real_kernel_spec` a prepared kernel tree (`IE_KERNEL_DIR`) -- both are
 described below.
@@ -158,7 +159,7 @@ Correctness is verified on **real OSS**, not just hand-written snippets:
   The summary line each spec prints is not just "how many passed":
 
   ```
-  real zlib: sites=238  skipped-ambiguous=28  dead-branch=33  engine-accepted=177  built+passed=169  unverifiable-files=0  unverifiable-dead-sites=0
+  real zlib: sites=238  skipped-ambiguous=28  dead-branch=33  engine-accepted=176  built+passed=168  unverifiable-files=0  unverifiable-dead-sites=0
   ```
 
   - **`sites`** — every in-file call to an in-file function the harness
@@ -328,6 +329,20 @@ of the labels:
   round trip. Same measurement: p50 11ms.
 - `extract:cached` — the plugin had already resolved this symbol and
   answered from its result cache. p50 0.1ms.
+- `extract:timeout` — server path, no answer within the budget: the lines
+  came from local extraction. The request is not cancelled; when its reply
+  arrives it goes to the cache and is logged as `extract:late` (or
+  `extract:late-unusable` when it has no usable range), timed from the
+  timeout, so the span says how much longer than the budget the server
+  needed.
+
+The `locate:` spans say the same about `workspace/symbol`: `locate:ok` (from
+every server's answer, or at the deadline from those that answered),
+`locate:miss` (every server answered, none with an exact match),
+`locate:timeout` (the deadline found no match) and `locate:late` (a match
+that arrived after it, cached for the next lookup). A request whose answer
+can no longer matter is cancelled, as is a chase, call hierarchy or macro
+request that times out.
 
 The server path's first-touch case gets a shorter budget than the rest of the
 plugin's LSP calls
@@ -336,17 +351,19 @@ is the opposite of what it looks like it should be. A first touch normally
 answers in 380–650ms, but occasionally a small header does not answer at all
 within seconds — and the only thing a long budget bought there was four
 seconds of waiting before the same tree-sitter fallback a short one reaches
-at once. Cutting it is safe because the attachment survives the timeout and a
-timed-out result is never cached, so looking at the same symbol again asks
-the server against a preamble it has meanwhile finished building (measured at
-1.3ms, then 0.5ms, after a forced timeout on the first). You get an instant
-answer now and the server's own answer next time, instead of waiting for the
-instant answer.
+at once. Cutting it is safe because the request survives the timeout and its
+late reply is cached, so looking at the same symbol again gets the server's
+lines without another round trip. You get an instant answer now and the
+server's own answer next time, instead of waiting for the instant answer.
 
-The plugin keeps the last few definition files attached to stay out of the
-first case, and caches resolution results to stay out of the second
-(`:InlineExplorerProfile clear` wipes both the report and the log between
-experiments).
+The plugin attaches a server to a definition file only right before asking
+it about that file, and keeps the last few files it attached or loaded open
+to stay out of the first case; past those it detaches its server, or unloads
+a file it loaded itself so that every server closes it. (A file that a jump
+to a definition or a caller opens without any server gets the servers of
+the file the jump came from.) It caches resolution results to stay out of
+the second (`:InlineExplorerProfile clear` wipes both the report and the log
+between experiments).
 
 Enable it permanently with `setup({ profile = true })`; set
 `require("inline-explorer.profile").logfile = false` to keep it in memory only.

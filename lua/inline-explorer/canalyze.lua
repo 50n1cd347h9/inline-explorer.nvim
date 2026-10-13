@@ -4,57 +4,260 @@ local csrc = require("inline-explorer.csrc")
 
 local M = {}
 
--- The names declared in the caller's enclosing function, or in the whole file
--- without one (an #ifdef straddling braces can make it an ERROR node). Extra
--- names only cost a rename (see plan_body_edits); a missed one compiles to
--- wrong code: a binding `int x = (x);` reads the new, uninitialised x.
----@param call TSNode
----@param src string
----@return table<string, true>
-function M.names_in_scope(call, src)
-  local scope = call
-  while scope and scope:type() ~= "function_definition" do
-    local parent = scope:parent()
-    if not parent then
-      break
-    end
-    scope = parent
-  end
-  local names = {}
-  -- `(_)`, not `(identifier)`: `int *p;` and `int a[2];` put a pointer or
-  -- array declarator there, and decl_name digs the name out.
-  local q = [[
-    (parameter_declaration declarator: (_) @d)
-    (init_declarator declarator: (_) @d)
-    (declaration declarator: (_) @d)
-  ]]
-  for _, d in ipairs(csrc.query_nodes(scope, src, q)) do
-    local nm = csrc.decl_name(d, src)
-    if nm then
-      names[nm] = true
+local NAMES = "[(identifier) (type_identifier)] @i"
+
+-- Struct, union and enum tags are a namespace of their own.
+local TAG_PARENTS = { struct_specifier = true, union_specifier = true, enum_specifier = true }
+
+-- The identifiers and type names under `node`, tags left out.
+local function ordinary_names(node, src)
+  local out = {}
+  for _, id in ipairs(csrc.query_nodes(node, src, NAMES)) do
+    local parent = id:parent()
+    if not (parent and TAG_PARENTS[parent:type()]) then
+      out[#out + 1] = id
     end
   end
-  return names
+  return out
 end
 
--- Builds ir.rename. Only parameters and top-level locals count: those are the
--- names a hoist declares in the caller's block. Locals inside a top-level #if
--- block are hoisted too but not checked yet, so they can collide.
-local function plan_renames(params, stmts, callee_src, caller_names, N)
+-- `(_)`, not `(identifier)`: `int *p;` and `int a[2];` put a pointer or array
+-- declarator there, and decl_name digs the name out.
+local LOCAL_DECLARATIONS = [[
+  (declaration declarator: (_) @d)
+  (type_definition declarator: (_) @d)
+  (enumerator name: (identifier) @d)
+]]
+local DECLARATIONS = LOCAL_DECLARATIONS .. "(parameter_declaration declarator: (_) @d)"
+
+-- { name, byte } for each identifier that error recovery left in an ERROR
+-- node of a declaration under `nodes`. It is the name declared, as `limit`
+-- in `u32 __maybe_unused limit = 7;`, or an annotation macro, as FAR in
+-- `struct state FAR *s;`; misparsed_names tells them apart.
+local function error_held(nodes, src)
+  local held = {}
+  for _, node in ipairs(nodes) do
+    local errors = node:has_error() and csrc.query_nodes(node, src, "(ERROR (identifier) @e)") or {}
+    for _, id in ipairs(errors) do
+      local holder = id:parent():parent()
+      if holder and (holder:type() == "declaration" or holder:type():match("declarator$")) then
+        held[#held + 1] = { csrc.text(id, src), csrc.start_byte(id) }
+      end
+    end
+  end
+  return held
+end
+
+-- The error_held names under `nodes` that an expression there also uses
+-- outside any ERROR node: an annotation macro is not used as a value,
+-- though tree-sitter-c may read it as a type elsewhere. Each is
+-- { name, byte }.
+local function misparsed_names(nodes, src)
+  local held = error_held(nodes, src)
+  if #held == 0 then
+    return held
+  end
+  local used = {}
+  for _, node in ipairs(nodes) do
+    for _, id in ipairs(csrc.query_nodes(node, src, "(identifier) @i")) do
+      if id:parent():type() ~= "ERROR" then
+        used[csrc.text(id, src)] = true
+      end
+    end
+  end
+  local out = {}
+  for _, h in ipairs(held) do
+    if used[h[1]] then
+      out[#out + 1] = h
+    end
+  end
+  return out
+end
+
+local function holds_function_head(n)
+  if n:type() == "function_definition" then
+    return true
+  end
+  for _, child in ipairs(csrc.code_children(n)) do
+    if child:type() == "function_declarator" then
+      return true
+    end
+  end
+  return false
+end
+
+-- The top-level nodes that hold the caller's function when tree-sitter gave
+-- it no function_definition around the call: an #ifdef straddling braces
+-- can turn the whole function into an ERROR node, or close it early so that
+-- the call lands in a later top-level node. Then the nodes from the one with
+-- the function's head through the one with the call.
+local function function_remnants(call)
+  local top = call
+  while top:parent() and top:parent():parent() do
+    top = top:parent() --[[@as TSNode]]
+  end
+  local nodes = { top }
+  local n = top
+  while not holds_function_head(n) do
+    n = n:prev_named_sibling()
+    if not n then
+      return { top }
+    end
+    nodes[#nodes + 1] = n
+  end
+  return nodes
+end
+
+-- The names in the caller's function (see caller_names).
+---@class inline_explorer.CallerNames
+---@field spelled table<string, true> every identifier and type name in it: a callee name among them is renamed
+---@field declared table<string, true> the names it declares: the callee must not use one it does not declare
+
+-- The names of the caller's function. A spelled name the callee also
+-- declares is renamed: extra names only cost a rename, but a missed one is
+-- wrong code, such as the binding `int x = (x);`, which reads the new,
+-- uninitialised x, or a hoisted local hiding the global the rest of the
+-- caller reads. Without a function_definition around the call, the spelled
+-- names are those of the whole file, and the declared ones those of
+-- function_remnants.
+---@param call TSNode
+---@param src string
+---@return inline_explorer.CallerNames
+function M.caller_names(call, src)
+  local fn = call:parent()
+  while fn and fn:type() ~= "function_definition" do
+    fn = fn:parent()
+  end
+  local declaring = fn and { fn } or function_remnants(call)
+  local declared = {}
+  for _, node in ipairs(declaring) do
+    for _, d in ipairs(csrc.query_nodes(node, src, DECLARATIONS)) do
+      local nm = csrc.decl_name(d, src)
+      if nm then
+        declared[nm] = true
+      end
+    end
+  end
+  for _, h in ipairs(misparsed_names(declaring, src)) do
+    declared[h[1]] = true
+  end
+  -- Tags too, unlike ordinary_names: that costs a rename at most, and the
+  -- whole-file case is slow enough.
+  local spelled = {}
+  for _, id in ipairs(csrc.query_nodes(fn or call:tree():root(), src, NAMES)) do
+    spelled[csrc.text(id, src)] = true
+  end
+  return { spelled = spelled, declared = declared }
+end
+
+-- Where the name declared by `d` is visible: the nearest block or for
+-- statement around it, or the prototype that lists it as a parameter. The
+-- callee's own parameters are visible in the whole definition.
+local function decl_scope(d, def, own_params)
+  local n = d:parent()
+  while n and n ~= def do
+    local t = n:type()
+    if t == "parameter_list" then
+      return n == own_params and def or n
+    end
+    if t == "compound_statement" or t == "for_statement" then
+      return n
+    end
+    n = n:parent()
+  end
+  return def
+end
+
+-- name -> the places it is declared in `def`: its scope, and the byte its
+-- declarator starts at.
+local function callee_declarations(def, fn_declarator, src)
+  local own_params = fn_declarator:field("parameters")[1]
+  local decls = {}
+  for _, d in ipairs(csrc.query_nodes(def, src, DECLARATIONS)) do
+    local nm = csrc.decl_name(d, src)
+    if nm then
+      decls[nm] = decls[nm] or {}
+      table.insert(decls[nm], { scope = decl_scope(d, def, own_params), from = csrc.start_byte(d) })
+    end
+  end
+  return decls
+end
+
+local function is_bound(id, decls)
+  local at = csrc.start_byte(id)
+  for _, d in ipairs(decls or {}) do
+    if d.from <= at and csrc.start_byte(d.scope) <= at and at < csrc.end_byte(d.scope) then
+      return true
+    end
+  end
+  return false
+end
+
+-- The names `def` uses without declaring them first in a scope around the
+-- use, in document order: globals, functions, macros and typedefs from
+-- elsewhere. The function's own name is left out.
+local function free_names(def, fn_declarator, src)
+  local decls = callee_declarations(def, fn_declarator, src)
+  local own_name = csrc.decl_identifier(fn_declarator:field("declarator")[1])
+  local free, seen = {}, {}
+  for _, id in ipairs(ordinary_names(def, src)) do
+    local nm = csrc.text(id, src)
+    if not seen[nm] and id ~= own_name and not is_bound(id, decls[nm]) then
+      seen[nm] = true
+      free[#free + 1] = nm
+    end
+  end
+  return free
+end
+
+-- The top-level statements that declare names; `enum { A, B };` is a bare
+-- enum_specifier.
+local TOP_LEVEL_DECLARING = { declaration = true, type_definition = true, enum_specifier = true }
+
+local PREPROC_BLOCKS = {
+  preproc_if = true,
+  preproc_ifdef = true,
+  preproc_elif = true,
+  preproc_elifdef = true,
+  preproc_else = true,
+}
+
+-- `stmts` with the statements of every #if, #ifdef, #elif and #else block
+-- among them in place of the block: those share the top-level scope.
+local function flatten_preproc(stmts, out)
+  for _, s in ipairs(stmts) do
+    if PREPROC_BLOCKS[s:type()] then
+      flatten_preproc(csrc.code_children(s), out)
+    else
+      out[#out + 1] = s
+    end
+  end
+  return out
+end
+
+-- Builds ir.rename. Only parameters and top-level locals count, those in
+-- #if blocks included: those are the names a hoist declares in the caller's
+-- block.
+local function plan_renames(params, stmts, body, callee_src, spelled, N)
   local rename = {}
   local function maybe_rename(nm)
-    if nm and caller_names[nm] then
+    if nm and spelled[nm] then
       rename[nm] = nm .. "__ie" .. N
     end
   end
   for _, p in ipairs(params) do
     maybe_rename(p.name)
   end
-  for _, s in ipairs(stmts) do
-    if s:type() == "declaration" then
-      -- `(_)`: see names_in_scope.
-      for _, d in ipairs(csrc.query_nodes(s, callee_src, "(declaration declarator: (_) @d)")) do
+  local misparsed = misparsed_names({ body }, callee_src)
+  for _, s in ipairs(flatten_preproc(stmts, {})) do
+    if TOP_LEVEL_DECLARING[s:type()] then
+      for _, d in ipairs(csrc.query_nodes(s, callee_src, LOCAL_DECLARATIONS)) do
         maybe_rename(csrc.decl_name(d, callee_src))
+      end
+      for _, h in ipairs(misparsed) do
+        if h[2] >= csrc.start_byte(s) and h[2] < csrc.end_byte(s) then
+          maybe_rename(h[1])
+        end
       end
     end
   end
@@ -77,10 +280,11 @@ local function plan_body_edits(body, callee_src, rename, N)
     suffix_label(n)
   end
   if next(rename) then
-    -- Every occurrence, `name(...)` included: in the callee's body the keys
-    -- mean its own declarations. Not so a use ahead of a top-level local's
-    -- declaration that means an outer name: renamed too, it refers to nothing.
-    for _, id in ipairs(csrc.query_nodes(body, callee_src, "(identifier) @i")) do
+    -- Every occurrence, `name(...)` and a typedef's uses included: in the
+    -- callee's body the keys mean its own declarations. Not so a use ahead of
+    -- a top-level local's declaration that means an outer name: renamed too,
+    -- it refers to nothing.
+    for _, id in ipairs(ordinary_names(body, callee_src)) do
       local r = rename[csrc.text(id, callee_src)]
       if r then
         edits[#edits + 1] = { csrc.start_byte(id), csrc.end_byte(id), r }
@@ -90,14 +294,28 @@ local function plan_body_edits(body, callee_src, rename, N)
   return edits
 end
 
+-- Error recovery can leave a `return` outside any return_statement, as the
+-- declared name in `out: __maybe_unused return 0;`: pasted as it is, it
+-- would return from the caller.
+local function has_stray_return(body, src)
+  local query = '([(identifier) (type_identifier)] @r (#eq? @r "return")) ("return" @k)'
+  for _, n in ipairs(csrc.query_nodes(body, src, query)) do
+    local parent = n:parent()
+    if n:named() or not parent or parent:type() ~= "return_statement" then
+      return true
+    end
+  end
+  return false
+end
+
 ---@class inline_explorer.IR
 ---@field src string callee_src, which the nodes and byte offsets below refer to
 ---@field params inline_explorer.Param[]
----@field rename table<string, string> colliding parameter or top-level local -> name__ieN; not yet those in #if blocks
+---@field rename table<string, string> parameter or top-level local, #if blocks included, in caller.spelled -> name__ieN
 ---@field stmts TSNode[] the body's top-level named nodes, comments and preprocessor blocks included
 ---@field returns TSNode[] every return_statement in the body
 ---@field body_edits inline_explorer.Edit[] the label suffixes and renames on src (see plan_body_edits)
----@field ret_type string the declared return type, rebuilt as text
+---@field ret_decl string the declaration of ret_var, of the callee's return type, without its `;`
 ---@field has_value boolean whether the first return carries a value (false when there is none)
 ---@field simple boolean exactly one return, carrying a value and last of stmts: a trailing comment makes it false
 ---@field ret_var string __ie_retN, which holds the result
@@ -107,10 +325,10 @@ end
 ---@param callee_src string
 ---@param fname string
 ---@param N integer
----@param caller_names table<string, true> see names_in_scope
+---@param caller inline_explorer.CallerNames
 ---@return inline_explorer.IR? ir without binds
 ---@return string? err
-function M.analyze_callee(callee_src, fname, N, caller_names)
+function M.analyze_callee(callee_src, fname, N, caller)
   local fn_def, fn_declarator = csrc.find_function_def(csrc.parse(callee_src), callee_src, fname)
   if not fn_def then
     return nil, "definition of '" .. fname .. "' not found"
@@ -120,8 +338,21 @@ function M.analyze_callee(callee_src, fname, N, caller_names)
   if variadic then
     return nil, "cannot inline variadic function '" .. fname .. "'"
   end
-
+  -- What it declares is out of sight: no name in it can be checked or renamed.
+  if #csrc.query_nodes(fn_def, callee_src, "(preproc_include) @i") > 0 then
+    return nil, fname .. " has an #include in its body"
+  end
   local body = fn_def:field("body")[1]
+  if has_stray_return(body, callee_src) then
+    return nil, "a `return` in " .. fname .. " does not parse as a return statement"
+  end
+  -- Pasted into the caller, such a use would mean the caller's declaration.
+  for _, nm in ipairs(free_names(fn_def, fn_declarator, callee_src)) do
+    if caller.declared[nm] then
+      return nil, ("'%s' in %s would mean the caller's own '%s'"):format(nm, fname, nm)
+    end
+  end
+
   local stmts = {}
   for i = 0, body:named_child_count() - 1 do
     stmts[#stmts + 1] = body:named_child(i)
@@ -131,7 +362,7 @@ function M.analyze_callee(callee_src, fname, N, caller_names)
   end
   local returns = csrc.query_nodes(body, callee_src, "(return_statement) @r")
 
-  local rename = plan_renames(params, stmts, callee_src, caller_names, N)
+  local rename = plan_renames(params, stmts, body, callee_src, caller.spelled, N)
   local body_edits = plan_body_edits(body, callee_src, rename, N)
 
   local last = stmts[#stmts]
@@ -142,9 +373,9 @@ function M.analyze_callee(callee_src, fname, N, caller_names)
     stmts = stmts,
     returns = returns,
     body_edits = body_edits,
-    ret_type = csrc.return_type(fn_def, callee_src),
-    has_value = returns[1] ~= nil and returns[1]:named_child_count() > 0,
-    simple = #returns == 1 and last:type() == "return_statement" and last:named_child_count() > 0,
+    ret_decl = csrc.result_decl(fn_def, callee_src, "__ie_ret" .. N),
+    has_value = returns[1] ~= nil and #csrc.code_children(returns[1]) > 0,
+    simple = #returns == 1 and last:type() == "return_statement" and #csrc.code_children(last) > 0,
     ret_var = "__ie_ret" .. N,
     end_label = "__ie_end" .. N,
   }
@@ -181,25 +412,73 @@ local function short_circuits(n, src)
   return false
 end
 
--- Whether the call surely runs whenever target does. Only a return, expression
--- statement or declaration qualifies: a loop header may run the call any
--- number of times, and if and switch headers are excluded as well. A call
--- anywhere inside a ?:, && or || does not, even in the operand that always runs.
+-- Operands that may run never, or only after another part of the node.
+local GUARDING_TYPES = {
+  conditional_expression = true,
+  comma_expression = true,
+  sizeof_expression = true,
+  alignof_expression = true,
+  offsetof_expression = true,
+  generic_expression = true,
+  macro_type_specifier = true, -- `typeof(f(x)) v;`
+}
+
+-- Calls that do not evaluate their arguments (__builtin_choose_expr: all but
+-- the chosen one), checked with gcc, and typeof, which tree-sitter-c reads as
+-- a call in `__typeof__(f(x) + 1) *p;`.
+local UNEVALUATED_CALLS = {
+  __builtin_constant_p = true,
+  __builtin_choose_expr = true,
+  __builtin_types_compatible_p = true,
+  __builtin_object_size = true,
+  __builtin_dynamic_object_size = true,
+  __builtin_classify_type = true,
+  __builtin_has_attribute = true,
+  typeof = true,
+  __typeof = true,
+  __typeof__ = true,
+  typeof_unqual = true,
+  __typeof_unqual = true,
+  __typeof_unqual__ = true,
+}
+
+-- Whether `n`, an ancestor of the call within target, keeps the code under
+-- `child` (its child on the way to the call) from running exactly once, or
+-- runs other code first.
+local function guards(n, child, caller_src)
+  local node_type = n:type()
+  if GUARDING_TYPES[node_type] then
+    return true
+  end
+  if node_type == "binary_expression" then
+    return short_circuits(n, caller_src)
+  end
+  if node_type == "call_expression" and child ~= n:field("function")[1] then
+    local fn = n:field("function")[1]
+    return fn:type() == "identifier" and UNEVALUATED_CALLS[csrc.text(fn, caller_src)] == true
+  end
+  -- A later declarator runs after the earlier ones, and may read them.
+  return node_type == "declaration" and child ~= n:field("declarator")[1]
+end
+
+-- Whether the call surely runs, once, whenever target does, with nothing in
+-- target due to run before it: only then may it be hoisted. Only a return,
+-- expression statement or declaration qualifies: a loop header may run the
+-- call any number of times, and if and switch headers are excluded as well.
+-- Within target, see guards: a call under ?:, && or || does not qualify even
+-- in the operand that always runs.
 local function is_unconditional(call, target, caller_src)
   local target_type = target:type()
   if target_type ~= "return_statement" and target_type ~= "expression_statement" and target_type ~= "declaration" then
     return false
   end
-  local n = call
-  while n and n ~= target do
-    local node_type = n:type()
-    if node_type == "conditional_expression" then
+  local child = call
+  while child ~= target do
+    local n = child:parent()
+    if not n or guards(n, child, caller_src) then
       return false
     end
-    if node_type == "binary_expression" and short_circuits(n, caller_src) then
-      return false
-    end
-    n = n:parent()
+    child = n
   end
   return true
 end
@@ -209,7 +488,8 @@ end
 ---@field target TSNode the statement or declaration that holds the call (see enclosing_statement)
 ---@field can_insert_above boolean lines can go directly above target; if not, a hoist wraps target in a new block
 ---@field wrap_unsafe boolean target is a declaration that lines cannot go above, so it must not be wrapped (see decide)
----@field unconditional boolean target is a return, expression statement or declaration that surely runs the call
+---@field parse_error boolean target does not parse cleanly, so what lines above or around it would do is unknown
+---@field unconditional boolean hoisting the call above target keeps its meaning (see is_unconditional)
 ---@field stmt_bol integer the byte offset of the start of target's line
 ---@field indent string the leading spaces and tabs of that line
 ---@field indent_unit string one level of indentation
@@ -238,6 +518,7 @@ function M.analyze_context(caller_src, call)
     target = target,
     can_insert_above = can_insert_above,
     wrap_unsafe = target_type == "declaration" and not can_insert_above,
+    parse_error = target:has_error(),
     unconditional = unconditional,
     stmt_bol = stmt_bol,
     indent = indent,
@@ -246,7 +527,8 @@ function M.analyze_context(caller_src, call)
 end
 
 -- The name of the printer to use. A declaration that cannot be wrapped
--- (ctx.wrap_unsafe) gets "canonical" in both modes. Otherwise correct mode
+-- (ctx.wrap_unsafe) and a target that does not parse cleanly
+-- (ctx.parse_error) get "canonical" in both modes. Otherwise correct mode
 -- picks "pretty" for a simple callee whose call is unconditional, else
 -- "canonical", which is valid in any expression context; readable mode avoids
 -- ({...}) and goto: "pretty" for any simple callee, else "readable_multi".
@@ -256,8 +538,10 @@ end
 ---@return "pretty"|"canonical"|"readable_multi"
 function M.decide(ir, ctx, mode)
   -- Wrapping a declaration in a block would end its scope early: later code
-  -- would see whatever it shadowed. Canonical leaves it in place.
-  if ctx.wrap_unsafe then
+  -- would see whatever it shadowed. Canonical leaves it in place. So it does
+  -- with a misparsed target, such as `WHEN(c) x = f(a);` where WHEN expands
+  -- to an `if`: hoisted, f would run whatever c is.
+  if ctx.wrap_unsafe or ctx.parse_error then
     return "canonical"
   end
   if ir.simple and (mode == "readable" or ctx.unconditional) then
@@ -295,23 +579,33 @@ end
 ---@return inline_explorer.Ctx? ctx nil when ir is
 ---@return string? err
 function M.analyze_call_node(caller_src, callee_src, fname, N, call)
-  local caller_names = M.names_in_scope(call, caller_src)
-  local ir, err = M.analyze_callee(callee_src, fname, N, caller_names)
+  -- Its arguments cannot be told apart: in `f(a, 2 ADD)` the 2 is in an
+  -- ERROR node.
+  if call:has_error() then
+    return nil, nil, "the call to " .. fname .. " does not parse cleanly"
+  end
+  local ir, err = M.analyze_callee(callee_src, fname, N, M.caller_names(call, caller_src))
   if not ir then
     return nil, nil, err
   end
 
-  local arglist = call:field("arguments")[1]
   local args = {}
-  for i = 0, arglist:named_child_count() - 1 do
-    args[#args + 1] = csrc.text(arglist:named_child(i) --[[@as TSNode]], caller_src)
+  for _, arg in ipairs(csrc.code_children(call:field("arguments")[1])) do
+    args[#args + 1] = csrc.text(arg, caller_src)
   end
   if #args ~= #ir.params then
     return nil, nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
   end
+  -- Only the parameters are in scope in a parameter's declaration.
+  local param_rename = {}
+  for _, p in ipairs(ir.params) do
+    if p.name then
+      param_rename[p.name] = ir.rename[p.name]
+    end
+  end
   ir.binds = {}
   for i, p in ipairs(ir.params) do
-    ir.binds[i] = csrc.build_bind(p, args[i], ir.rename, N, i, callee_src)
+    ir.binds[i] = csrc.build_bind(p, args[i], param_rename, N, i, callee_src)
   end
 
   return ir, M.analyze_context(caller_src, call)

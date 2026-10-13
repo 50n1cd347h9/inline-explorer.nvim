@@ -149,11 +149,12 @@ end
 do
   local uri = "file:///src/x.c"
   local range = { start = { line = 3, character = 8 }, ["end"] = { line = 3, character = 12 } }
+  local pos = { line = 3, character = 10 }
 
   local changes_shape = { changes = { [uri] = { { range = range, newText = "(0x3U << 0)" } } } }
   check(
     "edit: changes shape -> lines",
-    table.concat(macro._edit_lines(changes_shape, uri) or {}, "\n") == "(0x3U << 0)"
+    table.concat(macro._edit_lines(changes_shape, uri, pos) or {}, "\n") == "(0x3U << 0)"
   )
 
   local doc_changes_shape = {
@@ -165,19 +166,60 @@ do
       },
     },
   }
-  local lines = macro._edit_lines(doc_changes_shape, uri)
+  local lines = macro._edit_lines(doc_changes_shape, uri, pos)
   check(
     "edit: documentChanges shape, uri-matched",
     lines ~= nil and lines[1] == "({" and lines[#lines] == "})",
     lines and vim.inspect(lines)
   )
 
-  check("edit: wrong uri -> nil", macro._edit_lines(changes_shape, "file:///nope.c") == nil)
+  check("edit: wrong uri -> nil", macro._edit_lines(changes_shape, "file:///nope.c", pos) == nil)
   check(
     "edit: empty newText -> nil",
-    macro._edit_lines({ changes = { [uri] = { { range = range, newText = "" } } } }, uri) == nil
+    macro._edit_lines({ changes = { [uri] = { { range = range, newText = "" } } } }, uri, pos) == nil
   )
-  check("edit: nil input tolerated", macro._edit_lines(nil, uri) == nil)
+  check("edit: nil input tolerated", macro._edit_lines(nil, uri, pos) == nil)
+end
+
+-- clangd runs clang-format over the tweak's output, so the applyEdit carries
+-- whitespace edits besides the expansion; their order means nothing. These
+-- are the edits clangd 18 sent for `return add(x, TWICE(x));` in a function
+-- whose `{` sits on its own line. Taking the first edit read " ".
+do
+  local uri = "file:///src/x.c"
+  local function edit(sl, sc, el, ec, text)
+    return { range = { start = { line = sl, character = sc }, ["end"] = { line = el, character = ec } }, newText = text }
+  end
+  local formatted = {
+    changes = {
+      [uri] = {
+        edit(3, 24, 4, 0, " "),
+        edit(4, 1, 5, 4, " "),
+        edit(5, 18, 5, 26, "((x) * 2)"),
+        edit(5, 28, 6, 0, " "),
+      },
+    },
+  }
+  for _, character in ipairs({ 18, 20, 25 }) do
+    local lines = macro._edit_lines(formatted, uri, { line = 5, character = character })
+    check(
+      ("edit: the expansion is the edit at the use, not the first (5:%d)"):format(character),
+      lines ~= nil and #lines == 1 and lines[1] == "((x) * 2)",
+      lines
+    )
+  end
+
+  -- A use at the start of a statement: a whitespace edit ends where the
+  -- expansion begins, so both touch the position.
+  local at_statement = {
+    changes = { [uri] = { edit(4, 1, 5, 4, " "), edit(5, 4, 5, 12, "do { } while (0)") } },
+  }
+  local lines = macro._edit_lines(at_statement, uri, { line = 5, character = 4 })
+  check(
+    "edit: an edit that only ends at the use is not the expansion",
+    lines ~= nil and lines[1] == "do { } while (0)",
+    lines
+  )
 end
 
 -- _edit_matches: does a WorkspaceEdit belong to OUR tweak (exactly one document,
@@ -410,7 +452,7 @@ do
   local uri = "file:///src/x.c"
   local range14 = { start = { line = 1, character = 0 }, ["end"] = { line = 4, character = 0 } }
   local padded = { changes = { [uri] = { { range = range14, newText = "\n\n(v + 1)\n\n" } } } }
-  local lines = macro._edit_lines(padded, uri)
+  local lines = macro._edit_lines(padded, uri, { line = 2, character = 0 })
   check(
     "edit: blank edge lines trimmed",
     lines ~= nil and #lines == 1 and lines[1] == "(v + 1)",
@@ -488,6 +530,269 @@ do
     made == 0,
     ("caller parses=%d"):format(made)
   )
+end
+
+-- The tweak end to end against a fake clangd whose applyEdit leads with the
+-- whitespace edits clang-format adds: the fetch must return the expansion
+-- through the tweak, not miss and fall back to hover.
+do
+  local fake_lsp = require("tests.lib.fake_lsp")
+  local profile = require("inline-explorer.profile")
+  local dir = H.tmpdir()
+  H.writef(dir .. "/m.c", "#define TWICE(x) ((x) * 2)\nstatic int helper(int x)\n{\n    return TWICE(x);\n}\n")
+  vim.cmd.edit(dir .. "/m.c")
+  local buf = vim.api.nvim_get_current_buf()
+  local uri = vim.uri_from_bufnr(buf)
+  local function edit(sl, sc, el, ec, text)
+    return { range = { start = { line = sl, character = sc }, ["end"] = { line = el, character = ec } }, newText = text }
+  end
+  local cid = fake_lsp.start({
+    name = "clangd",
+    buf = buf,
+    root_dir = dir,
+    capabilities = {
+      codeActionProvider = true,
+      hoverProvider = true,
+      executeCommandProvider = { commands = { "clangd.applyTweak" } },
+    },
+    handle = function(method, _, callback, server)
+      if method == "textDocument/codeAction" then
+        local cmd =
+          { title = "Expand macro", command = "clangd.applyTweak", arguments = { { tweakID = "ExpandMacro" } } }
+        callback(nil, { { title = "Expand macro TWICE", kind = "refactor", command = cmd } })
+      elseif method == "workspace/executeCommand" then
+        server.request("workspace/applyEdit", {
+          edit = {
+            changes = {
+              [uri] = {
+                edit(1, 24, 2, 0, " "),
+                edit(2, 1, 3, 4, " "),
+                edit(3, 11, 3, 19, "((x) * 2)"),
+                edit(3, 20, 4, 0, " "),
+              },
+            },
+          },
+        })
+        callback(nil, vim.NIL)
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "tweak end-to-end checks (in-process LSP server unavailable)",
+  })
+  if cid then
+    local was, wasfile = profile.enabled, profile.logfile
+    profile.enabled, profile.logfile = true, false
+    profile.clear()
+    local got
+    macro.fetch_expansion({ source_bufnr = buf }, 3, 11, function(lines)
+      got = lines or false
+    end)
+    vim.wait(5000, function()
+      return got ~= nil
+    end, 10)
+    local spans = {}
+    for _, e in ipairs(profile.events) do
+      spans[#spans + 1] = e.name
+    end
+    check(
+      "tweak: a formatted applyEdit yields the expansion through the tweak",
+      got and #got == 1 and got[1] == "((x) * 2)" and vim.tbl_contains(spans, "macro:tweak"),
+      { got = got, spans = spans }
+    )
+    profile.enabled, profile.logfile = was, wasfile
+    vim.lsp.stop_client(cid, true)
+  end
+end
+
+-- A server that offers no hover is not asked for one. The hover went out
+-- through buf_request_all, which never calls back when no server supports
+-- the method, so the fetch never ended and the inliner held its guard.
+do
+  local fake_lsp = require("tests.lib.fake_lsp")
+  local dir = H.tmpdir()
+  H.writef(dir .. "/n.c", "#define ONE 1\nint f(void) { return ONE; }\n")
+  vim.cmd.edit(dir .. "/n.c")
+  local buf = vim.api.nvim_get_current_buf()
+  local cid = fake_lsp.start({
+    name = "clangd",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { codeActionProvider = true, executeCommandProvider = { commands = { "clangd.applyTweak" } } },
+    handle = function(_, _, callback)
+      callback(nil, {}) -- no code action: the tweak misses
+    end,
+    skip = "hover-capability checks (in-process LSP server unavailable)",
+  })
+  if cid then
+    local orig_notify = vim.notify
+    vim.notify = function() end
+    local done, got = false, nil
+    macro.fetch_expansion({ source_bufnr = buf }, 1, 21, function(lines)
+      got, done = lines, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 10)
+    vim.notify = orig_notify
+    check(
+      "hover: a server without hover ends the fetch at once, empty",
+      done and got == nil,
+      { done = done, got = got }
+    )
+    vim.lsp.stop_client(cid, true)
+  end
+end
+
+-- The expansion comes from the server with the tweak, whatever it is called,
+-- and only that server is asked for the hover: another server's hover text
+-- hid clangd's expansion when its client id was lower, and one that never
+-- answered held the fetch forever.
+do
+  local fake_lsp = require("tests.lib.fake_lsp")
+  local dir = H.tmpdir()
+  H.writef(dir .. "/h.c", "#define TWICE(x) ((x) * 2)\nint f(int a) { return TWICE(a); }\n")
+  vim.cmd.edit(dir .. "/h.c")
+  local buf = vim.api.nvim_get_current_buf()
+  local uri = vim.uri_from_bufnr(buf)
+  local tweak_caps = {
+    codeActionProvider = true,
+    hoverProvider = true,
+    executeCommandProvider = { commands = { "clangd.applyTweak" } },
+  }
+  local clangd_hover = {
+    contents = {
+      kind = "markdown",
+      value = "### macro `TWICE`\n\n---\n```cpp\n#define TWICE(x) ((x) * 2)\n\n// Expands to\n((a) * 2)\n```",
+    },
+  }
+  local function start(name, capabilities, handle)
+    return fake_lsp.start({
+      name = name,
+      buf = buf,
+      root_dir = dir,
+      capabilities = capabilities,
+      handle = handle,
+      skip = "expansion-server checks (in-process LSP server unavailable)",
+    })
+  end
+  local function stop_all()
+    for _, c in ipairs(vim.lsp.get_clients({ bufnr = buf })) do
+      vim.lsp.stop_client(c.id, true)
+    end
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 10)
+  end
+  local function fetch()
+    local got, t0 = nil, vim.uv.hrtime()
+    macro.fetch_expansion({ source_bufnr = buf }, 1, 22, function(lines)
+      got = lines or false
+    end)
+    vim.wait(5000, function()
+      return got ~= nil
+    end, 10)
+    return got, (vim.uv.hrtime() - t0) / 1e6
+  end
+  -- clangd with no tweak at the position, so the hover is asked.
+  local function hover_only(reply)
+    return function(method, _, callback)
+      if method == "textDocument/codeAction" then
+        callback(nil, {})
+      elseif method == "textDocument/hover" then
+        if reply then
+          callback(nil, reply)
+        end
+      else
+        callback(nil, nil)
+      end
+    end
+  end
+
+  local other_hovers = 0
+  local other = start("typos", { hoverProvider = true }, function(method, _, callback)
+    if method == "textDocument/hover" then
+      other_hovers = other_hovers + 1
+      callback(nil, { contents = { kind = "markdown", value = "spelling: `TWICE` looks fine" } })
+    end
+  end)
+  local clangd = start("clangd", tweak_caps, hover_only(clangd_hover))
+  if other and clangd then
+    local got = fetch()
+    check(
+      "hover: only the server with the tweak is asked, so no other text can hide the expansion",
+      got and got[1] == "((a) * 2)" and other_hovers == 0,
+      { got = got, other_hovers = other_hovers }
+    )
+  end
+  stop_all()
+
+  local hung = start("hung", { hoverProvider = true }, function() end)
+  clangd = start("clangd", tweak_caps, hover_only(clangd_hover))
+  if hung and clangd then
+    local got, ms = fetch()
+    check(
+      "hover: a second server that never answers does not hold the fetch",
+      got and got[1] == "((a) * 2)" and ms < 1500,
+      { got = got, ms = ms }
+    )
+  end
+  stop_all()
+
+  local log
+  clangd, log = start("clangd", tweak_caps, hover_only(nil))
+  if clangd then
+    local got, ms = fetch()
+    vim.wait(100)
+    check(
+      "hover: an unanswered hover ends the fetch, empty, at its timeout, and is cancelled",
+      got == false and ms < 4500 and fake_lsp.count(log.notifications, "$/cancelRequest") == 1,
+      { got = got, ms = ms, notifications = log.notifications }
+    )
+  end
+  stop_all()
+
+  -- A codeAction that never comes back is cancelled at the tweak's timeout,
+  -- and the hover still answers.
+  clangd, log = start("clangd", tweak_caps, function(method, _, callback)
+    if method == "textDocument/hover" then
+      callback(nil, clangd_hover)
+    end
+  end)
+  if clangd then
+    local got = fetch()
+    check(
+      "tweak: an unanswered codeAction is cancelled, and the hover answers",
+      got
+        and got[1] == "((a) * 2)"
+        and fake_lsp.count(log.notifications, "$/cancelRequest") == 1
+        and fake_lsp.count(log.requests, "workspace/executeCommand") == 0,
+      { got = got, log = log }
+    )
+  end
+  stop_all()
+
+  -- Not called "clangd" (a versioned binary, say), but it has the tweak.
+  local renamed = start("clangd-18", tweak_caps, function(method, _, callback, server)
+    if method == "textDocument/codeAction" then
+      local cmd = { title = "Expand macro", command = "clangd.applyTweak", arguments = { { tweakID = "ExpandMacro" } } }
+      callback(nil, { { title = "Expand macro TWICE", kind = "refactor", command = cmd } })
+    elseif method == "workspace/executeCommand" then
+      local range = { start = { line = 1, character = 22 }, ["end"] = { line = 1, character = 30 } }
+      server.request(
+        "workspace/applyEdit",
+        { edit = { changes = { [uri] = { { range = range, newText = "((a) * 2)" } } } } }
+      )
+      callback(nil, vim.NIL)
+    else
+      callback(nil, nil)
+    end
+  end)
+  if renamed then
+    local got = fetch()
+    check("tweak: a server with the tweak is used whatever its name", got and got[1] == "((a) * 2)", got)
+  end
+  stop_all()
 end
 
 H.finish("MACRO")

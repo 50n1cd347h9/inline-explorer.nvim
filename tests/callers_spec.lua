@@ -111,6 +111,55 @@ do
   )
 end
 
+-- 1c. A grep hit counts only where a call of the name begins. A mention in
+-- a call's comment, string or argument used to confirm the enclosing call
+-- again: 9 call sites reported for these 6.
+do
+  local cdir = H.tmpdir()
+  H.writef(cdir .. "/x.c", table.concat({
+    "int foo(int x) { return x; }",
+    "int bar(int (*f)(int)) { return f(1); }",
+    "int use(void)",
+    "{",
+    "    int a = foo(1);", -- 4: one call
+    "    int b = foo(/* foo */ 2);", -- 5: one call, the name also in a comment
+    '    int c = foo(sizeof "foo");', -- 6: one call, the name also in a string
+    "    int d = bar(foo);", -- 7: no call of foo
+    "    int e = foo(foo(3));", -- 8: two calls
+    "    int g = foo(1, foo);", -- 9: one call, the name also an argument
+    "    return a + b + c + d + e + g;",
+    "}",
+  }, "\n") .. "\n")
+  local xbuf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(xbuf, cdir .. "/x.c")
+  local function sites(without_rg)
+    local orig = vim.fn.executable
+    if without_rg then
+      vim.fn.executable = function(n)
+        return n == "rg" and 0 or orig(n)
+      end
+    end
+    local done, got = false, nil
+    callers.get("foo", xbuf, function(items)
+      got, done = items, true
+    end)
+    vim.wait(10000, function()
+      return done
+    end, 10)
+    vim.fn.executable = orig
+    local out = {}
+    for _, it in ipairs(got or {}) do
+      out[#out + 1] = it.range.start.line .. ":" .. it.range.start.character
+    end
+    return table.concat(out, " ")
+  end
+  local want = "4:12 5:12 6:12 8:12 8:16 9:12"
+  local with_rg = sites(false)
+  check("grep fallback: only call sites count, sorted by line and column", with_rg == want, with_rg)
+  local without_rg = sites(true)
+  check("grep(no rg): every match on a line is a hit, only call sites count", without_rg == want, without_rg)
+end
+
 -- 2. In-process LSP server with callHierarchy: LSP wins, labelled so.
 do
   local uri1 = vim.uri_from_fname(vim.fn.resolve(dir .. "/use1.c"))
@@ -203,21 +252,39 @@ do
   end
 end
 
--- 3. A server that never answers: the timeout must hand over to grep,
--- and cb must fire EXACTLY once -- the first version of this module
+-- 3. A call hierarchy that never answers: the timeout must hand over to
+-- grep, and cb must fire EXACTLY once -- the first version of this module
 -- routed the timeout through once_with_timeout, whose internal callback
 -- capture bypassed the sentinel filter, delivering a nil-items callback
--- and then grep's answer on top of it.
+-- and then grep's answer on top of it. The server answers workspace/symbol,
+-- so it is prepareCallHierarchy that times out, not the lookup before it.
 do
-  local cid2 = fake_lsp.start({
+  local prepare_count = 0
+  local cid2, log2 = fake_lsp.start({
     name = "wedgehier",
     buf = buf,
     root_dir = dir,
-    capabilities = { callHierarchyProvider = true },
-    -- everything else: swallowed
+    capabilities = { callHierarchyProvider = true, workspaceSymbolProvider = true },
+    handle = function(method, _, callback)
+      if method == "workspace/symbol" then
+        callback(nil, {
+          {
+            name = "target_fn",
+            kind = 12,
+            location = {
+              uri = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c")),
+              range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } },
+            },
+          },
+        })
+      elseif method == "textDocument/prepareCallHierarchy" then
+        prepare_count = prepare_count + 1 -- never answered
+      end
+    end,
     skip = "timeout-fallback checks (in-process LSP server unavailable)",
   })
   if cid2 then
+    require("inline-explorer.resolver").clear_caches()
     local saved = callers._timeout_ms
     callers._timeout_ms = 200
     local calls, items, source = 0, nil, nil
@@ -229,11 +296,249 @@ do
       return calls > 0
     end, 10)
     vim.wait(500) -- room for a buggy second invocation to land
+    check("timeout: the call hierarchy was asked", prepare_count == 1, prepare_count)
+    check(
+      "timeout: the unanswered request is cancelled",
+      log2 and fake_lsp.count(log2.notifications, "$/cancelRequest") == 1,
+      log2 and log2.notifications
+    )
     check("timeout: falls back to grep", source == "grep", tostring(source))
     check("timeout: cb fired exactly once", calls == 1, calls)
     check("timeout: grep items intact (never a nil-items callback)", items ~= nil and #items == 3, items and #items)
     callers._timeout_ms = saved
     vim.lsp.stop_client(cid2, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
+  end
+end
+
+-- 3a. An empty call hierarchy hands over to grep exactly once. A timer
+-- outliving that answer started a second grep over the whole tree whenever
+-- the first took longer than the timeout.
+do
+  local resolver = require("inline-explorer.resolver")
+  local liburi = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c"))
+  local cid5 = fake_lsp.start({
+    name = "emptyhier",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { callHierarchyProvider = true, workspaceSymbolProvider = true },
+    handle = function(method, _, callback)
+      if method == "workspace/symbol" then
+        local name_range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } }
+        callback(nil, { { name = "target_fn", kind = 12, location = { uri = liburi, range = name_range } } })
+      else
+        callback(nil, {}) -- no call hierarchy item
+      end
+    end,
+    skip = "double-grep checks (in-process LSP server unavailable)",
+  })
+  if cid5 then
+    resolver.clear_caches()
+    local greps = 0
+    local orig_system = vim.system
+    vim.system = function(cmd, opts, on_exit)
+      greps = greps + 1
+      return orig_system({ "sh", "-c", "sleep 0.4; " .. cmd[#cmd] }, opts, on_exit)
+    end
+    local saved = callers._timeout_ms
+    callers._timeout_ms = 50
+    local calls, source = 0, nil
+    callers.get("target_fn", buf, function(_, s2)
+      calls, source = calls + 1, s2
+    end)
+    vim.wait(5000, function()
+      return calls > 0
+    end, 10)
+    vim.wait(800) -- room for a second grep to start and finish
+    vim.system = orig_system
+    callers._timeout_ms = saved
+    check(
+      "empty call hierarchy: one grep, one answer",
+      source == "grep" and calls == 1 and greps == 1,
+      ("source=%s calls=%d greps=%d"):format(tostring(source), calls, greps)
+    )
+    vim.lsp.stop_client(cid5, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
+  end
+end
+
+-- 3b. A call hierarchy server that cannot look names up: grep answers at
+-- once. Before, locate sent nothing, waited out its whole budget and only
+-- then let grep start.
+do
+  local resolver = require("inline-explorer.resolver")
+  local cid4 = fake_lsp.start({
+    name = "hieronly",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { callHierarchyProvider = true },
+    handle = function(_, _, callback)
+      callback(nil, nil)
+    end,
+    skip = "unsupported-lookup checks (in-process LSP server unavailable)",
+  })
+  if cid4 then
+    resolver.clear_caches()
+    local saved = resolver._timeout_ms
+    resolver._timeout_ms = 10000
+    local orig_notify = vim.notify
+    vim.notify = function() end
+    local done, source, t0 = false, nil, vim.uv.hrtime()
+    callers.get("target_fn", buf, function(_, s2)
+      source, done = s2, true
+    end)
+    vim.wait(15000, function()
+      return done
+    end, 10)
+    local waited = (vim.uv.hrtime() - t0) / 1e6
+    vim.notify = orig_notify
+    resolver._timeout_ms = saved
+    check(
+      "no workspace/symbol: grep answers without waiting for the lookup's budget",
+      done and source == "grep" and waited < 5000,
+      ("source=%s waited=%.0fms"):format(tostring(source), waited)
+    )
+    vim.lsp.stop_client(cid4, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
+  end
+end
+
+-- 3c. Two call hierarchy servers, the first of which never answers: the
+-- question goes to the server that found the symbol, and only that one is
+-- attached to the symbol's file.
+do
+  local resolver = require("inline-explorer.resolver")
+  local liburi = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c"))
+  local use1 = vim.uri_from_fname(vim.fn.resolve(dir .. "/use1.c"))
+  local hung_prepares = 0
+  local caps = { callHierarchyProvider = true, workspaceSymbolProvider = true }
+  vim.cmd.edit(dir .. "/use2.c")
+  local ubuf = vim.api.nvim_get_current_buf()
+  local hung_id = fake_lsp.start({
+    name = "hunghier",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method)
+      if method == "textDocument/prepareCallHierarchy" then
+        hung_prepares = hung_prepares + 1
+      end
+    end,
+    skip = "two-server callers checks (in-process LSP server unavailable)",
+  })
+  local found_id = fake_lsp.start({
+    name = "foundhier",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method, _, callback)
+      local name_range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } }
+      if method == "workspace/symbol" then
+        callback(nil, { { name = "target_fn", kind = 12, location = { uri = liburi, range = name_range } } })
+      elseif method == "textDocument/prepareCallHierarchy" then
+        callback(
+          nil,
+          { { name = "target_fn", kind = 12, uri = liburi, range = name_range, selectionRange = name_range } }
+        )
+      elseif method == "callHierarchy/incomingCalls" then
+        local from_range = { start = { line = 1, character = 0 }, ["end"] = { line = 4, character = 1 } }
+        callback(nil, {
+          {
+            from = { name = "u1", kind = 12, uri = use1, range = from_range, selectionRange = from_range },
+            fromRanges = { { start = { line = 3, character = 11 }, ["end"] = { line = 3, character = 20 } } },
+          },
+        })
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "two-server callers checks (in-process LSP server unavailable)",
+  })
+  if hung_id and found_id then
+    resolver.clear_caches()
+    local saved_r, saved_c = resolver._timeout_ms, callers._timeout_ms
+    resolver._timeout_ms, callers._timeout_ms = 300, 3000
+    local done, source = false, nil
+    callers.get("target_fn", ubuf, function(_, s2)
+      source, done = s2, true
+    end)
+    vim.wait(10000, function()
+      return done
+    end, 10)
+    resolver._timeout_ms, callers._timeout_ms = saved_r, saved_c
+    local libbuf = vim.uri_to_bufnr(liburi)
+    check(
+      "two servers: the call hierarchy of the server that found the symbol answers",
+      done and source == "lsp" and hung_prepares == 0,
+      ("source=%s hung prepares=%d"):format(tostring(source), hung_prepares)
+    )
+    check("two servers: the other server is not attached for it", not vim.lsp.buf_is_attached(libbuf, hung_id))
+  end
+  for _, id in ipairs({ hung_id, found_id }) do
+    vim.lsp.stop_client(id, true)
+  end
+  vim.wait(1000, function()
+    return #vim.lsp.get_clients({ bufnr = ubuf }) == 0
+  end, 20)
+end
+
+-- 3d. prepareCallHierarchy and incomingCalls share one budget: a slow
+-- prepare leaves incomingCalls only what remains, so grep answers after
+-- callers._timeout_ms, not up to twice that.
+do
+  local resolver = require("inline-explorer.resolver")
+  local liburi = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c"))
+  local name_range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } }
+  vim.api.nvim_set_current_buf(buf) -- fake_lsp.start attaches to the current buffer
+  local cid6, log6 = fake_lsp.start({
+    name = "slowhier",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { callHierarchyProvider = true, workspaceSymbolProvider = true },
+    handle = function(method, _, callback)
+      if method == "workspace/symbol" then
+        callback(nil, { { name = "target_fn", kind = 12, location = { uri = liburi, range = name_range } } })
+      elseif method == "textDocument/prepareCallHierarchy" then
+        vim.defer_fn(function()
+          callback(
+            nil,
+            { { name = "target_fn", kind = 12, uri = liburi, range = name_range, selectionRange = name_range } }
+          )
+        end, 700)
+      end -- incomingCalls: never answered
+    end,
+    skip = "shared call hierarchy budget checks (in-process LSP server unavailable)",
+  })
+  if cid6 then
+    resolver.clear_caches()
+    local saved = callers._timeout_ms
+    callers._timeout_ms = 1000
+    local started, elapsed, source = vim.uv.hrtime(), nil, nil
+    callers.get("target_fn", buf, function(_, s2)
+      elapsed, source = (vim.uv.hrtime() - started) / 1e6, s2
+    end)
+    vim.wait(5000, function()
+      return elapsed ~= nil
+    end, 10)
+    callers._timeout_ms = saved
+    check(
+      "shared budget: grep answers once the one budget is spent",
+      source == "grep"
+        and elapsed
+        and elapsed < 1400
+        and fake_lsp.count(log6.requests, "callHierarchy/incomingCalls") == 1,
+      ("source=%s elapsed=%s"):format(tostring(source), tostring(elapsed))
+    )
+    vim.lsp.stop_client(cid6, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
   end
 end
 

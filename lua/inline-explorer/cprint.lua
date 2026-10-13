@@ -22,7 +22,7 @@ local function return_edits(ir, style)
   for _, r in ipairs(ir.returns) do
     local keyword = r:child(0)
     local semicolon = r:child(r:child_count() - 1)
-    local has_expr = r:named_child_count() > 0
+    local has_expr = #csrc.code_children(r) > 0
     if style == "assign" then
       replace(keyword, has_expr and (ir.ret_var .. " =") or "(void)0")
     elseif has_expr then
@@ -37,13 +37,23 @@ local function return_edits(ir, style)
 end
 
 -- Statements 1..last_i with ir.body_edits and `extra` applied, from the start
--- of the first one's line, so that csrc.reindent sees the callee's indentation.
+-- of the first one's line, so that csrc.reindent sees the callee's
+-- indentation; but from the statement itself when code precedes it on that
+-- line, as the signature of `static int f(int x) { return x; }` does.
 local function body_text(ir, last_i, extra)
   local edits = {}
   vim.list_extend(edits, ir.body_edits)
   vim.list_extend(edits, extra or {})
-  local from = csrc.line_start_byte(ir.stmts[1])
-  return csrc.apply_edits(ir.src, from, csrc.end_byte(ir.stmts[last_i]), edits)
+  local first = ir.stmts[1]
+  local from = csrc.line_start_byte(first)
+  if not ir.src:sub(from + 1, csrc.start_byte(first)):match("^[ \t]*$") then
+    from = csrc.start_byte(first)
+  end
+  -- A bare `struct s { ... };` or `enum { A };` leaves its `;` to the block.
+  local last = ir.stmts[last_i]
+  local after = last:next_sibling()
+  local stop = csrc.end_byte((after and after:type() == ";") and after or last)
+  return csrc.apply_edits(ir.src, from, stop, edits)
 end
 
 -- print_hoisted where lines cannot go above target: a new block replaces
@@ -92,8 +102,7 @@ local function print_pretty(caller_src, ir, ctx)
   if #ir.stmts >= 2 then
     vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts - 1), ""))
   end
-  local expr = ir.stmts[#ir.stmts]:named_child(0)
-  ---@cast expr -nil
+  local expr = csrc.code_children(ir.stmts[#ir.stmts])[1]
   local expr_text = csrc.apply_edits(ir.src, csrc.start_byte(expr), csrc.end_byte(expr), ir.body_edits)
   local replacement = simplify.parens("(" .. expr_text .. ")")
   return print_hoisted(caller_src, ctx, hoist, replacement)
@@ -112,7 +121,7 @@ local function print_canonical(caller_src, ir, ctx)
     parts[#parts + 1] = inner .. b
   end
   if ir.has_value then
-    parts[#parts + 1] = inner .. ir.ret_type .. " " .. ir.ret_var .. ";"
+    parts[#parts + 1] = inner .. ir.ret_decl .. ";"
   end
   vim.list_extend(parts, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "goto")), inner))
   parts[#parts + 1] = inner .. ir.end_label .. ":;"
@@ -134,7 +143,7 @@ local function print_readable_multi(caller_src, ir, ctx)
   local hoist = {}
   vim.list_extend(hoist, ir.binds)
   if ir.has_value then
-    hoist[#hoist + 1] = ir.ret_type .. " " .. ir.ret_var .. ";"
+    hoist[#hoist + 1] = ir.ret_decl .. ";"
   end
   vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "assign")), ""))
   return print_hoisted(caller_src, ctx, hoist, ir.ret_var)

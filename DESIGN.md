@@ -65,38 +65,49 @@ and prettier output is only chosen when the analysis proves it safe.
 
 Mechanism:
 
-- Parameters bind by reconstructing each parameter's declared type (arrays
-  decay to pointers), so a NULL/`0` argument keeps the right pointer type;
-  `__auto_type` is a fallback for exotic declarators (e.g. function pointers).
-  This preserves call-by-value.
+- Parameters bind as the callee declares them, with an array or function
+  declarator next to the name adjusted to a pointer as C adjusts parameters
+  (`int m[][4]` binds as `int (*m)[4]`), so a NULL/`0` argument keeps the
+  right pointer type and inner qualifiers survive; `__auto_type` is the
+  fallback for an unnamed parameter. This preserves call-by-value.
 - A callee whose only `return` is its last statement and carries a value
   renders as a *pretty hoist* (setup lifted above the call statement, return
   expression spliced in, parenthesised) when the call runs unconditionally;
   readable mode uses it either way. A declaration that lines cannot be inserted
   above gets the canonical form in both modes, since wrapping it in a block
-  would end its scope early.
+  would end its scope early, and so does a statement that does not parse
+  cleanly, since a macro in it may hide an `if`.
 - Everything else renders as a GNU statement expression `({ ... })` with each
-  `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and the
-  reconstructed declared return type as `__ie_retN`'s value slot. This makes
-  *any* function inlinable as an expression.
-- Callee labels (function-scoped), and parameters and top-level locals that
-  collide with the caller scope, are suffixed `name__ieN`, keyed by a
-  per-expansion id N, so repeated and nested inlining stays correct.
-- Calls the analysis rejects (variadic functions, for example) are not
-  rewritten: the inliner falls back to block-paste (`<leader>ee`) rather than
-  produce wrong code. Macros are expanded through clangd instead.
+  `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }`, and
+  `__ie_retN` declared as the value slot with the callee's own declarator
+  around it (`char (*__ie_ret1)` for `char (*f(void))`). This makes *any*
+  function inlinable as an expression.
+- Callee labels (function-scoped) are suffixed `name__ieN`, keyed by a
+  per-expansion id N, and so are its parameters and top-level locals
+  (typedefs and enumerators included) whose name appears anywhere in the
+  caller's function, so repeated and nested inlining stays correct.
+- Calls the analysis rejects (variadic functions, a callee that reads a name
+  the caller's function declares too, which a rename cannot keep apart, a
+  callee with an `#include` in its body or a `return` that does not parse as
+  one, a call that does not parse cleanly) are not rewritten: the inliner
+  falls back to block-paste (`<leader>ee`) rather than produce wrong code.
+  Macros are expanded through clangd instead.
 
 Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
 
 - **correct** (default) — guaranteed to compile. Hoisting only when the call is
-  reached unconditionally in a plain statement; block-wrap after case/goto labels
-  (a declaration cannot follow a bare label); GNU statement expression + `goto`
-  for everything else. Parameter bindings reconstruct the declared parameter type
-  (arrays decay to pointers) so NULL/`0` arguments keep the right pointer type;
-  the result slot uses the reconstructed return type.
-- **readable** — never emits `({...})`/`goto`; hoists the body with `return`→
-  assignment. Cleaner, but not guaranteed to compile or preserve semantics for
-  early-return / labelled / short-circuit code.
+  reached unconditionally in a plain statement, outside any operand that is
+  never evaluated (`sizeof`, `_Generic`, `typeof`, `__builtin_constant_p`, ...)
+  and with nothing in the statement sequenced before it (a comma's left side,
+  an earlier declarator), in a statement that parses cleanly; block-wrap
+  after case/goto labels (a declaration cannot follow a bare label); GNU
+  statement expression + `goto` for everything else. Parameter bindings and
+  the result slot keep the callee's declared types (see Mechanism).
+- **readable** — hoists the body with `return`→ assignment and avoids
+  `({...})`/`goto`, except where only they keep the meaning: a declaration
+  that cannot be wrapped in a block, and a statement that does not parse
+  cleanly, get the correct-mode form. Cleaner, but not guaranteed to compile
+  or preserve semantics for early-return / labelled / short-circuit code.
 
 Guarantee: `tests/substitute_spec.lua` (shaped cases) and
 `tests/real_cjson_spec.lua` (every in-file static call in real cJSON) have gcc
@@ -122,11 +133,13 @@ preprocessor. `macro.lua` therefore delegates to the live clangd, preferring its
 `ExpandMacro` tweak: the tweak is discovered via `textDocument/codeAction`,
 executed via `workspace/executeCommand`, and the `workspace/applyEdit` it sends
 back is intercepted — kept out of the real file (a reply straggling past the
-timeout + grace window, ~5 s, is the one exception) — with its `newText` taken
-as the expansion. When the tweak is unavailable (older clangd, no action at the
-position, errors, timeout) the fallback scrapes `textDocument/hover` markdown
-(clangd puts `#define` and the expansion in one code block separated by an
-"Expands to" marker; we take the part after it).
+timeout + grace window, ~5 s, is the one exception) — with the `newText` of its
+edit at the macro use taken as the expansion (clangd formats the result, so the
+other edits only change whitespace). When the tweak finds no action at the
+position, errors or times out, the fallback scrapes the same server's
+`textDocument/hover` markdown (clangd puts `#define` and the expansion in one
+code block separated by an "Expands to" marker; we take the part after it).
+Both go only to the server that offers the tweak, whatever its name.
 
 The smart `ei` action splices that expansion **in place** of the macro use (the
 same fetch→replace path as functions, with the fetch preferring the tweak and

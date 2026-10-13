@@ -71,13 +71,21 @@ do
   check("extract_sync: body includes the return", table.concat(lines, "\n"):find("return per_cpu", 1, true) ~= nil)
 end
 
--- extract_sync: macro definition -> a preproc node type, continuation kept.
+-- extract_sync: macro definition -> a preproc node type, continuation kept,
+-- and nothing after it. A #define's node ends at column 0 of the next row,
+-- so taking its end row as the last line added the line below the macro.
 do
   local cpath = vim.fn.tempname() .. ".c"
-  H.writef(cpath, "#define TWICE(x) \\\n    ((x) + (x))\nint y;\n")
+  H.writef(cpath, "#define TWICE(x) \\\n    ((x) + (x))\nint y;\n#define ONE 1\nint z;\n")
   local lines, label = resolver.extract_sync({ uri = vim.uri_from_fname(cpath), range = range(0, 8, 0, 13) })
   check("extract_sync: macro label is a preproc node", type(label) == "string" and label:find("preproc") ~= nil, label)
-  check("extract_sync: continuation line kept", table.concat(lines, "\n"):find("(x) + (x)", 1, true) ~= nil)
+  check(
+    "extract_sync: a function-like macro is its two lines, continuation kept",
+    #lines == 2 and lines[2] == "    ((x) + (x))",
+    lines
+  )
+  local one = resolver.extract_sync({ uri = vim.uri_from_fname(cpath), range = range(3, 8, 3, 11) })
+  check("extract_sync: an object-like macro is its one line", #one == 1 and one[1] == "#define ONE 1", one)
 end
 
 -- extract (async wrapper): with no LSP attached it falls back to extract_sync
@@ -195,6 +203,80 @@ do
   )
 end
 
+-- async.request against a stub client: one callback whatever happens, and a
+-- cancel on timeout only while the request is still pending -- Neovim logs an
+-- error for cancelling one that is not.
+do
+  local async = require("inline-explorer.async")
+  local function stub(sent)
+    local client = { requests = {}, cancelled = {}, handlers = {} }
+    function client:request(method, _, handler, bufnr)
+      if not sent then
+        return false, nil
+      end
+      self.requests[7] = { type = "pending", method = method, bufnr = bufnr }
+      self.handlers[7] = handler
+      return true, 7
+    end
+    function client:cancel_request(id)
+      self.cancelled[#self.cancelled + 1] = id
+      self.requests[id] = { type = "cancel" }
+    end
+    return client
+  end
+  local function run(client, before_timeout)
+    local calls = {}
+    async.request(client, "textDocument/definition", {}, 0, 50, function(err, result)
+      calls[#calls + 1] = { err = err, result = result }
+    end)
+    if before_timeout then
+      before_timeout(client)
+    end
+    vim.wait(300, function()
+      return #calls > 0
+    end, 5)
+    vim.wait(100) -- room for a second callback
+    return calls
+  end
+
+  local client = stub(true)
+  local calls = run(client)
+  check(
+    "async.request: no reply -> one error callback, and the pending request is cancelled",
+    #calls == 1 and calls[1].err ~= nil and #client.cancelled == 1 and client.cancelled[1] == 7,
+    { calls = calls, cancelled = client.cancelled }
+  )
+
+  client = stub(true)
+  calls = run(client, function(c)
+    c.requests[7] = nil -- answered, its handler not yet run
+  end)
+  check(
+    "async.request: a request no longer pending is not cancelled",
+    #calls == 1 and #client.cancelled == 0,
+    { calls = calls, cancelled = client.cancelled }
+  )
+
+  client = stub(true)
+  calls = run(client, function(c)
+    c.handlers[7](nil, "answer")
+  end)
+  vim.wait(100)
+  check(
+    "async.request: a reply -> one callback with it, nothing cancelled",
+    #calls == 1 and calls[1].err == nil and calls[1].result == "answer" and #client.cancelled == 0,
+    { calls = calls, cancelled = client.cancelled }
+  )
+
+  client = stub(false)
+  calls = run(client)
+  check(
+    "async.request: a request that cannot be sent fails at once",
+    #calls == 1 and calls[1].err ~= nil and #client.cancelled == 0,
+    calls
+  )
+end
+
 -- Timeout: a wedged server (accepts requests, never replies) must not starve
 -- the callbacks -- locate reports a timeout error, extract falls back to
 -- extract_sync. Uses an in-process LSP server that swallows everything after
@@ -205,7 +287,7 @@ do
 
   vim.cmd.edit(hpath)
   local src_buf = vim.api.nvim_get_current_buf()
-  local client_id = fake_lsp.start({
+  local client_id, wedge_log = fake_lsp.start({
     name = "wedge",
     buf = src_buf,
     root_dir = vim.fn.fnamemodify(hpath, ":h"),
@@ -218,7 +300,7 @@ do
   })
   if client_id then
     -- These checks exist to exercise the SERVER extraction path -- timeout,
-    -- cold budget, retry -- which local-first C extraction would bypass
+    -- cold budget, late reply -- which local-first C extraction would bypass
     -- entirely. It stays the live path for non-C-family languages, so
     -- forcing it here tests real code, not a dead branch.
     local saved_lf = resolver._local_first
@@ -311,6 +393,7 @@ do
       resolver._cold_timeout_ms = 120
       resolver._timeout_ms = 8000 -- must NOT be the one that governs here
       profile.clear()
+      local ds_before = fake_lsp.count(wedge_log.requests, "textDocument/documentSymbol")
       local done3, t3 = false, vim.uv.hrtime()
       resolver.extract(
         {
@@ -334,41 +417,40 @@ do
         ("waited %.0fms (cold=%d general=%d)"):format(waited, resolver._cold_timeout_ms, resolver._timeout_ms)
       )
 
-      -- The retry probe must send a WELL-FORMED request. Its first version
-      -- read `params` from inside the timeout closure while the local of
-      -- that name was declared below it, so the name resolved to a global --
-      -- nil -- and the probe sent documentSymbol with no textDocument. The
-      -- server rejected that in single-digit milliseconds and the probe
-      -- reported retry-failed, which read as evidence about the server when
-      -- it was evidence about this file. The wedge server swallows the
-      -- retry (never answers), so what this pins is the absence of the
-      -- instant `retry-failed` that only a malformed request produces.
+      -- A timeout neither cancels the request nor sends it again: its reply,
+      -- whenever it comes, is what the next look uses. The background retry
+      -- this replaced sent a second documentSymbol while the first was still
+      -- pending.
       vim.wait(500)
-      local saw_retry_failed = false
-      for _, e in ipairs(profile.events) do
-        if e.name == "extract:retry-failed" then
-          saw_retry_failed = true
-        end
-      end
       check(
-        "extract: the retry probe does not fail instantly on a malformed request",
-        not saw_retry_failed,
-        "extract:retry-failed recorded -- the probe's request is malformed again"
+        "extract: a timed-out request is sent once and not cancelled",
+        fake_lsp.count(wedge_log.requests, "textDocument/documentSymbol") == ds_before + 1
+          and fake_lsp.count(wedge_log.notifications, "$/cancelRequest") == 0,
+        wedge_log
       )
 
       -- A late answer must not be thrown away. A real kernel log showed a
       -- symbol whose first touch timed out costing another 89ms round trip
       -- on the next look, when the server's answer had arrived moments
-      -- after the timeout and was discarded. The server below swallows the
-      -- FIRST documentSymbol and answers every later one -- the same shape
-      -- as a preamble finishing just after the budget -- so the retry's
-      -- answer must land in the cache and the next fetch must be served
-      -- without a new request.
+      -- after the timeout and was discarded. The server below answers
+      -- documentSymbol only after the budget -- the shape of a preamble
+      -- finishing just after it -- so its answer must land in the cache and
+      -- the next fetch must be served without a new request.
+      local function wait_for_span(name)
+        return vim.wait(2000, function()
+          for _, e in ipairs(profile.events) do
+            if e.name == name then
+              return true
+            end
+          end
+          return false
+        end, 10)
+      end
       do
         local dpath3 = vim.fn.tempname() .. ".h"
         H.writef(dpath3, "static int late_fn(void)\n{\n    return 4;\n}\nstatic int after_late(void);\n")
         local uri3 = vim.uri_from_fname(vim.fn.resolve(dpath3))
-        local ds_count, swallowed = 0, false
+        local ds_count = 0
         vim.cmd.edit(dpath3)
         local src3 = vim.api.nvim_get_current_buf()
         local cid3 = fake_lsp.start({
@@ -382,9 +464,7 @@ do
           handle = function(method, _, callback)
             if method == "textDocument/documentSymbol" then
               ds_count = ds_count + 1
-              if ds_count == 1 then
-                swallowed = true -- first request: never answered
-              else
+              vim.defer_fn(function()
                 callback(nil, {
                   {
                     name = "late_fn",
@@ -398,15 +478,16 @@ do
                     },
                   },
                 })
-              end
+              end, 300)
             else
               callback(nil, nil)
             end
           end,
-          skip = "retry-cache checks (in-process LSP server unavailable)",
+          skip = "late-reply checks (in-process LSP server unavailable)",
         })
         if cid3 then
           resolver.clear_caches()
+          profile.clear()
           resolver._cold_timeout_ms = 100
           resolver._timeout_ms = 100
           local loc3 = {
@@ -422,18 +503,8 @@ do
           vim.wait(4000, function()
             return done4
           end, 5)
-          -- allow the retry round trip to land
-          vim.wait(2000, function()
-            return ds_count >= 2
-          end, 10)
-          vim.wait(200)
-          check(
-            "retry cache: the retry reached the server",
-            swallowed and ds_count >= 2,
-            ("ds_count=%d"):format(ds_count)
-          )
+          check("late reply: it is logged once it arrives", wait_for_span("extract:late"))
 
-          local before = ds_count
           local done5, lines5 = false, nil
           resolver.extract(loc3, src3, function(l)
             lines5 = l
@@ -443,37 +514,95 @@ do
             return done5
           end, 5)
           check(
-            "retry cache: the next fetch is served without a new request",
-            done5 and ds_count == before,
-            ("ds_count %d -> %d"):format(before, ds_count)
+            "late reply: the next fetch is served from it, one request in all",
+            done5 and ds_count == 1,
+            ("ds_count=%d"):format(ds_count)
           )
           check(
-            "retry cache: and returns the server's body, not the fallback",
+            "late reply: and returns the server's body, not the fallback",
             lines5 ~= nil and table.concat(lines5, "\n"):find("return 4", 1, true) ~= nil,
             vim.inspect(lines5)
           )
-          -- The retry parsed the reply on its own copy of the main path's
-          -- code, minus the end-exclusive trim: an end at character 0 kept
-          -- the next line, and the cache served it on every later look.
+          -- The retry this replaced parsed the reply on its own copy of the
+          -- main path's code, minus the end-exclusive trim: an end at
+          -- character 0 kept the next line, and the cache served it on every
+          -- later look.
           check(
-            "retry cache: an end-exclusive range does not drag in the next line",
+            "late reply: an end-exclusive range does not drag in the next line",
             lines5 ~= nil and #lines5 == 4 and not table.concat(lines5, "\n"):find("after_late", 1, true),
             vim.inspect(lines5)
           )
-          if cid3 then
-            vim.lsp.stop_client(cid3, true)
-          end
+          vim.lsp.stop_client(cid3, true)
         end
       end
-      -- A retry whose reply cannot be read is logged as retry-failed. The
-      -- label came from pcall's second value, which is the error message
-      -- when reading the reply raises, so a failed retry was logged as a
-      -- success.
+      -- A late reply belongs to the file as it was when asked: an edit made
+      -- while the request was out keeps it from being served, as it would
+      -- an answer in time. Read against the edited file, its range picks
+      -- other lines.
+      do
+        local dpath5 = vim.fn.tempname() .. ".h"
+        H.writef(dpath5, "static int edited_fn(void)\n{\n    return 6;\n}\n")
+        local uri5 = vim.uri_from_fname(vim.fn.resolve(dpath5))
+        local ds5 = 0
+        vim.cmd.edit(dpath5)
+        local src5 = vim.api.nvim_get_current_buf()
+        local cid5 = fake_lsp.start({
+          name = "edited",
+          buf = src5,
+          root_dir = vim.fn.fnamemodify(dpath5, ":h"),
+          capabilities = { documentSymbolProvider = true, workspaceSymbolProvider = true },
+          handle = function(method, _, callback)
+            if method == "textDocument/documentSymbol" then
+              ds5 = ds5 + 1
+              vim.defer_fn(function()
+                callback(
+                  nil,
+                  { { name = "edited_fn", kind = 12, range = range(0, 0, 4, 0), selectionRange = range(0, 11, 0, 20) } }
+                )
+              end, 300)
+            else
+              callback(nil, nil)
+            end
+          end,
+          skip = "edited late-reply checks (in-process LSP server unavailable)",
+        })
+        if cid5 then
+          resolver.clear_caches()
+          profile.clear()
+          resolver._cold_timeout_ms = 100
+          resolver._timeout_ms = 100
+          local loc5 = { uri = uri5, range = range(0, 11, 0, 20), kind = 12, name = "edited_fn" }
+          local asked, asked_again = false, false
+          resolver.extract(loc5, src5, function()
+            asked = true
+          end)
+          vim.wait(4000, function()
+            return asked
+          end, 5)
+          vim.api.nvim_buf_set_lines(src5, 0, 0, false, { "// a line above" })
+          wait_for_span("extract:late")
+          profile.clear()
+          resolver.extract(loc5, src5, function()
+            asked_again = true
+          end)
+          vim.wait(4000, function()
+            return asked_again
+          end, 5)
+          check(
+            "late reply: an edit made while it was out keeps it from being served",
+            ds5 == 2 and not wait_for_span("extract:cached"),
+            ("documentSymbol requests: %d"):format(ds5)
+          )
+          vim.lsp.stop_client(cid5, true)
+        end
+      end
+      -- A late reply that cannot be read is logged as such, not as one that
+      -- filled the cache. The label once came from pcall's second value,
+      -- which is the error message when reading the reply raises.
       do
         local dpath4 = vim.fn.tempname() .. ".h"
         H.writef(dpath4, "static int bad_fn(void)\n{\n    return 5;\n}\n")
         local uri4 = vim.uri_from_fname(vim.fn.resolve(dpath4))
-        local ds4 = 0
         vim.cmd.edit(dpath4)
         local src4 = vim.api.nvim_get_current_buf()
         local cid4 = fake_lsp.start({
@@ -486,17 +615,15 @@ do
           },
           handle = function(method, _, callback)
             if method == "textDocument/documentSymbol" then
-              ds4 = ds4 + 1
-              -- The first request is never answered; the retry gets a
-              -- symbol whose ranges have no positions.
-              if ds4 > 1 then
+              -- After the budget, a symbol whose ranges have no positions.
+              vim.defer_fn(function()
                 callback(nil, { { name = "bad_fn", kind = 12, range = {}, selectionRange = {} } })
-              end
+              end, 300)
             else
               callback(nil, nil)
             end
           end,
-          skip = "malformed-retry checks (in-process LSP server unavailable)",
+          skip = "malformed late-reply checks (in-process LSP server unavailable)",
         })
         if cid4 then
           resolver.clear_caches()
@@ -519,18 +646,15 @@ do
           vim.wait(4000, function()
             return done6
           end, 5)
-          vim.wait(2000, function()
-            return ds4 >= 2
-          end, 10)
-          vim.wait(200)
+          local unusable = wait_for_span("extract:late-unusable")
           local labels = {}
           for _, e in ipairs(profile.events) do
             labels[e.name] = true
           end
           check(
-            "retry: a reply that cannot be read is logged as retry-failed",
-            ds4 >= 2 and labels["extract:retry-failed"] and not labels["extract:retry-after-timeout"],
-            ("ds4=%d labels=%s"):format(ds4, vim.inspect(vim.tbl_keys(labels)))
+            "late reply: one that cannot be read is logged as unusable",
+            unusable and not labels["extract:late"],
+            vim.tbl_keys(labels)
           )
           vim.lsp.stop_client(cid4, true)
         end
@@ -1030,6 +1154,429 @@ do
   end
 end
 
+-- Replies that come late, or never. A workspace/symbol reply after the
+-- deadline is not cancelled but cached, so that a server slower than the
+-- budget still answers the next lookup without being asked again; before, a
+-- slower server could never succeed. A definition request the chase gave up
+-- on is cancelled, so the server can drop the work.
+do
+  local lpath = vim.fn.tempname() .. ".c"
+  H.writef(lpath, "int slow_fn(int a);\nint slow_fn(int a)\n{\n    return a;\n}\n")
+  vim.cmd.edit(lpath)
+  local lbuf = vim.api.nvim_get_current_buf()
+  local luri = vim.uri_from_bufnr(lbuf)
+  local lcid, llog = fake_lsp.start({
+    name = "slow",
+    buf = lbuf,
+    root_dir = vim.fn.fnamemodify(lpath, ":h"),
+    capabilities = { workspaceSymbolProvider = true, definitionProvider = true },
+    handle = function(method, _, callback)
+      if method == "workspace/symbol" then
+        vim.defer_fn(function()
+          callback(nil, { { name = "slow_fn", kind = 12, location = { uri = luri, range = range(0, 4, 0, 11) } } })
+        end, 600)
+      end -- definition: never answered
+    end,
+    skip = "late-reply checks (in-process LSP server unavailable)",
+  })
+  if lcid then
+    resolver.clear_caches()
+    local saved = resolver._timeout_ms
+    resolver._timeout_ms = 300
+    local function locate()
+      local done, loc, err = false, nil, nil
+      resolver.locate("slow_fn", lbuf, function(l, e)
+        loc, err, done = l, e, true
+      end)
+      vim.wait(3000, function()
+        return done
+      end, 5)
+      return loc, err
+    end
+    local first, first_err = locate()
+    check("late reply: the first lookup times out", first == nil and tostring(first_err):find("timed out") ~= nil, {
+      first,
+      first_err,
+    })
+    vim.wait(600)
+    local second = locate()
+    check(
+      "late reply: the next lookup gets the late answer without asking again",
+      second ~= nil
+        and second.uri == luri
+        and fake_lsp.count(llog.requests, "workspace/symbol") == 1
+        and fake_lsp.count(llog.notifications, "$/cancelRequest") == 0,
+      { second = second, log = llog }
+    )
+
+    local chased
+    resolver._chase_definition({ uri = luri, range = range(0, 4, 0, 11), name = "slow_fn" }, lbuf, function(d)
+      chased = d or false
+    end)
+    vim.wait(3000, function()
+      return chased ~= nil
+    end, 5)
+    vim.wait(100)
+    local pending = 0
+    for _, r in pairs(vim.lsp.get_client_by_id(lcid).requests) do
+      pending = pending + ((r.type == "pending") and 1 or 0)
+    end
+    check(
+      "chase: a definition request that timed out is cancelled",
+      chased == false and fake_lsp.count(llog.notifications, "$/cancelRequest") == 1 and pending == 0,
+      { notifications = llog.notifications, pending = pending }
+    )
+    resolver._timeout_ms = saved
+    resolver.clear_caches()
+    vim.lsp.stop_client(lcid, true)
+  end
+end
+
+-- Two servers on one buffer: "found" knows the symbol, "hung" accepts every
+-- request and answers none. The lookup must not wait for "hung" past its
+-- deadline, and everything asked about the symbol afterwards goes to the
+-- server that found it -- not to the other one, and not to an arbitrary
+-- first client.
+do
+  local dir = H.tmpdir()
+  H.writef(dir .. "/api.h", "int two_fn(int a);\n")
+  H.writef(dir .. "/impl.c", "int two_fn(int a)\n{\n    return a;\n}\n")
+  local huri = vim.uri_from_fname(vim.fn.resolve(dir .. "/api.h"))
+  local curi = vim.uri_from_fname(vim.fn.resolve(dir .. "/impl.c"))
+  vim.cmd.edit(dir .. "/use.c")
+  local ubuf = vim.api.nvim_get_current_buf()
+  local asked = { found = {}, hung = {} }
+  local function count(server, method)
+    asked[server][method] = (asked[server][method] or 0) + 1
+  end
+  local caps = { workspaceSymbolProvider = true, documentSymbolProvider = true, definitionProvider = true }
+  -- Started first, so that it is the first client of the buffer.
+  local hung_id, hung_log = fake_lsp.start({
+    name = "hung",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method)
+      count("hung", method)
+    end,
+    skip = "two-server checks (in-process LSP server unavailable)",
+  })
+  local found_id = fake_lsp.start({
+    name = "found",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method, _, callback)
+      count("found", method)
+      if method == "workspace/symbol" then
+        callback(nil, { { name = "two_fn", kind = 12, location = { uri = huri, range = range(0, 4, 0, 10) } } })
+      elseif method == "textDocument/definition" then
+        callback(nil, { { uri = curi, range = range(0, 4, 0, 10) } })
+      elseif method == "textDocument/documentSymbol" then
+        callback(nil, {})
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "two-server checks (in-process LSP server unavailable)",
+  })
+  if hung_id and found_id then
+    resolver.clear_caches()
+    local saved_t, saved_c, saved_lf = resolver._timeout_ms, resolver._cold_timeout_ms, resolver._local_first
+    resolver._timeout_ms, resolver._cold_timeout_ms = 300, 300
+    local done, loc, lerr = false, nil, nil
+    resolver.locate("two_fn", ubuf, function(l, e)
+      loc, lerr, done = l, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 5)
+    check(
+      "two servers: at the deadline, the answer that arrived is used",
+      loc ~= nil and loc.uri == huri,
+      { loc = loc, err = lerr }
+    )
+    check("two servers: the loc records the server that found it", loc ~= nil and loc.client_id == found_id, loc)
+    vim.wait(100)
+    check(
+      "two servers: once the answer is known, the silent server's request is cancelled",
+      hung_log and fake_lsp.count(hung_log.notifications, "$/cancelRequest") == 1,
+      hung_log and hung_log.notifications
+    )
+
+    -- The loc locate returns, so that the checks below do not depend on it.
+    local found_loc = {
+      uri = huri,
+      range = range(0, 4, 0, 10),
+      kind = 12,
+      name = "two_fn",
+      client_id = found_id,
+    }
+    do
+      -- The server path, so that documentSymbol is asked at all.
+      resolver._local_first = false
+      local got = false
+      resolver.extract(found_loc, ubuf, function()
+        got = true
+      end)
+      vim.wait(3000, function()
+        return got
+      end, 5)
+      local hbuf = vim.uri_to_bufnr(huri)
+      check(
+        "two servers: documentSymbol goes only to the server that found the symbol",
+        got and asked.found["textDocument/documentSymbol"] == 1 and asked.hung["textDocument/documentSymbol"] == nil,
+        asked
+      )
+      check(
+        "two servers: only that server is attached to the definition file",
+        vim.lsp.buf_is_attached(hbuf, found_id) and not vim.lsp.buf_is_attached(hbuf, hung_id),
+        vim.tbl_map(function(c)
+          return c.name
+        end, vim.lsp.get_clients({ bufnr = hbuf }))
+      )
+
+      local chased
+      pcall(resolver._chase_definition, found_loc, ubuf, function(dloc)
+        chased = dloc or false
+      end)
+      vim.wait(3000, function()
+        return chased ~= nil
+      end, 5)
+      check(
+        "two servers: the chase asks only the server that found the symbol",
+        chased and chased.uri == curi and asked.hung["textDocument/definition"] == nil,
+        { chased = chased, asked = asked }
+      )
+      check(
+        "two servers: the chased loc records the server that answered",
+        chased and chased.client_id == found_id,
+        chased
+      )
+    end
+    resolver._timeout_ms, resolver._cold_timeout_ms, resolver._local_first = saved_t, saved_c, saved_lf
+    resolver.clear_caches()
+  end
+  for _, id in ipairs({ hung_id, found_id }) do
+    vim.lsp.stop_client(id, true)
+  end
+  vim.wait(1000, function()
+    return #vim.lsp.get_clients({ bufnr = ubuf }) == 0
+  end, 10)
+end
+
+-- A server attached to the buffer that cannot answer workspace/symbol is no
+-- server for locate. Asking anyway sent nothing, raised Neovim's own "not
+-- supported" error, and reported a timeout once the whole budget had passed.
+do
+  local npath = vim.fn.tempname() .. ".c"
+  H.writef(npath, "int nows_fn(void)\n{\n    return 1;\n}\n")
+  vim.cmd.edit(npath)
+  local nbuf = vim.api.nvim_get_current_buf()
+  local requests = 0
+  local ncid = fake_lsp.start({
+    name = "nows",
+    buf = nbuf,
+    root_dir = vim.fn.fnamemodify(npath, ":h"),
+    capabilities = { hoverProvider = true },
+    handle = function(_, _, callback)
+      requests = requests + 1
+      callback(nil, nil)
+    end,
+    skip = "unsupported-method checks (in-process LSP server unavailable)",
+  })
+  if ncid then
+    resolver.clear_caches()
+    local saved = resolver._timeout_ms
+    resolver._timeout_ms = 10000
+    local notes = {}
+    local orig_notify = vim.notify
+    vim.notify = function(msg)
+      notes[#notes + 1] = tostring(msg)
+    end
+    local done, loc, lerr, t0 = false, nil, nil, vim.uv.hrtime()
+    resolver.locate("nows_fn", nbuf, function(l, e)
+      loc, lerr, done = l, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 5)
+    local waited = (vim.uv.hrtime() - t0) / 1e6
+    vim.notify = orig_notify
+    resolver._timeout_ms = saved
+    check(
+      "locate: no server supporting workspace/symbol fails at once, not at the deadline",
+      done and loc == nil and waited < 2000,
+      ("done=%s waited=%.0fms"):format(tostring(done), waited)
+    )
+    check(
+      "locate: the error names the missing method and the server attached",
+      tostring(lerr):find("workspace/symbol", 1, true) ~= nil and tostring(lerr):find("nows", 1, true) ~= nil,
+      tostring(lerr)
+    )
+    check(
+      "locate: nothing is sent, and Neovim reports no error of its own",
+      requests == 0 and #notes == 0,
+      { requests = requests, notes = notes }
+    )
+    vim.lsp.stop_client(ncid, true)
+  end
+end
+
+-- Definition files: a server is attached to one only right before it is
+-- asked about it, and eviction from the attach cache puts the file back as
+-- it was. Every extract used to attach the file, and so open it in the
+-- server, even when tree-sitter answered locally; with a FileType autostart
+-- the files stayed open for good, since the cache only recorded files whose
+-- clients it had attached itself.
+do
+  local dir = H.tmpdir()
+  local function header(name)
+    local path = dir .. "/" .. name .. ".h"
+    H.writef(path, "static int " .. name .. "(void)\n{\n    return 1;\n}\n")
+    return path
+  end
+  local function loc_of(path, name)
+    return { uri = vim.uri_from_fname(path), range = range(0, 11, 0, 11 + #name), name = name, kind = 12 }
+  end
+  H.writef(dir .. "/src.c", "int main(void) { return 0; }\n")
+  vim.cmd.edit(dir .. "/src.c")
+  local sbuf = vim.api.nvim_get_current_buf()
+  local cid, log = fake_lsp.start({
+    name = "files",
+    buf = sbuf,
+    root_dir = dir,
+    capabilities = { documentSymbolProvider = true, textDocumentSync = { openClose = true, change = 1 } },
+    handle = function(method, params, callback)
+      if method == "textDocument/documentSymbol" then
+        local name = vim.fn.fnamemodify(vim.uri_to_fname(params.textDocument.uri), ":t:r")
+        callback(nil, { { name = name, kind = 12, range = range(0, 0, 3, 1), selectionRange = range(0, 11, 0, 11) } })
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "definition-file checks (in-process LSP server unavailable)",
+  })
+  local function extract(path, name)
+    local got
+    resolver.extract(loc_of(path, name), sbuf, function(lines)
+      got = lines
+    end)
+    vim.wait(3000, function()
+      return got ~= nil
+    end, 5)
+    vim.wait(50) -- let didOpen/didClose land
+    return vim.fn.bufnr(path)
+  end
+  local function opened(path, method)
+    local uri = vim.uri_from_fname(path)
+    local n = 0
+    for _, e in ipairs(log.notifications) do
+      if e.method == method and e.params.textDocument.uri == uri then
+        n = n + 1
+      end
+    end
+    return n
+  end
+  if cid then
+    resolver.clear_caches()
+    local saved_cap, saved_lf = resolver._attach_cache_max, resolver._local_first
+    resolver._attach_cache_max = 1
+
+    local a = header("lazy_a")
+    local abuf = extract(a, "lazy_a")
+    check(
+      "definition files: a local extraction attaches no server",
+      vim.api.nvim_buf_is_loaded(abuf)
+        and not vim.lsp.buf_is_attached(abuf, cid)
+        and opened(a, "textDocument/didOpen") == 0,
+      log.notifications
+    )
+
+    resolver._local_first = false
+    local b = header("lazy_b")
+    local bbuf = extract(b, "lazy_b")
+    check(
+      "definition files: the server is attached right before it is asked",
+      vim.lsp.buf_is_attached(bbuf, cid) and opened(b, "textDocument/didOpen") == 1,
+      log.notifications
+    )
+    check(
+      "definition files: a file this loaded is unloaded on eviction",
+      not vim.api.nvim_buf_is_loaded(abuf),
+      { a_loaded = vim.api.nvim_buf_is_loaded(abuf) }
+    )
+
+    local c = header("lazy_c")
+    extract(c, "lazy_c")
+    check(
+      "definition files: unloading closes the file in the server",
+      not vim.api.nvim_buf_is_loaded(bbuf) and opened(b, "textDocument/didClose") == 1,
+      log.notifications
+    )
+
+    -- A file the user has open (listed) is only detached, and without the
+    -- "Cannot detach" message when the client went away from it meanwhile.
+    local d = header("lazy_d")
+    vim.cmd.edit(d)
+    vim.cmd.edit(dir .. "/src.c")
+    local dbuf = vim.fn.bufnr(d)
+    extract(d, "lazy_d")
+    local attached_d = vim.lsp.buf_is_attached(dbuf, cid)
+    vim.lsp.buf_detach_client(dbuf, cid)
+    local notes = {}
+    local orig_notify = vim.notify
+    vim.notify = function(msg)
+      notes[#notes + 1] = tostring(msg)
+    end
+    extract(header("lazy_e"), "lazy_e")
+    vim.notify = orig_notify
+    check(
+      "definition files: a file the user has open stays loaded, and eviction says nothing",
+      attached_d and vim.api.nvim_buf_is_loaded(dbuf) and #notes == 0,
+      { attached_d = attached_d, notes = notes }
+    )
+
+    -- A file a reading view reads from keeps its server: the view looks
+    -- names up through it.
+    local f = header("lazy_f")
+    local fbuf = extract(f, "lazy_f")
+    local v = require("inline-explorer.view").open(fbuf) -- shown, not fbuf
+    extract(header("lazy_g"), "lazy_g")
+    check(
+      "definition files: the source of a reading view is left alone",
+      vim.api.nvim_buf_is_loaded(fbuf) and vim.lsp.buf_is_attached(fbuf, cid),
+      { loaded = vim.api.nvim_buf_is_loaded(fbuf) }
+    )
+    vim.cmd.edit(dir .. "/src.c")
+    pcall(vim.api.nvim_buf_delete, v, { force = true })
+
+    -- With an autostart, loading the file attaches the server. The plugin
+    -- attaches nothing then, but it loaded the file, so eviction still
+    -- unloads it and the server closes it.
+    resolver._local_first = true
+    vim.api.nvim_create_autocmd("BufReadPost", {
+      pattern = dir .. "/auto_*.h",
+      callback = function(ev)
+        vim.lsp.buf_attach_client(ev.buf, cid)
+      end,
+    })
+    local h1, h2 = header("auto_one"), header("auto_two")
+    local h1buf = extract(h1, "auto_one")
+    local autostarted = vim.lsp.buf_is_attached(h1buf, cid)
+    extract(h2, "auto_two")
+    check(
+      "definition files: a file an autostart opened is closed once evicted",
+      autostarted and not vim.api.nvim_buf_is_loaded(h1buf) and opened(h1, "textDocument/didClose") == 1,
+      { autostarted = autostarted, notifications = log.notifications }
+    )
+
+    resolver._attach_cache_max, resolver._local_first = saved_cap, saved_lf
+    resolver.clear_caches()
+    vim.lsp.stop_client(cid, true)
+  end
+end
+
 -- Position encodings. LSP `character` counts in the encoding negotiated
 -- with the server (utf-16 unless it says otherwise; clangd says utf-8);
 -- cursor columns and tree-sitter count bytes. Every check below sits on a
@@ -1045,6 +1592,13 @@ do
   check(
     "encoding: utf-8 and nil are bytes already",
     util.byte_col(line, 9, "utf-8") == 9 and util.lsp_col(line, 9, nil) == 9
+  )
+  check(
+    "encoding: a column past the end is the line's end, in every encoding",
+    util.byte_col(line, 99, "utf-8") == #line
+      and util.byte_col(line, 99, "utf-16") == #line
+      and util.lsp_col(line, 99, nil) == #line
+      and util.lsp_col(line, 99, "utf-16") == 9
   )
 
   local epath = vim.fn.tempname() .. ".c"

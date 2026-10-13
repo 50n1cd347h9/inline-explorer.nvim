@@ -38,7 +38,7 @@ do
   check("simple+plain: ctx.unconditional", p.ctx.unconditional == true, p.ctx)
   check("simple+plain: ctx.can_insert_above", p.ctx.can_insert_above == true, p.ctx)
   check("simple+plain: decision pretty", p.decision == "pretty", p.decision)
-  check("ir.ret_type reconstructed", p.ir.ret_type == "int", p.ir.ret_type)
+  check("ir.ret_decl reconstructed", p.ir.ret_decl == "int __ie_ret1", p.ir.ret_decl)
   check("ir.has_value", p.ir.has_value == true)
 end
 
@@ -67,6 +67,37 @@ do
     "acc"
   ))
   check("ternary: decision canonical", p.decision == "canonical", p.decision)
+end
+
+-- A call that may not run, or runs after other code in its statement, is not
+-- hoisted. An argument of an ordinary call still is.
+do
+  local shapes = {
+    { "int r = sizeof(acc(n));", "canonical" },
+    { "int r = _Generic(acc(n), int: 1, default: 0);", "canonical" },
+    { "int r = (n = 1, acc(n));", "canonical" },
+    { "int a = n, r = acc(a);", "canonical" },
+    { "int r = __builtin_constant_p(acc(n));", "canonical" },
+    { "__typeof__(acc(n) + 1) *p = 0;", "canonical" },
+    { "int r = acc(n), s = 1;", "pretty" },
+    { "int r = __builtin_expect(acc(n), 1);", "pretty" },
+  }
+  for _, sh in ipairs(shapes) do
+    local p =
+      assert(S._probe(("static int caller(int n)\n{\n    %s\n    return 0;\n}"):format(sh[1]), simple_callee, "acc"))
+    check(("hoist guard: `%s` -> %s"):format(sh[1], sh[2]), p.decision == sh[2], p.decision)
+  end
+end
+
+-- A target that does not parse cleanly gets the in-place form in both modes:
+-- WHEN may hide an `if`.
+do
+  local caller = "static int caller(int n)\n{\n    int x = 0;\n    WHEN(n > 0) x = acc(n);\n    return x;\n}"
+  for _, mode in ipairs({ "correct", "readable" }) do
+    local p = assert(S._probe(caller, simple_callee, "acc", 1, mode))
+    check("misparsed target, " .. mode .. ": ctx.parse_error", p.ctx.parse_error == true, p.ctx)
+    check("misparsed target, " .. mode .. ": decision canonical", p.decision == "canonical", p.decision)
+  end
 end
 
 -- Multi-return callee -> canonical in correct mode, readable_multi in readable.

@@ -7,9 +7,9 @@
 -- GRACE_MS (the grace window) discards a late matching applyEdit rather than
 -- let it edit the source buffer.
 
+local async = require("inline-explorer.async")
 local csrc = require("inline-explorer.csrc")
 local profile = require("inline-explorer.profile")
-local resolver = require("inline-explorer.resolver")
 local simplify = require("inline-explorer.simplify")
 local util = require("inline-explorer.util")
 
@@ -116,7 +116,8 @@ function M.replace_in_src(src, row, col, exp_lines, root)
   return src:sub(1, csrc.start_byte(invocation)) .. rep .. src:sub(csrc.end_byte(invocation) + 1)
 end
 
-local TWEAK_TIMEOUT_MS = 2000
+-- Budget for the tweak (codeAction through applyEdit), and again for the hover.
+local TIMEOUT_MS = 2000
 
 ---@param actions any
 ---@return lsp.Command? cmd the command of the "Expand macro" action in a codeAction reply
@@ -153,6 +154,22 @@ local function pos_in_range(pos, range)
     return false
   end
   return at_or_after(pos, range.start) and at_or_after(range["end"], pos)
+end
+
+-- The edit that replaces the text at `pos`, else one that ends or inserts
+-- there. clangd formats the tweak's output, so the expansion can come with
+-- whitespace edits around it, and an edit's place in the list means nothing.
+local function edit_at(edits, pos)
+  local touching
+  for _, e in ipairs(edits) do
+    if type(e) == "table" and pos_in_range(pos, e.range) then
+      if not at_or_after(pos, e.range["end"]) then
+        return e
+      end
+      touching = touching or e
+    end
+  end
+  return touching
 end
 
 -- The text edits of `workspace_edit`, if it edits document `uri` and nothing
@@ -196,21 +213,17 @@ local function edit_matches(workspace_edit, uri, pos)
   if type(edits) ~= "table" then
     return false
   end
-  for _, e in ipairs(edits) do
-    if type(e) == "table" and pos_in_range(pos, e.range) then
-      return true
-    end
-  end
-  return false
+  return edit_at(edits, pos) ~= nil
 end
 
--- The newText of the first text edit for `uri`, without blank edge lines. It
--- reads only edits that edit_matches accepted, so other documents are not
--- checked again.
+-- The newText of the edit at `pos` in document `uri` (see edit_at), without
+-- blank edge lines. It reads only edits that edit_matches accepted, so other
+-- documents are not checked again.
 ---@param workspace_edit lsp.WorkspaceEdit?
 ---@param uri string
+---@param pos lsp.Position
 ---@return string[]? lines nil when there is no text
-local function edit_lines(workspace_edit, uri)
+local function edit_lines(workspace_edit, uri, pos)
   if type(workspace_edit) ~= "table" then
     return nil
   end
@@ -225,10 +238,11 @@ local function edit_lines(workspace_edit, uri)
       end
     end
   end
-  if type(edits) ~= "table" or #edits == 0 or type(edits[1].newText) ~= "string" then
+  local edit = type(edits) == "table" and edit_at(edits, pos)
+  if not edit or type(edit.newText) ~= "string" then
     return nil
   end
-  local out = trim_blank_lines(vim.split(edits[1].newText, "\n", { plain = true }))
+  local out = trim_blank_lines(vim.split(edit.newText, "\n", { plain = true }))
   if #out == 0 then
     return nil
   end
@@ -362,15 +376,23 @@ local function source_position(bufnr, row, col, client)
   return { line = row, character = util.lsp_col(line, col, client.offset_encoding) }
 end
 
+-- The server with the tweak (clangd), if it supports `method`. Only its hover
+-- shows an expansion, and other servers' replies could hide it.
+local function expansion_client(bufnr, method)
+  for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr, method = method })) do
+    if M.supports_tweak(client) then
+      return client
+    end
+  end
+  return nil
+end
+
 -- Calls cb(lines) exactly once, with nil on any failure (no clangd or tweak, a
 -- request error, the timeout) so that the caller can fall back.
 local function fetch_via_tweak(bufnr, row, col, cb)
   prune_dead_clients()
-  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd" })[1]
+  local client = expansion_client(bufnr, "textDocument/codeAction")
   if not client then
-    return cb(nil)
-  end
-  if not M.supports_tweak(client) then
     return cb(nil)
   end
 
@@ -378,6 +400,7 @@ local function fetch_via_tweak(bufnr, row, col, cb)
 
   local uri = vim.uri_from_bufnr(bufnr)
   local pos = source_position(bufnr, row, col, client)
+  local deadline = vim.uv.now() + TIMEOUT_MS
 
   local claim -- set once codeAction offers the tweak
   local finished = false
@@ -392,61 +415,42 @@ local function fetch_via_tweak(bufnr, row, col, cb)
     end
     cb(lines)
   end
-  vim.defer_fn(function()
-    finish(nil)
-  end, TWEAK_TIMEOUT_MS)
+
+  local function on_actions(err, actions)
+    local cmd = not err and pick_expand_action(actions)
+    if not cmd then
+      return finish(nil)
+    end
+    -- Before executeCommand: clangd sends the applyEdit first and replies
+    -- only once it is answered, so the reply comes after our claim took the
+    -- edit, if it did, and ends the fetch either way.
+    claim = {
+      uri = uri,
+      pos = pos,
+      on_edit = function(edit)
+        finish(edit_lines(edit, uri, pos))
+      end,
+    }
+    add_claim(client.id, claim)
+    local exec_params = { command = cmd.command, arguments = cmd.arguments }
+    local remaining = math.max(deadline - vim.uv.now(), 0)
+    async.request(client, "workspace/executeCommand", exec_params, bufnr, remaining, function()
+      finish(nil)
+    end)
+  end
 
   local code_action_params = {
     textDocument = { uri = uri },
     range = { start = pos, ["end"] = pos },
     context = { diagnostics = {} },
   }
-  local sent = resolver.client_request(client, "textDocument/codeAction", code_action_params, function(err, actions)
-    if finished then
-      return
-    end
-    if err then
-      return finish(nil)
-    end
-    local cmd = pick_expand_action(actions)
-    if not cmd then
-      return finish(nil)
-    end
-
-    -- Before executeCommand: clangd sends the applyEdit before it replies.
-    claim = {
-      uri = uri,
-      pos = pos,
-      on_edit = function(edit)
-        finish(edit_lines(edit, uri))
-      end,
-    }
-    add_claim(client.id, claim)
-
-    local exec_sent = resolver.client_request(client, "workspace/executeCommand", {
-      command = cmd.command,
-      arguments = cmd.arguments,
-    }, function(exec_err)
-      -- A success reply carries no edit and follows the applyEdit, which has
-      -- ended the fetch if our claim took it; otherwise the timeout will.
-      if exec_err then
-        finish(nil)
-      end
-    end, bufnr)
-    if not exec_sent then
-      finish(nil)
-    end
-  end, bufnr)
-  if not sent then
-    finish(nil)
-  end
+  async.request(client, "textDocument/codeAction", code_action_params, bufnr, TIMEOUT_MS, on_actions)
 end
 
--- Calls cb(lines) once, with expansion_lines' result, or nil with no hover.
+-- Calls cb(lines) once, with expansion_lines' result, or nil with no hover,
+-- an error or the timeout.
 local function fetch_via_hover(bufnr, row, col, cb)
-  -- clangd's position encoding is needed, and with no client attached,
-  -- buf_request_all would never call back.
-  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd" })[1]
+  local client = expansion_client(bufnr, "textDocument/hover")
   if not client then
     return cb(nil)
   end
@@ -454,19 +458,13 @@ local function fetch_via_hover(bufnr, row, col, cb)
     textDocument = { uri = vim.uri_from_bufnr(bufnr) },
     position = source_position(bufnr, row, col, client),
   }
-  vim.lsp.buf_request_all(bufnr, "textDocument/hover", params, function(results)
-    local md
-    for _, r in pairs(results or {}) do
-      if r.result and r.result.contents then
-        md = hover_markdown(r.result.contents)
-        break
-      end
-    end
-    local lines
+  async.request(client, "textDocument/hover", params, bufnr, TIMEOUT_MS, function(err, result)
+    local contents = not err and type(result) == "table" and result.contents
+    local md = contents and hover_markdown(contents)
     if md and md ~= "" then
-      lines = expansion_lines(md)
+      return cb(expansion_lines(md))
     end
-    cb(lines)
+    cb(nil)
   end)
 end
 

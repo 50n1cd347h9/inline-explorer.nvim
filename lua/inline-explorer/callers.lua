@@ -4,6 +4,7 @@
 -- while grep sees calls written anywhere, in #if 0 blocks and macro arguments
 -- too (but not in #define bodies), and cannot tell same-named static functions
 -- apart.
+local async = require("inline-explorer.async")
 local csrc = require("inline-explorer.csrc")
 local resolver = require("inline-explorer.resolver")
 
@@ -17,7 +18,8 @@ local M = {}
 ---@field text string the call's line, trimmed
 ---@field encoding? string the server's offset encoding; nil (grep) means bytes
 
--- How long the call hierarchy requests may take before grep starts as well.
+-- How long the call hierarchy requests may take, together, before grep
+-- answers instead.
 M._timeout_ms = 4000
 -- The most grep hits checked; with more, the answer is marked as truncated.
 M._grep_max = 200
@@ -27,7 +29,10 @@ local function sort_items(items)
     if a.uri ~= b.uri then
       return a.uri < b.uri
     end
-    return a.range.start.line < b.range.start.line
+    if a.range.start.line ~= b.range.start.line then
+      return a.range.start.line < b.range.start.line
+    end
+    return a.range.start.character < b.range.start.character
   end)
   return items
 end
@@ -43,37 +48,49 @@ local function trimmed_line(path, lnum0)
   return text and vim.trim(text) or ""
 end
 
+-- The 1-based columns of the hits on one line of grep output: rg --vimgrep
+-- prints file:line:col:text, one line per match; grep -rnw prints
+-- file:line:text, one line per matching line, so every match in the text
+-- is a hit.
+local function grep_line(line, name)
+  local file, lnum, col = line:match("^(.-):(%d+):(%d+):")
+  if file then
+    return file, lnum, { tonumber(col) }
+  end
+  local text
+  file, lnum, text = line:match("^(.-):(%d+):(.*)$")
+  if not file then
+    return nil, nil, {}
+  end
+  local cols = {}
+  for start in text:gmatch("()%f[%w_]" .. vim.pesc(name) .. "%f[^%w_]") do
+    cols[#cols + 1] = start
+  end
+  return file, lnum, cols
+end
+
 -- The hits by path, with 0-based lines and byte columns. Keeps the first
 -- M._grep_max hits; `truncated` says whether there were more.
 local function parse_grep_output(stdout, name)
-  local hits_by_file, count, truncated = {}, 0, false
+  local hits_by_file, count = {}, 0
   for line in stdout:gmatch("[^\n]+") do
-    -- rg --vimgrep prints file:line:col:text; grep -rnw prints file:line:text.
-    local file, lnum, col = line:match("^(.-):(%d+):(%d+):")
-    if not file then
-      local text
-      file, lnum, text = line:match("^(.-):(%d+):(.*)$")
-      -- grep prints no column, and tree-sitter confirmation needs one inside the
-      -- call (column 1 of an indented line is whitespace), so find the name.
-      if file and text then
-        local start = text:find("%f[%w_]" .. vim.pesc(name) .. "%f[^%w_]")
-        col = start or 1 -- 1-based, like rg's column
-      end
-    end
+    local file, lnum, cols = grep_line(line, name)
     if file then
-      count = count + 1
-      if count > M._grep_max then
-        truncated = true
-        break
+      for _, col in ipairs(cols) do
+        count = count + 1
+        if count > M._grep_max then
+          return hits_by_file, true
+        end
+        hits_by_file[file] = hits_by_file[file] or {}
+        table.insert(hits_by_file[file], { lnum = tonumber(lnum) - 1, col = col - 1 })
       end
-      hits_by_file[file] = hits_by_file[file] or {}
-      table.insert(hits_by_file[file], { lnum = tonumber(lnum) - 1, col = tonumber(col) - 1 })
     end
   end
-  return hits_by_file, truncated
+  return hits_by_file, false
 end
 
--- Adds to `items` the hits whose innermost call_expression calls `name`.
+-- Adds to `items` the hits that are the callee of a call of `name`. A hit
+-- elsewhere in a call (in an argument, a comment or a string) is not one.
 local function add_confirmed_calls(items, file, hits, name)
   local read_ok, file_lines = pcall(vim.fn.readfile, file)
   if not read_ok then
@@ -84,10 +101,13 @@ local function add_confirmed_calls(items, file, hits, name)
   if not parsed then
     return
   end
+  local callee_at = {}
+  for _, call in ipairs(csrc.find_calls(tree_root, src, name)) do
+    local row, col = call:field("function")[1]:start()
+    callee_at[row .. ":" .. col] = true
+  end
   for _, hit in ipairs(hits) do
-    local call = csrc.ancestor_at(tree_root, hit.lnum, hit.col, "call_expression")
-    local callee = call and call:field("function")[1]
-    if callee and csrc.text(callee, src) == name then
+    if callee_at[hit.lnum .. ":" .. hit.col] then
       local caller_def = csrc.ancestor_at(tree_root, hit.lnum, hit.col, "function_definition")
       items[#items + 1] = {
         name = caller_def and csrc.function_name(caller_def, src) or "?",
@@ -165,58 +185,42 @@ local function items_from_calls(calls, encoding)
   return items
 end
 
--- prepareCallHierarchy, then incomingCalls. Grep answers instead on an error or
--- an empty answer. After M._timeout_ms grep starts as well, and the first answer
--- wins. Calls cb once.
+-- prepareCallHierarchy, then incomingCalls. Grep answers instead on an error,
+-- an empty answer or a timeout, which also cancels the request. Calls cb once.
 local function call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
-  -- Not async.once_with_timeout: that needs the timeout's result at once, but
-  -- the grep started on a timeout answers later.
-  local answered = false
-  local function finish(items, provider, note)
-    if answered then
-      return
-    end
-    answered = true
-    cb(items, provider, note)
-  end
+  local deadline = vim.uv.now() + M._timeout_ms
   local function fall_back_to_grep()
-    grep_callers(name, root_dir, finish)
+    grep_callers(name, root_dir, cb)
   end
-  vim.defer_fn(function()
-    if not answered then
-      fall_back_to_grep()
-    end
-  end, M._timeout_ms)
-
   local function on_incoming_calls(err, calls)
-    if err or not calls or #calls == 0 then
-      fall_back_to_grep()
-      return
+    if err or type(calls) ~= "table" or #calls == 0 then
+      return fall_back_to_grep()
     end
-    finish(sort_items(items_from_calls(calls, client.offset_encoding)), "lsp", nil)
+    cb(sort_items(items_from_calls(calls, client.offset_encoding)), "lsp", nil)
   end
-  local function on_prepared(err, result)
-    if err or not result or #result == 0 then
-      fall_back_to_grep()
-      return
+  local function on_prepared(err, items)
+    if err or type(items) ~= "table" or #items == 0 then
+      return fall_back_to_grep()
     end
-    local request = { item = result[1] }
-    resolver.client_request(client, "callHierarchy/incomingCalls", request, on_incoming_calls, target_bufnr)
+    local request = { item = items[1] }
+    local remaining = math.max(deadline - vim.uv.now(), 0)
+    async.request(client, "callHierarchy/incomingCalls", request, target_bufnr, remaining, on_incoming_calls)
   end
-  resolver.client_request(client, "textDocument/prepareCallHierarchy", params, on_prepared, target_bufnr)
+  async.request(client, "textDocument/prepareCallHierarchy", params, target_bufnr, M._timeout_ms, on_prepared)
 end
 
--- Find the call sites of function `name` with the language servers attached
--- to `bufnr`, or with grep when none offers call hierarchy or the lookup fails
--- (see call_hierarchy). Calls `cb` once, with the items sorted by file, then
--- line, and `note` a message to show with them, or nil.
+-- Find the call sites of function `name` with the language server that
+-- finds it from `bufnr`, or with grep when no server offers call hierarchy or
+-- the lookup fails (see call_hierarchy). Calls `cb` once, with the items
+-- sorted by file, line and column, and `note` a message to show with them,
+-- or nil.
 ---@param name string
 ---@param bufnr integer
 ---@param cb fun(items: inline_explorer.CallerItem[], provider: "lsp"|"grep", note: string?)
 function M.get(name, bufnr, cb)
-  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/prepareCallHierarchy" })
+  local method = "textDocument/prepareCallHierarchy"
   local root_dir = grep_root(bufnr)
-  if #clients == 0 then
+  if #vim.lsp.get_clients({ bufnr = bufnr, method = method }) == 0 then
     grep_callers(name, root_dir, cb)
     return
   end
@@ -225,16 +229,12 @@ function M.get(name, bufnr, cb)
   -- locate, not locate_definition: call hierarchy accepts a declaration, so no
   -- extract or chase is needed.
   resolver.locate(name, bufnr, function(loc)
-    if not loc then
+    local client = loc and resolver.client_for(loc, bufnr, method)
+    if not (loc and client) then
       grep_callers(name, root_dir, cb)
       return
     end
-    local target_bufnr = resolver.ensure_attached(loc.uri, bufnr)
-    if not target_bufnr then
-      grep_callers(name, root_dir, cb)
-      return
-    end
-    local client = clients[1]
+    local target_bufnr = resolver.ensure_attached(loc.uri, client)
     local params = {
       textDocument = { uri = loc.uri },
       position = resolver.name_position(target_bufnr, loc, client.offset_encoding),

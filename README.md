@@ -13,7 +13,7 @@ lua_ls, ...).
 
 ## Requirements
 
-- Neovim 0.10+
+- Neovim 0.11+
 - A language server attached to the files you read
 - Recommended: the tree-sitter parser for the language (`:TSInstall <lang>`);
   required for C inline substitution
@@ -117,8 +117,8 @@ struct ct *p = per_cpu_ptr(CT, cpu);
 return snap != (p->state & MASK);
 ```
 
-Calls that cannot be inlined (variadic functions) fall back to
-`<leader>ee`.
+Calls that cannot be inlined (variadic functions, or a function that reads
+a name your function declares too) fall back to `<leader>ee`.
 
 ## Cross-compiled kernels (Buildroot)
 

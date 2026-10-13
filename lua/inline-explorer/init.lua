@@ -51,6 +51,10 @@ end
 
 ---@param opts? table overrides of config.defaults
 function M.setup(opts)
+  if vim.fn.has("nvim-0.11") == 0 then
+    util.notify("Neovim 0.11+ is required", vim.log.levels.ERROR)
+    return
+  end
   local options = config.setup(opts)
   profile.enabled = options.profile
 

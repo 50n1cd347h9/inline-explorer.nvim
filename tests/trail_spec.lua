@@ -151,4 +151,33 @@ do
   trail.clear()
 end
 
+-- Without a FileType autostart, a file a jump opens has no server. It gets
+-- the servers of the file the jump came from: lookups from its view go
+-- through them, and before definition files were attached only on demand,
+-- the lookup that found the location attached them as a side effect.
+do
+  trail.clear()
+  local fake_lsp = require("tests.lib.fake_lsp")
+  vim.cmd.edit(paths[1])
+  local from_buf = vim.api.nvim_get_current_buf()
+  local cid = fake_lsp.start({
+    name = "trailsrv",
+    buf = from_buf,
+    root_dir = dir,
+    capabilities = {},
+    skip = "server sharing checks (in-process LSP server unavailable)",
+  })
+  if cid then
+    view.open()
+    trail.goto_location(loc_of(3))
+    local f3 = vim.fn.bufnr(paths[3])
+    check("goto: the opened file gets the servers of the file left", vim.lsp.buf_is_attached(f3, cid))
+    trail.clear()
+    vim.lsp.stop_client(cid, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = from_buf }) == 0
+    end, 20)
+  end
+end
+
 H.finish("TRAIL")

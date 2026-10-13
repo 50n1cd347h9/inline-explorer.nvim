@@ -382,8 +382,8 @@ do
 end
 
 -- Case 15: parameter bindings reconstruct the declared type: a NULL/0 argument
--- keeps its pointer type, arrays decay to pointers, and exotic declarators
--- (function pointers) fall back to __auto_type.
+-- keeps its pointer type, arrays decay to pointers, and a function pointer
+-- keeps its declarator.
 do
   local callee_null = [[static int isnull(char *p)
 {
@@ -428,7 +428,7 @@ static int caller(int n)
 }]]
   local t3 = transform(caller_fp, callee_fp, "apply", { { N = 1 } })
   local main3 = "int main(void){ return (caller(4)==7)?0:1; }\n"
-  check("case15 function-pointer param falls back to __auto_type, name kept", t3:find("__auto_type fp =") ~= nil, t3)
+  check("case15 function-pointer param keeps its declarator", t3:find("int (*fp)(int) = (add2);", 1, true) ~= nil, t3)
   check("case15 fn-pointer compiles", (compiles(callee_fp .. "\n" .. t3 .. main3, "c15c")))
   check("case15 fn-pointer runs equal", (run_ok(callee_fp .. "\n" .. t3 .. main3, "c15c")))
 end
@@ -1069,6 +1069,578 @@ do
     check(label .. " renamed the colliding local", t:find("t__ie1", 1, true) ~= nil, t)
     check(label .. " compiles", (compiles(callee .. "\n" .. t .. main, "c32" .. sh[1])), t)
     check(label .. " runs equal to original", (run_ok(callee .. "\n" .. t .. main, "c32" .. sh[1])))
+  end
+end
+
+-- Case 33: tree-sitter-c makes a comment a named child wherever it sits. Read
+-- as code, it became the returned expression (`int r = (/* c */);`), a void
+-- callee's return value (`void __ie_ret1;`), the declarator inside parens
+-- (so the caller's `v` was missed and redeclared), or an argument.
+do
+  local twice = [[static int twice(int v)
+{
+    int x = v * 2;
+    return /* doubled */ x;
+}]]
+  local caller = [[static int caller(int n)
+{
+    int r = twice(n);
+    return r;
+}]]
+  local t = transform(caller, twice, "twice", { { N = 1 } })
+  local main = "int main(void){ return (caller(21)==42)?0:1; }\n"
+  check("case33 comment before the returned value compiles", (compiles(twice .. "\n" .. t .. main, "c33a")), t)
+  check("case33 comment before the returned value runs equal", (run_ok(twice .. "\n" .. t .. main, "c33a")), t)
+
+  local set = [[static void set(int v)
+{
+    if (v < 0)
+        return /* nothing to do */;
+    g = v;
+}]]
+  local set_caller = [[static int caller(int n)
+{
+    set(n);
+    return g;
+}]]
+  local prelude = "static int g;\n"
+  local t2 = transform(set_caller, set, "set", { { N = 1 } })
+  local main2 = "int main(void){ g = 3; return (caller(-1)==3 && caller(5)==5)?0:1; }\n"
+  check("case33 void callee's commented return has no value", not t2:find("__ie_ret1", 1, true), t2)
+  check("case33 void callee compiles", (compiles(prelude .. set .. "\n" .. t2 .. main2, "c33b")), t2)
+  check("case33 void callee runs equal", (run_ok(prelude .. set .. "\n" .. t2 .. main2, "c33b")), t2)
+
+  local inc = [[static int inc(int v)
+{
+    int w = v + 1;
+    return w;
+}]]
+  local id = "#define __stdcall\nstatic int id(int q) { return q; }\n"
+  local main3 = "int main(void){ return (caller(41)==49)?0:1; }\n"
+  for i, decl in ipairs({ "int (/* fn */ *v)(int) = id;", "int (__stdcall *v)(int) = id;" }) do
+    local caller3 = ("static int caller(int n)\n{\n    %s\n    int r = inc(n);\n    return r + v(7);\n}"):format(decl)
+    local t3 = transform(caller3, inc, "inc", { { N = 1 } })
+    local label = "case33 caller's `" .. decl .. "`"
+    check(label .. " renames the parameter", t3:find("int v__ie1 = (n);", 1, true) ~= nil, t3)
+    check(label .. " compiles", (compiles(id .. inc .. "\n" .. t3 .. main3, "c33c" .. i)), t3)
+    check(label .. " runs equal", (run_ok(id .. inc .. "\n" .. t3 .. main3, "c33c" .. i)), t3)
+  end
+
+  local add = "static int add(int a, int b)\n{\n    return a + b;\n}"
+  local add_caller = "static int caller(void)\n{\n    int r = add(1, /* two */ 2);\n    return r;\n}"
+  local t4, err4 = S.inline_call(add_caller, add, "add", 1, 1)
+  check("case33 a comment between arguments is not an argument", t4 ~= nil, tostring(err4))
+  local main4 = "int main(void){ return (caller()==3)?0:1; }\n"
+  check("case33 commented argument list runs equal", t4 ~= nil and (run_ok(add .. "\n" .. t4 .. main4, "c33d")), t4)
+end
+
+-- Case 34: a call that runs never, or only after other code in its
+-- statement, must not be hoisted above it. Each site is inlined in turn and
+-- the whole program must print what the original prints. Hoisted, sizeof's
+-- operand ran, the comma's left side ran too late, and the later declarator
+-- read the global a2 instead of the local.
+do
+  local sites = {
+    { "s_sizeof", "int r = sizeof(bump(a));", "r + counter" },
+    { "s_sizeof_bare", "int r = sizeof bump(a);", "r + counter" },
+    { "s_generic", "int r = _Generic(bump(a), int: 1, default: 0);", "r + counter" },
+    { "s_comma", "int r = (counter = 10, bump(a));", "r" },
+    { "s_later", "int a2 = a * 2, r = bump(a2);", "r" },
+    { "s_typeof", "__typeof__(bump(a) + 1) *p = 0;", "(p == 0) + counter" },
+    { "s_constant_p", "int r = __builtin_constant_p(bump(a));", "r + counter" },
+    { "s_choose", "int r = __builtin_choose_expr(1, 7, bump(a));", "r + counter" },
+    { "s_classify", "int r = __builtin_classify_type(bump(a));", "r + counter" },
+    { "s_object_size", "char buf[8];\n    int r = (int)__builtin_object_size(buf + bump(a), 0);", "r + counter" },
+    { "s_first", "int r = bump(a), s = 2;", "r + s" },
+  }
+  local parts = {
+    "#include <stdio.h>\nstatic int counter;\nstatic int a2 = 1000;\n",
+    "static int bump(int x)\n{\n    counter++;\n    return x + counter;\n}\n",
+  }
+  local names = {}
+  for _, site in ipairs(sites) do
+    parts[#parts + 1] = ("static int %s(int a)\n{\n    %s\n    return %s;\n}\n"):format(site[1], site[2], site[3])
+    names[#names + 1] = site[1]
+  end
+  parts[#parts + 1] = "int main(void)\n{\n    int (*sites[])(int) = { "
+    .. table.concat(names, ", ")
+    .. " };\n"
+    .. "    for (unsigned i = 0; i < sizeof sites / sizeof sites[0]; i++) {\n"
+    .. '        counter = 0;\n        printf("%u %d\\n", i, sites[i](1));\n    }\n    return 0;\n}\n'
+  local program = table.concat(parts)
+  local C = require("inline-explorer.csrc")
+  local tree = C.parse(program)
+  local callee = C.text((C.find_function_def(tree, program, "bump")), program)
+  local want = cc.build_run(program, tmp .. "/c34.c", tmp .. "/c34.out")
+  local n_calls = #C.find_calls(tree, program, "bump")
+  check("case34 original builds, one call per site", want ~= nil and n_calls == #sites, n_calls)
+  for occ = 1, n_calls do
+    local t, err = S.inline_call(program, callee, "bump", 1, occ)
+    local got = t and cc.build_run(t, tmp .. "/c34_" .. occ .. ".c", tmp .. "/c34_" .. occ .. ".out")
+    check(("case34 %s prints what the original prints"):format(sites[occ][1]), got ~= nil and got == want, t or err)
+  end
+end
+
+-- Case 35: names in the caller's function. Renaming only the names it
+-- declared missed three silent cases: a hoisted callee local hid the global
+-- the caller reads after the call, a parameter named like a global argument
+-- bound `int scale = (scale);`, and a callee's local typedef and enumerator
+-- captured the caller's later uses. Any name the caller spells is renamed.
+do
+  local prelude = "typedef char dim;\nenum { SCALE = 3 };\nstatic int limit = 5;\nstatic int scale = 3;\n"
+  local clamp = [[static int clamp(int v)
+{
+    int limit = 100;
+    return v > limit ? limit : v;
+}]]
+  local caller = [[static int caller(int x)
+{
+    int r = clamp(x) + limit;
+    return r;
+}]]
+  local t = transform(caller, clamp, "clamp", { { N = 1 } })
+  local main = "int main(void){ return (caller(50)==55 && caller(500)==105)?0:1; }\n"
+  check("case35 hoisted local renamed away from the caller's global", t:find("int limit__ie1 = 100;", 1, true), t)
+  check("case35 hoisted local runs equal", (run_ok(prelude .. clamp .. "\n" .. t .. main, "c35a")), t)
+
+  local twice = "static int twice(int scale)\n{\n    return scale * 2;\n}"
+  local caller2 = "static int caller(void)\n{\n    int r = twice(scale);\n    return r;\n}"
+  local main2 = "int main(void){ return (caller()==6)?0:1; }\n"
+  for _, printer in ipairs({ "pretty", "canonical" }) do
+    local t2 = assert(S._render(caller2, twice, "twice", 1, 1, printer))
+    check(
+      "case35 " .. printer .. " binds the argument to a renamed parameter",
+      t2:find("int scale__ie1 = (scale);", 1, true),
+      t2
+    )
+    check(
+      "case35 " .. printer .. " argument runs equal",
+      (run_ok(prelude .. twice .. "\n" .. t2 .. main2, "c35b" .. printer)),
+      t2
+    )
+  end
+
+  local area = [[static int area(int w)
+{
+    typedef int dim;
+    enum { SCALE = 2 };
+    dim v = w * SCALE;
+    return v;
+}]]
+  local caller3 = [[static int caller(int w)
+{
+    int r = area(w);
+    dim d = SCALE;
+    return r * 10 + (int)sizeof(d) + d;
+}]]
+  local t3 = transform(caller3, area, "area", { { N = 1 } })
+  local main3 = "int main(void){ return (caller(4)==84)?0:1; }\n"
+  check(
+    "case35 callee typedef and enumerator renamed",
+    t3:find("dim__ie1 v", 1, true) and t3:find("SCALE__ie1 = 2", 1, true),
+    t3
+  )
+  check("case35 callee typedef and enumerator run equal", (run_ok(prelude .. area .. "\n" .. t3 .. main3, "c35c")), t3)
+
+  local by = "static int scale_by(int LIMIT)\n{\n    return LIMIT * 2;\n}"
+  local caller4 =
+    "static int caller(void)\n{\n    enum { LIMIT = 10 };\n    int r = scale_by(3);\n    return r + LIMIT;\n}"
+  local t4 = transform(caller4, by, "scale_by", { { N = 1 } })
+  local main4 = "int main(void){ return (caller()==16)?0:1; }\n"
+  check("case35 parameter named like a caller enumerator compiles", (compiles(by .. "\n" .. t4 .. main4, "c35d")), t4)
+  check("case35 parameter named like a caller enumerator runs equal", (run_ok(by .. "\n" .. t4 .. main4, "c35d")), t4)
+
+  -- tree-sitter-c leaves the name of `int ret __maybe_unused = ...;` in an
+  -- ERROR node; it is still the name the hoist declares.
+  local attr = "#define __maybe_unused __attribute__((unused))\nstatic int ret = 40;\n"
+  local doubled = "static int doubled(int x)\n{\n    int ret __maybe_unused = x * 2;\n    return ret + 1;\n}"
+  local caller5 = "static int caller(int n)\n{\n    int r = doubled(n);\n    return r + ret;\n}"
+  local t5 = transform(caller5, doubled, "doubled", { { N = 1 } })
+  local main5 = "int main(void){ return (caller(1)==43)?0:1; }\n"
+  check("case35 local named inside an ERROR node renamed", t5:find("int ret__ie1 __maybe_unused", 1, true), t5)
+  check(
+    "case35 local named inside an ERROR node runs equal",
+    (run_ok(attr .. doubled .. "\n" .. t5 .. main5, "c35e")),
+    t5
+  )
+end
+
+-- Case 36: a caller local named like a global the callee reads would capture
+-- that read, renamed or not, so the inline is refused (block paste). Only a
+-- use no declaration around it binds counts: the callee's own block-local
+-- `limit` does not cover the read after its block.
+do
+  local caller = [[static int caller(int x)
+{
+    int limit = 7;
+    int i = 0;
+    return f(x) + limit + i;
+}]]
+  local callees = {
+    { "reads a global", "static int f(int x)\n{\n    return limit + x;\n}" },
+    {
+      "reads it after its own block-local one",
+      "static int f(int x)\n{\n    {\n        int limit = 3;\n        x += limit;\n    }\n    return x + limit;\n}",
+    },
+  }
+  for _, c in ipairs(callees) do
+    local new, err = S.inline_call(caller, c[2], "f", 1, 1)
+    check(
+      "case36 refused: callee " .. c[1],
+      new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
+      new or tostring(err)
+    )
+  end
+  local attr_caller = caller:gsub("int limit = 7;", "u32 __maybe_unused limit = 7;")
+  local new, err = S.inline_call(attr_caller, callees[1][2], "f", 1, 1)
+  check(
+    "case36 refused: the caller's name sits in an ERROR node",
+    new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
+    new or tostring(err)
+  )
+
+  -- An annotation macro such as zlib's FAR lands in an ERROR node of a
+  -- declaration on both sides; the caller does not declare it.
+  local far = "#define FAR\nstruct st { int v; };\n"
+  local peek = "static int peek(struct st FAR *q)\n{\n    struct st FAR *r = q;\n    return r->v;\n}"
+  local far_caller = "static int caller(struct st *s)\n{\n    struct st FAR *p = s;\n    return peek(p) + p->v;\n}"
+  local tf, ferr = S.inline_call(far_caller, peek, "peek", 1, 1)
+  local far_main = "int main(void){ struct st s = { 4 }; return (caller(&s)==8)?0:1; }\n"
+  check("case36 a macro both sides misparse is no reason to refuse", tf ~= nil, tostring(ferr))
+  check(
+    "case36 misparsed macro runs equal",
+    tf ~= nil and (run_ok(far .. peek .. "\n" .. tf .. far_main, "c36far")),
+    tf
+  )
+
+  -- Without a function node around the call (an #ifdef straddling braces),
+  -- the declarations that count are those of the function's ERROR node, not
+  -- the file's: a global the callee reads is fine, a local named like it is
+  -- not.
+  local get = "static int get(void)\n{\n    return limit;\n}"
+  local wrapped = "static int limit = 5;\n"
+    .. get
+    .. "\nstatic int caller(int x)\n{\n#ifdef SOMETHING_UNDEFINED\n    if (x) {\n#endif\n%s    int r = get() + x;\n    return r;\n}\n"
+  local tw, werr = S.inline_call(wrapped:format(""), get, "get", 1, 1)
+  check("case36 a file-scope global is no reason to refuse", tw ~= nil, tostring(werr))
+  local wrapped_main = "int main(void){ return (caller(1)==6)?0:1; }\n"
+  check("case36 file-scope global runs equal", tw ~= nil and (run_ok(tw .. wrapped_main, "c36wrap")), tw)
+  local tl, lerr = S.inline_call(wrapped:format("    int limit = 7;\n"), get, "get", 1, 1)
+  check(
+    "case36 refused: a local of a function without a function node",
+    tl == nil and tostring(lerr):find("'limit'", 1, true) ~= nil,
+    tl or tostring(lerr)
+  )
+
+  -- Its own declarations do not count, wherever they sit.
+  local own = [[static int f(int x)
+{
+    int s = 0;
+    for (int i = 0; i < x; i++)
+        s += i;
+    {
+        int limit = 2;
+        s *= limit;
+    }
+    return s;
+}]]
+  local t = transform(caller, own, "f", { { N = 1 } })
+  local main = "int main(void){ return (caller(4)==19)?0:1; }\n"
+  check(
+    "case36 callee's own locals are no reason to refuse",
+    (run_ok("static int limit = 5;\n" .. own .. "\n" .. t .. main, "c36")),
+    t
+  )
+end
+
+-- Case 37: a callee local declared in a top-level #if block is hoisted like
+-- any other, so it needs the rename too: unrenamed, `int t` shadowed the
+-- caller's parameter `t` for the rest of its block, and `sel(t) + t` read the
+-- callee's t. A caller's own declarations in #if blocks count as well.
+do
+  local blocks = {
+    { "#ifdef/#else", "#ifdef FAST\n    int t = v * 2;\n#else\n    int t = v * 3;\n#endif" },
+    {
+      "#if/#elif/#else",
+      "#if defined(FAST)\n    int t = v * 2;\n#elif defined(MEDIUM)\n    int t = v * 4;\n#else\n    int t = v * 3;\n#endif",
+    },
+  }
+  local caller = [[static int caller(int t)
+{
+    int r = 0;
+    if (t > 0) {
+        r = sel(t) + t;
+    }
+    return r;
+}]]
+  local main = "int main(void){ return (caller(2)==9 && caller(-1)==0)?0:1; }\n"
+  for i, b in ipairs(blocks) do
+    local callee = ("static int sel(int v)\n{\n%s\n    return t + 1;\n}"):format(b[2])
+    for _, mode in ipairs({ "correct", "readable" }) do
+      local t = transform(caller, callee, "sel", { { N = 1, mode = mode } })
+      local label = ("case37 %s local, %s mode,"):format(b[1], mode)
+      check(label .. " renamed in every branch", select(2, t:gsub("int t__ie1 = v", "")) == (i + 1), t)
+      check(label .. " runs equal", (run_ok(callee .. "\n" .. t .. main, "c37" .. i .. mode)), t)
+    end
+  end
+
+  -- zlib's fixedtables declares its tables in one branch and #includes them
+  -- in the other: the included names cannot be renamed along with the rest.
+  local tables = [[static int fixed(int v)
+{
+#ifdef BUILDFIXED
+    static int lenfix[2] = { 1, 2 };
+#else
+#   include "inffixed.h"
+#endif
+    return lenfix[v];
+}]]
+  local tables_caller = "static int caller(int v)\n{\n    int lenfix = fixed(v);\n    return lenfix;\n}"
+  local tnew, terr = S.inline_call(tables_caller, tables, "fixed", 1, 1)
+  check(
+    "case37 refused: an #include in the callee's body",
+    tnew == nil and tostring(terr):find("#include", 1, true) ~= nil,
+    tnew or tostring(terr)
+  )
+
+  local get = "static int get(void)\n{\n    return limit;\n}"
+  local caller2 =
+    "static int caller(int x)\n{\n#ifdef WIDE\n    long limit = 7;\n#else\n    int limit = 7;\n#endif\n    return get() + limit + x;\n}"
+  local new, err = S.inline_call(caller2, get, "get", 1, 1)
+  check(
+    "case37 refused: the caller declares the name in an #if block",
+    new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
+    new or tostring(err)
+  )
+end
+
+-- Case 38: types rebuilt from the callee's declarators. Only the array
+-- declarator next to a parameter's name decays (`int m[][4]` bound as
+-- `int **m` read the wrong memory), the declarator text keeps an inner const,
+-- a parameter's type follows another parameter's rename, the result slot is
+-- the callee's declarator around __ie_retN (`char (*f(void))` gave a `char`
+-- slot), and the parameters are those next to the name, not those of a
+-- returned function pointer. Each site must print what the original prints.
+do
+  local program = [[#include <stdio.h>
+#define ZEXPORT
+static int sum_row(int m[][4], int i)
+{
+    int s = 0;
+    for (int j = 0; j < 4; j++)
+        s += m[i][j];
+    return s;
+}
+static int count(const char *const argv[])
+{
+    int k = 0;
+    while (argv[k])
+        k++;
+    return k;
+}
+static int first(const int a[const 4], int b[static 2])
+{
+    int s = a[0];
+    return s + b[1];
+}
+static int apply(int fn(int), int x)
+{
+    if (!fn)
+        return -1;
+    return fn(x);
+}
+static int vla_row(int n, int m[][n])
+{
+    int s = 0;
+    for (int j = 0; j < n; j++)
+        s += m[1][j];
+    return s;
+}
+static char(*skip(char *s))
+{
+    if (*s == ' ')
+        return s + 1;
+    return s;
+}
+static int (*pick(int k))(int)
+{
+    (void)k;
+    return 0;
+}
+static char *const keep(char *s)
+{
+    if (!s)
+        return 0;
+    return s;
+}
+static int (*row(int (*g)[4], int i))[4]
+{
+    if (i < 0)
+        return 0;
+    return g + i;
+}
+static const char * ZEXPORT version(void)
+{
+    if (0)
+        return 0;
+    return "1.3";
+}
+static int twice(int v)
+{
+    return v * 2;
+}
+int main(void)
+{
+    int grid[2][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+    const char *const names[] = {"a", "b", 0};
+    const int arr[4] = {7, 8, 9, 10};
+    int n = 4;
+    int small[2][2] = {{1, 2}, {3, 4}};
+    char text[] = " x";
+    int r = sum_row(grid, 1);
+    int c = count(names);
+    int f = first(arr, grid[0]);
+    int a1 = n > 0 ? apply(twice, 5) : 0;
+    int a2 = n > 0 ? apply(0, 5) : 0;
+    int v = vla_row(2, small);
+    char *p = n > 0 ? skip(text) : 0;
+    int (*fp)(int) = pick(1);
+    char *q = n > 0 ? keep(text) : 0;
+    int (*g)[4] = n > 0 ? row(grid, 1) : 0;
+    const char *ver = n > 0 ? version() : 0;
+    printf("%d %d %d %d %d %d %c %d %c %d %s\n", r, c, f, a1, a2, v, *p, fp == 0, *q, (*g)[0], ver);
+    return 0;
+}
+]]
+  local C = require("inline-explorer.csrc")
+  local tree = C.parse(program)
+  local want = cc.build_run(program, tmp .. "/c38.c", tmp .. "/c38.out")
+  check("case38 original builds", want ~= nil)
+  local expect = {
+    sum_row = "int (*m)[4] = (grid);",
+    count = "const char *const *argv = (names);",
+    first = "const int *const a = (arr);",
+    vla_row = "int (*m)[n__ie1] = (small);",
+    skip = "char (*__ie_ret1);",
+    pick = "int k = (1);",
+    keep = "char *__ie_ret1;",
+    row = "int (*__ie_ret1)[4];",
+    version = "char * __ie_ret1;",
+  }
+  for _, fname in ipairs({ "sum_row", "count", "first", "apply", "vla_row", "skip", "pick", "keep", "row", "version" }) do
+    local def = C.find_function_def(tree, program, fname)
+    check("case38 " .. fname .. " definition found", def ~= nil)
+    local callee = def and C.text(def, program) or ""
+    for occ = 1, #C.find_calls(tree, program, fname) do
+      local label = ("case38 %s (call %d)"):format(fname, occ)
+      local t, err = S.inline_call(program, callee, fname, 1, occ)
+      if expect[fname] then
+        check(
+          label .. " writes `" .. expect[fname] .. "`",
+          t ~= nil and t:find(expect[fname], 1, true) ~= nil,
+          t or err
+        )
+      end
+      local got = t
+        and cc.build_run(t, tmp .. "/c38_" .. fname .. occ .. ".c", tmp .. "/c38_" .. fname .. occ .. ".out")
+      check(label .. " prints what the original prints", got ~= nil and got == want, t or err)
+    end
+  end
+end
+
+-- Case 39: code tree-sitter cannot parse cleanly. A callee whose `return`
+-- error recovery read as a declared name was spliced with that `return`
+-- raw, returning from the caller. A misparsed caller statement hid an `if`
+-- in a macro, and hoisting ran the callee whatever the condition. A call
+-- with an ERROR among its arguments lost one of them.
+do
+  local stray = [[static int f(int v)
+{
+    if (!v)
+        goto out;
+    return 1;
+out: __maybe_unused
+    return 0;
+}]]
+  local caller = "static int caller(int v)\n{\n    int r = f(v);\n    return r + 1;\n}"
+  local new, err = S.inline_call(caller, stray, "f", 1, 1)
+  check(
+    "case39 refused: a `return` that is not a return statement",
+    new == nil and tostring(err):find("return", 1, true) ~= nil,
+    new or tostring(err)
+  )
+
+  local prelude = "#define WHEN(c) if (c)\n#define ADD + 1\nstatic int counter;\n"
+  local step = [[static int step(int a, int n)
+{
+    counter++;
+    return a - n;
+}]]
+  local when = [[static int caller(int a)
+{
+    int x = 0;
+    WHEN(a > 0) x = step(a, 2);
+    return x * 100 + counter;
+}]]
+  local main = "int main(void){ counter = 0; if (caller(-1) != 0) return 1; return (caller(5) == 301)?0:1; }\n"
+  for _, mode in ipairs({ "correct", "readable" }) do
+    local t = transform(when, step, "step", { { N = 1, mode = mode } })
+    check("case39 misparsed caller statement, " .. mode .. " mode, stays in place", t:find("({", 1, true) ~= nil, t)
+    check(
+      "case39 misparsed caller statement, " .. mode .. " mode, runs equal",
+      (run_ok(prelude .. step .. "\n" .. t .. main, "c39" .. mode)),
+      t
+    )
+  end
+
+  local added = "static int caller(int a)\n{\n    int r = step(a, 2 ADD);\n    return r;\n}"
+  local new2, err2 = S.inline_call(added, step, "step", 1, 1)
+  check(
+    "case39 refused: a call with an ERROR among its arguments",
+    new2 == nil and tostring(err2):find("parse", 1, true) ~= nil,
+    new2 or tostring(err2)
+  )
+end
+
+-- Case 40: a callee written on one line. The body was taken from the start
+-- of its first statement's line, which is the signature, so the canonical,
+-- readable and pretty forms all pasted `static int twice(int x) { ...`.
+do
+  local twice = "static int twice(int x) { return x * 2; }"
+  local tern = "static int caller(int c, int n)\n{\n    return c ? twice(n) : 0;\n}"
+  local t = transform(tern, twice, "twice", { { N = 1 } })
+  local main = "int main(void){ return (caller(1, 4)==8 && caller(0, 4)==0)?0:1; }\n"
+  check("case40 canonical leaves the signature out", not t:find("static int twice", 1, true), t)
+  check("case40 canonical runs equal", (run_ok(twice .. "\n" .. t .. main, "c40a")), t)
+
+  local inc2 = "static int inc2(int x) { int t = x + 1; return t * 2; }"
+  local decl = "static int caller(int n)\n{\n    int r = inc2(n);\n    return r;\n}"
+  local t2 = transform(decl, inc2, "inc2", { { N = 1 } })
+  local main2 = "int main(void){ return (caller(4)==10)?0:1; }\n"
+  check("case40 pretty leaves the signature out", not t2:find("static int inc2", 1, true), t2)
+  check("case40 pretty runs equal", (run_ok(inc2 .. "\n" .. t2 .. main2, "c40b")), t2)
+
+  local sgn = "static int sgn(int x) { if (x < 0) return -1; return x > 0; }"
+  local t3 = transform(decl:gsub("inc2", "sgn"), sgn, "sgn", { { N = 1, mode = "readable" } })
+  check("case40 readable leaves the signature out", not t3:find("static int sgn", 1, true), t3)
+  check("case40 readable compiles", (compiles(sgn .. "\n" .. t3 .. main2, "c40c")), t3)
+end
+
+-- Case 41: a bare `enum { ... };` or `struct s { ... };` keeps its `;` as a
+-- token of the block, not of the statement, so hoisted last it came out as
+-- `enum { A = 2 }` and the caller did not compile.
+do
+  local caller = "static int caller(int n)\n{\n    int r = f(n);\n    return r;\n}"
+  local main = "int main(void){ return (caller(3)==6)?0:1; }\n"
+  for i, body in ipairs({
+    "enum { A = 2 };\n    return x * A;",
+    "struct pt { int a; };\n    return x * (int)sizeof(struct pt) / 2;",
+  }) do
+    local callee = ("static int f(int x)\n{\n    %s\n}"):format(body)
+    local t = transform(caller, callee, "f", { { N = 1 } })
+    local kind = body:match("^%a+")
+    check("case41 hoisted bare " .. kind .. " keeps its ;", t:find("}%s*;") ~= nil, t)
+    check("case41 hoisted bare " .. kind .. " runs equal", (run_ok(callee .. "\n" .. t .. main, "c41" .. i)), t)
   end
 end
 

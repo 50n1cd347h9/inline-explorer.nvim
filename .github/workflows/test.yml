@@ -48,6 +48,26 @@ jobs:
             if echo "$out" | grep -q "FAILURE"; then echo "FAILED: $s"; exit 1; fi
           done
 
+  fast-suites-oldest-nvim:
+    # The same suites on the oldest Neovim the README supports. Its bundled C
+    # parser is a different build from the pinned release's.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-nvim
+        with:
+          version: v0.11.0
+      - name: Run fast suites
+        run: |
+          set -e
+          for s in gen_spec properties_spec pbt_spec ir_spec substitute_spec macro_spec resolver_spec expander_spec bench_lib_spec trail_spec callers_spec pick_spec health_spec real_source_lib_spec; do
+            echo "==== tests/$s.lua"
+            out=$(nvim --headless --clean -u NONE -c "luafile tests/$s.lua" -c "qa!" 2>&1 | tr '\r' '\n')
+            echo "$out"
+            echo "$out" | grep -q "TESTS PASSED" || { echo "FAILED: $s (no pass banner)"; exit 1; }
+            if echo "$out" | grep -q "FAILURE"; then echo "FAILED: $s"; exit 1; fi
+          done
+
   real-source:
     # Runs on push AND pull_request (unlike perf-regression below): a job
     # gated to `push` only is silently absent from a PR's checks, and GitHub

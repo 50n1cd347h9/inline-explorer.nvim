@@ -78,7 +78,8 @@ end
 ---@param src string
 ---@return string
 function M.text(node, src)
-  return src:sub(M.start_byte(node) + 1, M.end_byte(node))
+  local _, _, start_byte, _, _, end_byte = node:range(true)
+  return src:sub(start_byte + 1, end_byte)
 end
 
 ---@param node TSNode
@@ -93,45 +94,83 @@ function M.query_nodes(node, src, query_text)
   return out
 end
 
--- tree-sitter-c gives parenthesized_declarator no `declarator` field, so its
--- first named child stands in for one.
-local function inner_declarator(d)
-  if d:type() == "parenthesized_declarator" then
-    return d:named_child(0)
+-- The named children of `node` without the extras: tree-sitter-c makes a
+-- comment a named child wherever it sits, as in `return /* c */ x;`.
+---@param node TSNode
+---@return TSNode[]
+function M.code_children(node)
+  local out = {}
+  for i = 0, node:named_child_count() - 1 do
+    local child = node:named_child(i)
+    ---@cast child -nil
+    if not child:extra() then
+      out[#out + 1] = child
+    end
   end
-  return d:field("declarator")[1]
+  return out
 end
 
--- The name that declarator `decl` declares: "p" for `*p`, `p[4]`, `(*p)(int)`
--- or `p = 0`.
+-- tree-sitter-c gives parenthesized_declarator no `declarator` field. The
+-- child that stands in for one can follow a comment or a calling convention,
+-- as in `(__stdcall *fp)`.
+local function inner_declarator(d)
+  if d:type() ~= "parenthesized_declarator" then
+    return d:field("declarator")[1]
+  end
+  for _, child in ipairs(M.code_children(d)) do
+    local t = child:type()
+    if t == "identifier" or t == "type_identifier" or t:match("declarator$") then
+      return child
+    end
+  end
+end
+
+-- The name node of declarator `decl`: `p` in `*p`, `p[4]`, `(*p)(int)` or
+-- `p = 0`, and the type_identifier a typedef declares.
 ---@param decl TSNode
----@param src string
----@return string? name nil for a declarator without one, such as the `*` of `char *`
-function M.decl_name(decl, src)
+---@return TSNode? name nil for a declarator without one, such as the `*` of `char *`
+function M.decl_identifier(decl)
   local d = decl
-  while d and d:type() ~= "identifier" do
+  while d and d:type() ~= "identifier" and d:type() ~= "type_identifier" do
     d = inner_declarator(d)
   end
+  return d
+end
+
+-- The text of decl_identifier.
+---@param decl TSNode
+---@param src string
+---@return string? name
+function M.decl_name(decl, src)
+  local d = M.decl_identifier(decl)
   if d then
     return M.text(d, src)
   end
   return nil
 end
 
--- The function_declarator inside `decl`, through `*` and parentheses as in
--- `*f(void)` or `(*f(void))`; nil when anything else wraps it.
+-- The function_declarator with which `decl` declares a function: the one
+-- next to the name, through `*`, `[]`, `()` and parentheses, as `f(int k)` in
+-- `(*f(int k))(int)` or `f(void)` in `(*f(void))[4]`; nil when anything else
+-- wraps it.
 ---@param decl TSNode
 ---@return TSNode?
 function M.func_declarator(decl)
+  local found
   local d = decl
-  while d and d:type() ~= "function_declarator" do
+  while d and d:type() ~= "identifier" do
     local t = d:type()
-    if t ~= "pointer_declarator" and t ~= "parenthesized_declarator" then
+    if t == "function_declarator" then
+      found = d
+    elseif t ~= "pointer_declarator" and t ~= "parenthesized_declarator" and t ~= "array_declarator" then
       return nil
     end
     d = inner_declarator(d)
   end
-  return d
+  if not d then
+    return nil
+  end
+  return found
 end
 
 local TYPE_KEYWORDS = {
@@ -238,28 +277,46 @@ local function return_base_type(def, src)
   return ty_text
 end
 
--- How many `*` the declarator `decl` adds to the return type. A
--- parenthesized_declarator ends the count: `char (*f(void))` gives 0, not 1.
-local function pointer_depth(decl)
-  local depth, d = 0, decl
-  while d and d:type() == "pointer_declarator" do
-    depth = depth + 1
-    d = inner_declarator(d)
+-- The pointer_declarator that makes `func_decl`'s result a pointer, as the
+-- `*const` of `char *const f(void)`, if any.
+local function result_pointer(func_decl)
+  local p = func_decl:parent()
+  while p and p:type() == "parenthesized_declarator" do
+    p = p:parent()
   end
-  return depth
+  if p and p:type() == "pointer_declarator" then
+    return p
+  end
+  return nil
 end
 
--- `def`'s declared return type as text, such as "unsigned long *".
----@param def TSNode
+-- The declaration of a variable `name` of `def`'s return type: `def`'s
+-- declarator with `name` in place of the function's own, as `char (*name)`
+-- for `char (*f(void))` or `int (*name)(int)` for `int (*f(int k))(int)`.
+-- Extras in it, as zlib's ZEXPORT in `char * ZEXPORT f(void)`, are left out,
+-- and so is a qualifier on the pointer returned: the variable is assigned.
+---@param def TSNode a function_definition that func_declarator finds a function in
 ---@param src string
+---@param name string
 ---@return string
-function M.return_type(def, src)
-  local base = return_base_type(def, src)
-  local depth = pointer_depth(def:field("declarator")[1])
-  if depth > 0 then
-    return base .. " " .. string.rep("*", depth)
+function M.result_decl(def, src, name)
+  local decl = def:field("declarator")[1]
+  local func_decl = M.func_declarator(decl)
+  ---@cast func_decl -nil
+  local edits = { { M.start_byte(func_decl), M.end_byte(func_decl), name } }
+  local top_pointer = result_pointer(func_decl)
+  local d = decl
+  while d and d ~= func_decl do
+    for child in d:iter_children() do
+      if child:extra() or (d == top_pointer and child:type() == "type_qualifier") then
+        local stop = M.end_byte(child)
+        edits[#edits + 1] = { M.start_byte(child), stop + #src:match("^%s*", stop + 1), "" }
+      end
+    end
+    d = inner_declarator(d)
   end
-  return base
+  local declarator = M.apply_edits(src, M.start_byte(decl), M.end_byte(decl), edits):gsub("%s+", " ")
+  return return_base_type(def, src) .. " " .. declarator
 end
 
 -- Both are nil when func_declarator returns nil for `def`'s declarator.
@@ -350,50 +407,62 @@ function M.get_params(func_decl, src)
   return params, is_variadic
 end
 
--- For a declarator of only `*` and `[]` around a name, such as `*a[]`: its
--- identifier and one `*` per level ("**"), as an array parameter is a pointer;
--- nil for any other shape. Only the `[]` next to the name decays, so `m[][4]`
--- wrongly gives `**`.
-local function pointer_target(decl)
-  local stars, d = "", decl
-  while d and (d:type() == "pointer_declarator" or d:type() == "array_declarator") do
-    stars = stars .. "*"
-    d = inner_declarator(d)
+-- The edit that turns parameter name `ident` into `name` and adjusts its
+-- type as C adjusts a parameter's: an array declarator next to the name
+-- becomes a pointer, keeping the qualifiers in its brackets (`m[][4]` ->
+-- `(*m)[4]`, `a[const 4]` -> `*const a`), and a function declarator next to
+-- it a function pointer (`f(int)` -> `(*f)(int)`).
+local function decay_edit(ident, name, src)
+  local adj = ident:parent()
+  if adj and adj:type() == "array_declarator" and adj:field("declarator")[1] == ident then
+    local ptr = { "*" }
+    for _, child in ipairs(M.code_children(adj)) do
+      if child:type() == "type_qualifier" then
+        ptr[#ptr + 1] = M.text(child, src) .. " "
+      end
+    end
+    ptr[#ptr + 1] = name
+    local outer = adj:parent()
+    local postfix = outer and (outer:type() == "array_declarator" or outer:type() == "function_declarator")
+    local text = table.concat(ptr)
+    return { M.start_byte(adj), M.end_byte(adj), postfix and "(" .. text .. ")" or text }
   end
-  if d and d:type() == "identifier" then
-    return d, stars
+  if adj and adj:type() == "function_declarator" and adj:field("declarator")[1] == ident then
+    return { M.start_byte(ident), M.end_byte(ident), "(*" .. name .. ")" }
   end
-  return nil
+  return { M.start_byte(ident), M.end_byte(ident), name }
 end
 
--- The line `<param type> <name> = (<arg>);` that binds one argument. The
--- declared type is rebuilt because __auto_type would deduce `int` from a 0
--- argument and `void *` from NULL. Other declarators and unnamed parameters
--- get an __auto_type line.
+-- The line `<param type> <name> = (<arg>);` that binds one argument: the
+-- parameter's own declaration, adjusted by decay_edit, so a NULL or 0
+-- argument keeps a pointer type and `const char *const argv[]` its inner
+-- const. A parameter without an identifier gets an __auto_type line.
 ---@param param inline_explorer.Param
 ---@param arg string the argument's text at the call site
----@param rename table<string, string> a name the caller uses -> the name to declare
+---@param rename table<string, string> parameter name -> the name to declare it as
 ---@param N integer the expansion's id, which keeps generated names unique
 ---@param idx integer param's 1-based position, which names it when it has no name
 ---@param src string the callee's source
 ---@return string
 function M.build_bind(param, arg, rename, N, idx, src)
   local decl = param.node:field("declarator")[1]
-  local ident, stars = pointer_target(decl)
-  if ident then
-    -- The text, not the type field: tree-sitter-c puts `const` outside it.
-    local spec = src:sub(M.start_byte(param.node) + 1, M.start_byte(decl)):gsub("%s+$", "")
-    local ident_name = M.text(ident, src)
-    local name = rename[ident_name] or ident_name
-    return string.format("%s %s%s = (%s);", spec, stars, name, arg)
+  local ident = decl and M.decl_identifier(decl)
+  if not ident or ident:type() ~= "identifier" then
+    local name = param.name and (rename[param.name] or param.name) or ("__ie_arg" .. idx .. "_" .. N)
+    return string.format("__auto_type %s = (%s);", name, arg)
   end
-  local name
-  if param.name then
-    name = rename[param.name] or param.name
-  else
-    name = "__ie_arg" .. idx .. "_" .. N
+  local ident_name = M.text(ident, src)
+  local edit = decay_edit(ident, rename[ident_name] or ident_name, src)
+  local edits = { edit }
+  -- Another parameter's name in the type, as the n of `int m[][n]`.
+  for _, id in ipairs(M.query_nodes(param.node, src, "(identifier) @i")) do
+    local r = rename[M.text(id, src)]
+    if r and (M.end_byte(id) <= edit[1] or M.start_byte(id) >= edit[2]) then
+      edits[#edits + 1] = { M.start_byte(id), M.end_byte(id), r }
+    end
   end
-  return string.format("__auto_type %s = (%s);", name, arg)
+  local text = M.apply_edits(src, M.start_byte(param.node), M.end_byte(param.node), edits)
+  return string.format("%s = (%s);", text, arg)
 end
 
 -- `{ start_byte, end_byte, replacement }`, with absolute offsets in the source.
