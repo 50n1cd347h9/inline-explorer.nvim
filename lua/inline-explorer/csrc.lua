@@ -10,6 +10,7 @@ local M = {}
 M._parse_cache_max = 4
 M._parse_cache = {}
 
+---@param src string
 ---@return TSNode root
 function M.parse(src)
   local entry = M._parse_cache[src]
@@ -25,30 +26,45 @@ function M.parse(src)
   return root
 end
 
+---@param node TSNode
+---@return integer
 function M.start_byte(node)
   local _, _, start_byte = node:range(true)
   return start_byte
 end
 
+---@param node TSNode
+---@return integer
 function M.end_byte(node)
   local _, _, _, _, _, end_byte = node:range(true)
   return end_byte
 end
 
+---@param node TSNode
+---@return integer col 0-based, in bytes
 function M.start_col(node)
   local _, start_col = node:range(true)
   return start_col
 end
 
+---@param node TSNode
+---@return integer
 function M.line_start_byte(node)
   return M.start_byte(node) - M.start_col(node)
 end
 
+---@param src string
+---@param node TSNode
+---@return string
 function M.line_indent(src, node)
   return src:match("^[ \t]*", M.line_start_byte(node) + 1)
 end
 
 -- The innermost node of type `ty` that encloses (row, col).
+---@param root TSNode
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param ty string
 ---@return TSNode?
 function M.ancestor_at(root, row, col, ty)
   local node = root:named_descendant_for_range(row, col, row, col)
@@ -58,10 +74,17 @@ function M.ancestor_at(root, row, col, ty)
   return node
 end
 
+---@param node TSNode
+---@param src string
+---@return string
 function M.text(node, src)
   return src:sub(M.start_byte(node) + 1, M.end_byte(node))
 end
 
+---@param node TSNode
+---@param src string
+---@param query_text string
+---@return TSNode[]
 function M.query_nodes(node, src, query_text)
   local out = {}
   for _, n in vim.treesitter.query.parse("c", query_text):iter_captures(node, src) do
@@ -81,6 +104,8 @@ end
 
 -- The name that declarator `decl` declares: "p" for `*p`, `p[4]`, `(*p)(int)`
 -- or `p = 0`.
+---@param decl TSNode
+---@param src string
 ---@return string? name nil for a declarator without one, such as the `*` of `char *`
 function M.decl_name(decl, src)
   local d = decl
@@ -95,6 +120,8 @@ end
 
 -- The function_declarator inside `decl`, through `*` and parentheses as in
 -- `*f(void)` or `(*f(void))`; nil when anything else wraps it.
+---@param decl TSNode
+---@return TSNode?
 function M.func_declarator(decl)
   local d = decl
   while d and d:type() ~= "function_declarator" do
@@ -223,6 +250,9 @@ local function pointer_depth(decl)
 end
 
 -- `def`'s declared return type as text, such as "unsigned long *".
+---@param def TSNode
+---@param src string
+---@return string
 function M.return_type(def, src)
   local base = return_base_type(def, src)
   local depth = pointer_depth(def:field("declarator")[1])
@@ -233,6 +263,8 @@ function M.return_type(def, src)
 end
 
 -- Both are nil when func_declarator returns nil for `def`'s declarator.
+---@param def TSNode
+---@param src string
 ---@return string? name
 ---@return TSNode? func_decl
 function M.function_name(def, src)
@@ -245,11 +277,15 @@ end
 
 -- The child of `root` that defines function `name`, and its
 -- function_declarator. Only direct children are searched, not `#if` blocks.
+---@param root TSNode
+---@param src string
+---@param name string
 ---@return TSNode? def
 ---@return TSNode? func_decl
 function M.find_function_def(root, src, name)
   for i = 0, root:named_child_count() - 1 do
     local child = root:named_child(i)
+    ---@cast child -nil
     if child:type() == "function_definition" then
       local child_name, func_decl = M.function_name(child, src)
       if child_name == name then
@@ -262,6 +298,11 @@ end
 -- The call_expressions that call `name` under `root`, in document order; at
 -- most `limit` when given. Not query_nodes: iter_captures is lazy, so the walk
 -- stops at the limit.
+---@param root TSNode
+---@param src string
+---@param name string
+---@param limit? integer
+---@return TSNode[]
 function M.find_calls(root, src, name, limit)
   local calls = {}
   local query = vim.treesitter.query.parse("c", "(call_expression function: (identifier) @f)")
@@ -281,6 +322,8 @@ end
 ---@field node TSNode the parameter_declaration
 
 -- The `void` of `f(void)` gives no entry.
+---@param func_decl TSNode
+---@param src string
 ---@return inline_explorer.Param[] params
 ---@return boolean is_variadic
 function M.get_params(func_decl, src)
@@ -288,6 +331,7 @@ function M.get_params(func_decl, src)
   local param_list = func_decl:field("parameters")[1]
   for i = 0, param_list:named_child_count() - 1 do
     local child = param_list:named_child(i)
+    ---@cast child -nil
     if child:type() == "variadic_parameter" then
       is_variadic = true
     elseif child:type() == "parameter_declaration" then
@@ -306,11 +350,10 @@ function M.get_params(func_decl, src)
   return params, is_variadic
 end
 
--- For a declarator of only `*` and `[]` around a name, such as `*a[]`: the
--- name and one `*` per level ("**"), as an array parameter is a pointer.
--- Only the `[]` next to the name decays, so `m[][4]` wrongly gives `**`.
----@return TSNode? ident nil for any other shape, such as a function pointer
----@return string? stars
+-- For a declarator of only `*` and `[]` around a name, such as `*a[]`: its
+-- identifier and one `*` per level ("**"), as an array parameter is a pointer;
+-- nil for any other shape. Only the `[]` next to the name decays, so `m[][4]`
+-- wrongly gives `**`.
 local function pointer_target(decl)
   local stars, d = "", decl
   while d and (d:type() == "pointer_declarator" or d:type() == "array_declarator") do
@@ -331,6 +374,9 @@ end
 ---@param arg string the argument's text at the call site
 ---@param rename table<string, string> a name the caller uses -> the name to declare
 ---@param N integer the expansion's id, which keeps generated names unique
+---@param idx integer param's 1-based position, which names it when it has no name
+---@param src string the callee's source
+---@return string
 function M.build_bind(param, arg, rename, N, idx, src)
   local decl = param.node:field("declarator")[1]
   local ident, stars = pointer_target(decl)
@@ -355,7 +401,11 @@ end
 
 -- The text of bytes [s, e) of `src`, with the `edits` that lie wholly inside
 -- that range applied.
+---@param src string
+---@param s integer
+---@param e integer
 ---@param edits inline_explorer.Edit[]
+---@return string
 function M.apply_edits(src, s, e, edits)
   local within = {}
   for _, ed in ipairs(edits) do
@@ -375,6 +425,8 @@ function M.apply_edits(src, s, e, edits)
 end
 
 -- The leading spaces and tabs that all non-blank `lines` share.
+---@param lines string[]
+---@return string
 function M.common_ws_prefix(lines)
   local prefix
   for _, l in ipairs(lines) do
@@ -396,6 +448,9 @@ end
 
 -- The lines of `fragment` with their common indent replaced by `target`;
 -- blank lines become empty.
+---@param fragment string
+---@param target string
+---@return string[]
 function M.reindent(fragment, target)
   local lines = vim.split(fragment, "\n", { plain = true })
   local strip_len = #M.common_ws_prefix(lines)

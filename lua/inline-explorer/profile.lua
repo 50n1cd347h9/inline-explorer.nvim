@@ -19,6 +19,7 @@ M.logfile = vim.fs.joinpath(vim.fn.stdpath("log"), "inline-explorer-profile.log"
 -- one keypress can be grouped in the log.
 M.action = 0
 
+---@return integer action
 function M.begin_action()
   M.action = M.action + 1
   return M.action
@@ -79,6 +80,7 @@ M._identified = {}
 
 -- Log each LSP client's name, version and command line once per session, so
 -- that a log from another machine shows which server setup produced it.
+---@param client? vim.lsp.Client
 function M.identify(client)
   if not M.enabled or not client or M._identified[client.id] then
     return
@@ -100,6 +102,7 @@ function M.identify(client)
 end
 
 -- Forget the recorded spans; with `also_logfile`, empty the log file too.
+---@param also_logfile? boolean
 function M.clear(also_logfile)
   M.events = {}
   if also_logfile and M.logfile then
@@ -114,6 +117,7 @@ local WORST_SHOWN = 8
 
 -- The report, as text with two tables: the totals per span name (slowest
 -- total first), then the WORST_SHOWN slowest single spans with their detail.
+---@return string
 function M.report()
   if #M.events == 0 then
     return M.enabled and "[inline-explorer] profiling on, no spans recorded yet"

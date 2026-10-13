@@ -25,6 +25,8 @@ local function trim_blank_lines(lines)
   return lines
 end
 
+---@param contents lsp.MarkedString|lsp.MarkedString[]|lsp.MarkupContent
+---@return string
 local function hover_markdown(contents)
   return table.concat(vim.lsp.util.convert_input_to_markdown_lines(contents), "\n")
 end
@@ -32,6 +34,7 @@ end
 -- clangd's hover for a macro shows the `#define` and the expansion in fenced
 -- code, split by an "Expands to" marker: a markdown line, or a `// Expands to`
 -- comment inside the block.
+---@param md string
 ---@return string[]? lines nil when the hover shows no expansion, {} when it is only blank lines
 local function expansion_lines(md)
   local in_code, seen_marker = false, false
@@ -51,10 +54,9 @@ local function expansion_lines(md)
   return trim_blank_lines(after)
 end
 
--- The macro use at (row, col): the call_expression when the identifier there
--- is its callee, else the identifier.
----@return TSNode? invocation nil when there is no identifier at (row, col)
----@return boolean? is_statement whether the use is a whole expression statement
+-- The macro use at (row, col), and whether it is a whole expression statement.
+-- The use is the call_expression when the identifier there is its callee, else
+-- the identifier.
 local function find_invocation(root, row, col)
   local node = csrc.ancestor_at(root, row, col, "identifier")
   if not node then
@@ -75,6 +77,11 @@ end
 
 -- `src` with the macro use at (row, col) replaced by `exp_lines`. `root` is
 -- src's parsed root, when the caller has it.
+---@param src string
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param exp_lines string[]
+---@param root? TSNode
 ---@return string? new_src
 ---@return string? err
 function M.replace_in_src(src, row, col, exp_lines, root)
@@ -111,6 +118,7 @@ end
 
 local TWEAK_TIMEOUT_MS = 2000
 
+---@param actions any
 ---@return lsp.Command? cmd the command of the "Expand macro" action in a codeAction reply
 local function pick_expand_action(actions)
   if type(actions) ~= "table" then
@@ -148,8 +156,7 @@ local function pos_in_range(pos, range)
 end
 
 -- The text edits of `workspace_edit`, if it edits document `uri` and nothing
--- else.
----@return lsp.TextEdit[]? edits nil if it touches another document or creates, renames or deletes one
+-- else: no other document, and no file created, renamed or deleted.
 local function edits_only_for(workspace_edit, uri)
   local edits
   if type(workspace_edit.changes) == "table" then
@@ -177,6 +184,10 @@ end
 
 -- Whether `workspace_edit` can be the ExpandMacro edit for the macro use at
 -- `pos`: it edits document `uri` only, and one of its ranges contains `pos`.
+---@param workspace_edit lsp.WorkspaceEdit?
+---@param uri string
+---@param pos lsp.Position
+---@return boolean
 local function edit_matches(workspace_edit, uri, pos)
   if type(workspace_edit) ~= "table" or type(uri) ~= "string" or type(pos) ~= "table" then
     return false
@@ -196,6 +207,8 @@ end
 -- The newText of the first text edit for `uri`, without blank edge lines. It
 -- reads only edits that edit_matches accepted, so other documents are not
 -- checked again.
+---@param workspace_edit lsp.WorkspaceEdit?
+---@param uri string
 ---@return string[]? lines nil when there is no text
 local function edit_lines(workspace_edit, uri)
   if type(workspace_edit) ~= "table" then
@@ -285,6 +298,7 @@ end
 -- replaced (or the global one). It is never removed, since restoring the old
 -- handler could undo one that another plugin installed later. A repeat call
 -- does nothing while ours is still installed.
+---@param client vim.lsp.Client
 local function install_interceptor(client)
   local installed = interceptor_by_client[client.id]
   if installed ~= nil and client.handlers["workspace/applyEdit"] == installed then
@@ -332,6 +346,8 @@ local function prune_dead_clients()
   end
 end
 
+---@param client vim.lsp.Client
+---@return boolean
 function M.supports_tweak(client)
   local provider = (client.server_capabilities or {}).executeCommandProvider
   if type(provider) ~= "table" or type(provider.commands) ~= "table" then
@@ -458,6 +474,9 @@ end
 -- an expansion, {} when the hover's is only blank lines. (row, col) is in the
 -- source buffer; a nil row (a use with no source line) gives cb(nil) at once.
 ---@param st inline_explorer.ViewState
+---@param row integer? 0-based
+---@param col integer 0-based, in bytes
+---@param cb fun(lines: string[]?)
 function M.fetch_expansion(st, row, col, cb)
   if row == nil then
     return cb(nil)

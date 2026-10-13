@@ -39,6 +39,8 @@ M.origin_ns = vim.api.nvim_create_namespace("inline_explorer_origin")
 ---@type table<integer, inline_explorer.ViewState>
 M.state = {}
 
+---@param buf integer
+---@return boolean
 function M.is_view(buf)
   return M.state[buf] ~= nil
 end
@@ -48,6 +50,7 @@ function M.current()
   return M.state[vim.api.nvim_get_current_buf()]
 end
 
+---@param buf integer
 function M.forget(buf)
   M.state[buf] = nil
 end
@@ -115,8 +118,8 @@ local function set_keymaps(view)
   end
 end
 
--- Open a reading view of `src` in the current window. A `src` that is not a
--- number (a user command's opts table) means the current buffer.
+-- Open a reading view of `src` in the current window.
+---@param src? integer|vim.api.keyset.create_user_command.command_args a table or nil means the current buffer
 ---@return integer? view nil if `src` is itself a view
 function M.open(src)
   if type(src) ~= "number" then
@@ -160,8 +163,10 @@ function M.close()
   vim.api.nvim_buf_delete(view, { force = true })
 end
 
--- The source row of view row `row` (both 0-based), or nil for inserted or
--- rewritten text.
+-- The source row of view row `row`.
+---@param st inline_explorer.ViewState
+---@param row integer 0-based
+---@return integer? src_row 0-based; nil for inserted or rewritten text
 function M.src_line(st, row)
   local marks = vim.api.nvim_buf_get_extmarks(st.bufnr, M.origin_ns, { row, 0 }, { row, -1 }, { details = true })
   for _, mark in ipairs(marks) do
@@ -193,6 +198,8 @@ local function block_range(bufnr, block)
 end
 
 -- The blocks whose first and last lines are both still there, in st.blocks order.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
 ---@return inline_explorer.BlockRange[]
 function M.block_ranges(st, bufnr)
   local out = {}
@@ -212,6 +219,10 @@ local function undo_seq(bufnr)
 end
 
 -- The view is 'nomodifiable', so every write goes through here.
+---@param bufnr integer
+---@param s integer first row, 0-based
+---@param e integer end row, 0-based, exclusive
+---@param lines string[]
 function M.set_lines(bufnr, s, e, lines)
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, s, e, false, lines)
@@ -236,8 +247,13 @@ local function clear_blocks(st, bufnr)
   st.blocks = {}
 end
 
--- Record rows s..e (0-based, inclusive) as block `name`, with an open fold in
--- the current window, which must show bufnr.
+-- Record rows s..e as block `name`, with an open fold in the current window,
+-- which must show bufnr.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param name string
+---@param s integer first row, 0-based
+---@param e integer last row, 0-based, inclusive
 function M.add_block(st, bufnr, name, s, e)
   st.blocks[#st.blocks + 1] = {
     name = name,
@@ -261,6 +277,9 @@ end
 -- marks, but not st.blocks: redo re-inserts a block's lines without its marks,
 -- and undo does not bring back the blocks dropped here. So the blocks of each
 -- undo state are recorded in st.ranges_at, for M.restore_blocks().
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param fn fun()
 function M.change(st, bufnr, fn)
   start_undo_step(bufnr)
   fn()
@@ -275,6 +294,8 @@ function M.change(st, bufnr, fn)
 end
 
 -- After an undo or redo, rebuild the blocks recorded for the undo state reached.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
 function M.restore_blocks(st, bufnr)
   clear_blocks(st, bufnr)
   for _, range in ipairs(st.ranges_at[undo_seq(bufnr)] or {}) do
@@ -302,6 +323,7 @@ local function guard_ms()
   return 3 * r._timeout_ms + math.max(r._cold_timeout_ms, r._timeout_ms) + 1000
 end
 
+---@param st inline_explorer.ViewState
 ---@return boolean taken false while an earlier lookup holds the guard
 function M.begin_fetch(st)
   local now = vim.uv.now()
@@ -312,13 +334,18 @@ function M.begin_fetch(st)
   return true
 end
 
+---@param st inline_explorer.ViewState
 function M.end_fetch(st)
   st.fetch_started = nil
 end
 
 -- Replace the view's text with `new_src`, changing only the lines that
 -- differ, so the others keep their origin and block marks. Then put the
--- cursor on `cursor_row` (0-based, default 0).
+-- cursor on `cursor_row`.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param new_src string
+---@param cursor_row? integer 0-based, default 0
 function M.rewrite(st, bufnr, new_src, cursor_row)
   local stop_timer = profile.start()
   local old_src = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")

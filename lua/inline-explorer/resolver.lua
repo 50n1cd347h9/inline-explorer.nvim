@@ -49,10 +49,18 @@ M._local_first = true
 
 -- client:request on Neovim 0.11+, which deprecates the dot call. On 0.10,
 -- client.request is a closure that takes no self.
+---@param client vim.lsp.Client
+---@param method string
+---@param params table?
+---@param handler lsp.Handler?
+---@param bufnr integer?
+---@return boolean sent
+---@return integer? request_id
 function M.client_request(client, method, params, handler, bufnr)
   if vim.fn.has("nvim-0.11") == 1 then
     return client:request(method, params, handler, bufnr)
   end
+  ---@cast client table
   return client.request(method, params, handler, bufnr)
 end
 
@@ -88,7 +96,6 @@ function M.clear_caches()
   M._chase_miss = {}
 end
 
----@return integer?
 local function tick_of(bufnr)
   if bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
     return vim.api.nvim_buf_get_changedtick(bufnr)
@@ -144,7 +151,6 @@ local function source_buf(source_bufnr)
 end
 
 -- Unlike vim.uri_to_bufnr, never creates a buffer.
----@return integer?
 local function existing_buf(uri)
   local bufnr = vim.fn.bufnr(vim.uri_to_fname(uri))
   if bufnr == -1 then
@@ -182,6 +188,8 @@ local function describe(name, uri)
 end
 
 -- Only an exact name match counts.
+---@param name string
+---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(loc: inline_explorer.Loc?, err: string?)
 function M.locate(name, source_bufnr, cb)
   local bufnr = source_buf(source_bufnr)
@@ -276,6 +284,9 @@ end
 -- The innermost symbol in a documentSymbol reply whose range contains
 -- ref_range.
 ---@param symbols lsp.DocumentSymbol[]|lsp.SymbolInformation[]
+---@param ref_range lsp.Range
+---@param name string? when set, SymbolInformation entries with another name are skipped
+---@param uri string? when set, SymbolInformation entries in another file are skipped
 ---@return lsp.Range? range
 ---@return string? label
 function M._symbol_range(symbols, ref_range, name, uri)
@@ -314,8 +325,6 @@ function M._symbol_range(symbols, ref_range, name, uri)
 end
 
 -- Raises on a malformed reply.
----@return string[]? lines
----@return string? label
 local function lines_from_symbols(results, loc, target)
   local range, label
   for _, r in pairs(results or {}) do
@@ -369,7 +378,6 @@ local HEURISTIC = "heuristic"
 -- window allows for a return type or attributes on lines of their own, and
 -- the outermost node is wanted because, when the parameter list spans
 -- lines, the innermost multi-line node is just the declarator.
----@return TSNode?
 local function outermost_in_window(root, srow, scol)
   local node = root:named_descendant_for_range(srow, scol, srow, scol)
   local found
@@ -421,6 +429,9 @@ local MAX_SCAN_LINES = 500 -- so an unclosed brace cannot pull in the rest of th
 
 -- The brace counter. From srow: a #define with its continuation lines, or
 -- the lines through the brace that closes the first one opened.
+---@param bufnr integer
+---@param srow integer 0-based
+---@return string[] lines
 function M.extract_heuristic(bufnr, srow)
   local total = vim.api.nvim_buf_line_count(bufnr)
   local first = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
@@ -483,7 +494,6 @@ local function cache_attachment(target, newly_attached)
   end)
 end
 
----@return integer[] newly_attached client ids
 local function attach_clients(target, clients)
   vim.fn.bufload(target)
   local newly_attached = {}
@@ -500,6 +510,8 @@ end
 
 -- Attaches source_bufnr's clients to uri's file, since clangd answers
 -- position requests only about documents it has open.
+---@param uri string
+---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@return integer? target the file's bufnr, nil when source_bufnr has no clients
 function M.ensure_attached(uri, source_bufnr)
   local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
@@ -511,8 +523,6 @@ function M.ensure_attached(uri, source_bufnr)
   return target
 end
 
----@return string[]? lines nil when M.extract should ask the server
----@return string? label
 local function extract_local(loc, target)
   local tlang = buffer_lang(target)
   if tlang ~= "c" and tlang ~= "cpp" then
@@ -525,7 +535,7 @@ local function extract_local(loc, target)
   return nil
 end
 
--- Calls cb(lines, label) exactly once on every path, possibly synchronously.
+-- Calls cb exactly once on every path, possibly synchronously.
 -- The steps, in order:
 --   1. no client on source_bufnr -> local extraction
 --   2. load the definition file and attach the source buffer's clients
@@ -535,6 +545,8 @@ end
 --   6. ask the server. Use local extraction when the reply has no usable
 --      range, and on timeout (then retry in the background).
 ---@param loc inline_explorer.Loc
+---@param source_bufnr integer? nil or invalid counts as the current buffer
+---@param cb fun(lines: string[], label: string)
 function M.extract(loc, source_bufnr, cb)
   local span = profile.start()
   local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
@@ -591,6 +603,7 @@ function M.extract(loc, source_bufnr, cb)
   if M._local_first then
     local ts_lines, ts_label = extract_local(loc, target)
     if ts_lines then
+      ---@cast ts_label -nil
       if tick then
         extract_cache_put(key, ts_lines, ts_label, tick)
       end
@@ -677,6 +690,7 @@ end
 -- Where loc.name appears as a whole word in the 4 lines from loc's start
 -- line, else loc.range.start. A position request needs the identifier, and
 -- loc.range.start may sit on a keyword such as `void`.
+---@param target integer bufnr of loc.uri
 ---@param loc inline_explorer.Loc
 ---@param out_encoding string encoding of the server the position is sent to
 ---@return lsp.Position
@@ -756,6 +770,9 @@ end
 
 -- Caches the chased definition under `name`, so a repeat lookup skips the
 -- chase.
+---@param name string
+---@param source_bufnr integer? nil or invalid counts as the current buffer
+---@param dloc inline_explorer.Loc
 function M._locate_cache_replace(name, source_bufnr, dloc)
   locate_cache_put(locate_key(source_buf(source_bufnr), name), dloc)
 end
@@ -765,6 +782,8 @@ end
 -- loc is where the lines came from: the definition, or the declaration when
 -- the chase fails. When locate fails, only err is set. M.fetch and
 -- go-to-definition share this so both reach the same definition.
+---@param name string
+---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(loc: inline_explorer.Loc?, lines: string[]?, label: string?, err: string?)
 function M.locate_definition(name, source_bufnr, cb)
   M.locate(name, source_bufnr, function(loc, err)
@@ -801,6 +820,8 @@ function M.locate_definition(name, source_bufnr, cb)
 end
 
 -- M.locate_definition without the loc.
+---@param name string
+---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(lines: string[]?, label: string?, err: string?)
 function M.fetch(name, source_bufnr, cb)
   M.locate_definition(name, source_bufnr, function(_, lines, label, err)

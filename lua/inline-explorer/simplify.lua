@@ -8,6 +8,8 @@ local M = {}
 -- `((X))` -> `(X)`, which never changes C's meaning. The text is parsed in a
 -- dummy function, as an expression, else as statements; when neither parses
 -- cleanly it is returned unchanged, so a splice is never corrupted.
+---@param text string
+---@return string
 function M.parens(text)
   local wrappers = {
     { pre = "void __ie_w(void) {\n__ie_sink =\n", post = "\n;\n}\n" },

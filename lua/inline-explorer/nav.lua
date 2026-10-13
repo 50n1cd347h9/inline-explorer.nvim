@@ -10,7 +10,6 @@ local function notify(msg)
 end
 
 -- view.block_ranges, sorted by first row. Rows are 0-based and inclusive.
----@return { name: string, first_row: integer, last_row: integer }[]
 local function sorted_blocks(st, bufnr)
   local blocks = {}
   for _, range in ipairs(view.block_ranges(st, bufnr)) do
@@ -22,9 +21,6 @@ local function sorted_blocks(st, bufnr)
   return blocks
 end
 
----@return inline_explorer.ViewState? st nil outside a reading view
----@return integer? bufnr
----@return integer? cursor_row 0-based
 local function cursor_in_view()
   local st = view.current()
   if not st then
@@ -88,6 +84,7 @@ end
 
 -- The names of the blocks around the cursor, outermost first, joined with
 -- " > "; "" outside a reading view.
+---@return string
 function M.breadcrumb()
   local st, bufnr, cursor_row = cursor_in_view()
   if not st then

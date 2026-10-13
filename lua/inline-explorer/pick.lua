@@ -21,7 +21,6 @@ local function source_buf()
   return st and st.source_bufnr or vim.api.nvim_get_current_buf()
 end
 
----@param item inline_explorer.CallerItem
 local function format_caller(item)
   return ("%s  %s:%d  │ %s"):format(
     item.name,

@@ -62,6 +62,8 @@ local function check(opts)
   end
 end
 
+---@param opts? table
+---@return table options
 function M.setup(opts)
   opts = opts or {}
   check(opts)

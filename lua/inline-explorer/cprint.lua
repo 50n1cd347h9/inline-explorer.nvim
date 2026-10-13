@@ -1,11 +1,9 @@
--- Printers: layout only, for the three forms canalyze.decide picks from. Each
--- returns the new caller source.
+-- Printers: layout only, for the three forms canalyze.decide picks from.
 local csrc = require("inline-explorer.csrc")
 local simplify = require("inline-explorer.simplify")
 
 local M = {}
 
----@param edits inline_explorer.Edit[]
 local function splice(caller_src, edits)
   return csrc.apply_edits(caller_src, 0, #caller_src, edits)
 end
@@ -84,8 +82,10 @@ end
 -- Pretty: the bindings and all statements but the last are hoisted above
 -- target, and E of the final `return E;`, parenthesised to keep its
 -- precedence, replaces the call. Only for a simple callee (see decide).
----@param ir inline_explorer.IR
+---@param caller_src string
+---@param ir inline_explorer.IR with binds
 ---@param ctx inline_explorer.Ctx
+---@return string new_src
 local function print_pretty(caller_src, ir, ctx)
   local hoist = {}
   vim.list_extend(hoist, ir.binds)
@@ -93,6 +93,7 @@ local function print_pretty(caller_src, ir, ctx)
     vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts - 1), ""))
   end
   local expr = ir.stmts[#ir.stmts]:named_child(0)
+  ---@cast expr -nil
   local expr_text = csrc.apply_edits(ir.src, csrc.start_byte(expr), csrc.end_byte(expr), ir.body_edits)
   local replacement = simplify.parens("(" .. expr_text .. ")")
   return print_hoisted(caller_src, ctx, hoist, replacement)
@@ -100,8 +101,10 @@ end
 
 -- Canonical: a GNU statement expression replaces the call, every return
 -- becoming a goto to its end.
----@param ir inline_explorer.IR
+---@param caller_src string
+---@param ir inline_explorer.IR with binds
 ---@param ctx inline_explorer.Ctx
+---@return string new_src
 local function print_canonical(caller_src, ir, ctx)
   local inner = ctx.indent .. ctx.indent_unit
   local parts = { "({" }
@@ -123,8 +126,10 @@ end
 -- Readable: the body is hoisted with every return turned into an assignment,
 -- and __ie_retN replaces the call. An early return no longer stops the rest
 -- of the body, so this is unfaithful to a callee that has one.
----@param ir inline_explorer.IR
+---@param caller_src string
+---@param ir inline_explorer.IR with binds
 ---@param ctx inline_explorer.Ctx
+---@return string new_src
 local function print_readable_multi(caller_src, ir, ctx)
   local hoist = {}
   vim.list_extend(hoist, ir.binds)

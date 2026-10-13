@@ -47,9 +47,13 @@ local function window_size(lines, title)
   return math.min(width + RIGHT_PAD, max_width), math.min(#lines, max_height)
 end
 
--- Takes the arguments of vim.ui.select; of `opts`, only prompt and
--- format_item are used. `on_choice` fires exactly once: with (item, idx) on a
--- choice, and with (nil, nil) on a cancel, however the window is closed.
+-- Takes the arguments of vim.ui.select. `on_choice` fires exactly once: with
+-- (item, idx) on a choice, and with (nil, nil) on a cancel, however the window
+-- is closed.
+---@generic T
+---@param items T[]
+---@param opts? { prompt?: string, format_item?: fun(item: T): string }
+---@param on_choice fun(item: T?, idx: integer?)
 ---@return integer win
 function M.open(items, opts, on_choice)
   opts = opts or {}

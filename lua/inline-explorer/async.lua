@@ -3,6 +3,9 @@ local M = {}
 -- The first call to the returned `finish(...)` passes its arguments to `cb`,
 -- and later calls are ignored. If `finish` has not been called within `ms`
 -- milliseconds, `on_timeout()` runs and `cb` gets its return values instead.
+---@param cb fun(...)
+---@param on_timeout fun(): ...
+---@param ms integer
 ---@return fun(...) finish
 function M.once_with_timeout(cb, on_timeout, ms)
   local finished = false

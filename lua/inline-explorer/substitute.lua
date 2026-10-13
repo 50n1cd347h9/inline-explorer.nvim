@@ -9,7 +9,6 @@ local cprint = require("inline-explorer.cprint")
 
 local M = {}
 
----@param mode? "correct"|"readable" see canalyze.decide
 local function print_call(caller_src, ir, ctx, mode)
   local printer_name = canalyze.decide(ir, ctx, mode or "correct")
   return cprint.PRINTERS[printer_name](caller_src, ir, ctx)
@@ -17,6 +16,12 @@ end
 
 -- Inlines the occ-th call to fname in caller_src; callee_src holds fname's
 -- definition.
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param N? integer default 1
+---@param occ? integer default 1
+---@param mode? "correct"|"readable" default "correct"
 ---@return string? new_src
 ---@return string? err
 function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
@@ -29,6 +34,11 @@ end
 
 -- Test hook: analyses the occ-th call to fname without printing it. Unlike
 -- analyze_call it binds no arguments: no arity check, and ir.binds is nil.
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param occ? integer default 1
+---@param mode? "correct"|"readable" default "correct"
 ---@return { ir: inline_explorer.IR, ctx: inline_explorer.Ctx, decision: string }?
 ---@return string? err
 function M._probe(caller_src, callee_src, fname, occ, mode)
@@ -52,6 +62,12 @@ M._rebase = csrc.reindent
 M._common_ws_prefix = csrc.common_ws_prefix
 
 -- Test hook: inline_call with the printer named printer_name, not decide()'s.
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param N? integer default 1
+---@param occ? integer default 1
+---@param printer_name string
 ---@return string? new_src
 ---@return string? err
 function M._render(caller_src, callee_src, fname, N, occ, printer_name)
@@ -67,10 +83,8 @@ function M._render(caller_src, callee_src, fname, N, occ, printer_name)
   return printer(caller_src, ir, ctx)
 end
 
--- The innermost call at (row, col), 0-based with col in bytes, and the name
--- it calls. `root`, if given, is caller_src's tree.
----@return TSNode? call nil if there is no call there or it calls no plain name
----@return string name_or_reason
+-- The innermost call at (row, col) and the name it calls, or nil and the
+-- reason when there is no call there or it calls no plain name.
 local function named_call_at(caller_src, row, col, root)
   local call = csrc.ancestor_at(root or csrc.parse(caller_src), row, col, "call_expression")
   if not call then
@@ -84,6 +98,11 @@ local function named_call_at(caller_src, row, col, root)
 end
 
 -- The name of the function called at (row, col), or nil.
+---@param caller_src string
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param root? TSNode caller_src's tree, if already parsed
+---@return string?
 function M.call_name_at(caller_src, row, col, root)
   local call, name_or_reason = named_call_at(caller_src, row, col, root)
   if not call then
@@ -93,6 +112,13 @@ function M.call_name_at(caller_src, row, col, root)
 end
 
 -- inline_call for the call at (row, col); see named_call_at.
+---@param caller_src string
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param callee_src string
+---@param N? integer default 1
+---@param mode? "correct"|"readable" default "correct"
+---@param root? TSNode caller_src's tree, if already parsed
 ---@return string? new_src
 ---@return string? err
 function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)

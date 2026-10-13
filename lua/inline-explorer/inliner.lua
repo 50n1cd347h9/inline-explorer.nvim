@@ -56,7 +56,6 @@ end
 
 -- The fetch guard is released first: without `prefetched`, expand fetches and
 -- takes the guard itself.
----@param action inline_explorer.InlineAction
 local function block_fallback(action, prefetched)
   action.finish_total("total:block-fallback", action.ident)
   view.end_fetch(action.st)
@@ -65,7 +64,6 @@ local function block_fallback(action, prefetched)
   end)
 end
 
----@param action inline_explorer.InlineAction
 local function inline_function(action, prefetched)
   local st = action.st
   local expansion_id = (st.subst_n or 0) + 1
@@ -103,7 +101,6 @@ local function inline_function(action, prefetched)
   end)
 end
 
----@param action inline_explorer.InlineAction
 local function expand_macro(action, prefetched)
   local st = action.st
   -- clangd knows only the source file.
@@ -164,6 +161,7 @@ function M.smart()
 
   -- Before resolver.fetch, so its spans carry this action's id too.
   profile.begin_action()
+  ---@type inline_explorer.InlineAction
   local action = {
     st = st,
     bufnr = bufnr,

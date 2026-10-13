@@ -49,6 +49,7 @@ local function run_profile_command(cmd)
   end
 end
 
+---@param opts? table overrides of config.defaults
 function M.setup(opts)
   local options = config.setup(opts)
   profile.enabled = options.profile
@@ -103,6 +104,7 @@ function M.setup(opts)
 end
 
 -- See nav.breadcrumb.
+---@return string
 function M.breadcrumb()
   return nav.breadcrumb()
 end

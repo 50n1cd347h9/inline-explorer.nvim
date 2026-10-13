@@ -8,6 +8,8 @@ local M = {}
 -- without one (an #ifdef straddling braces can make it an ERROR node). Extra
 -- names only cost a rename (see plan_body_edits); a missed one compiles to
 -- wrong code: a binding `int x = (x);` reads the new, uninitialised x.
+---@param call TSNode
+---@param src string
 ---@return table<string, true>
 function M.names_in_scope(call, src)
   local scope = call
@@ -61,7 +63,6 @@ end
 
 -- Edits on callee_src that suffix the body's labels and apply `rename`. None
 -- overlaps cprint's edits of `return` keywords and semicolons.
----@return inline_explorer.Edit[]
 local function plan_body_edits(body, callee_src, rename, N)
   local edits = {}
   -- Labels have function scope, so the callee's could clash with the caller's
@@ -103,6 +104,9 @@ end
 ---@field end_label string __ie_endN, which the returns jump to
 ---@field binds string[]? one `T name = (arg);` per parameter, set by analyze_call_node after the arity check
 
+---@param callee_src string
+---@param fname string
+---@param N integer
 ---@param caller_names table<string, true> see names_in_scope
 ---@return inline_explorer.IR? ir without binds
 ---@return string? err
@@ -111,6 +115,7 @@ function M.analyze_callee(callee_src, fname, N, caller_names)
   if not fn_def then
     return nil, "definition of '" .. fname .. "' not found"
   end
+  ---@cast fn_declarator -nil
   local params, variadic = csrc.get_params(fn_declarator, callee_src)
   if variadic then
     return nil, "cannot inline variadic function '" .. fname .. "'"
@@ -209,6 +214,8 @@ end
 ---@field indent string the leading spaces and tabs of that line
 ---@field indent_unit string one level of indentation
 
+---@param caller_src string
+---@param call TSNode
 ---@return inline_explorer.Ctx
 function M.analyze_context(caller_src, call)
   local target = enclosing_statement(call)
@@ -243,6 +250,10 @@ end
 -- picks "pretty" for a simple callee whose call is unconditional, else
 -- "canonical", which is valid in any expression context; readable mode avoids
 -- ({...}) and goto: "pretty" for any simple callee, else "readable_multi".
+---@param ir inline_explorer.IR
+---@param ctx inline_explorer.Ctx
+---@param mode "correct"|"readable"
+---@return "pretty"|"canonical"|"readable_multi"
 function M.decide(ir, ctx, mode)
   -- Wrapping a declaration in a block would end its scope early: later code
   -- would see whatever it shadowed. Canonical leaves it in place.
@@ -259,6 +270,14 @@ function M.decide(ir, ctx, mode)
 end
 
 -- analyze_call_node for the occ-th call to fname in caller_src.
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param N integer
+---@param occ integer
+---@return inline_explorer.IR? ir
+---@return inline_explorer.Ctx? ctx
+---@return string? err
 function M.analyze_call(caller_src, callee_src, fname, N, occ)
   local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ)[occ]
   if not call then
@@ -267,6 +286,11 @@ function M.analyze_call(caller_src, callee_src, fname, N, occ)
   return M.analyze_call_node(caller_src, callee_src, fname, N, call)
 end
 
+---@param caller_src string
+---@param callee_src string
+---@param fname string
+---@param N integer
+---@param call TSNode
 ---@return inline_explorer.IR? ir with binds
 ---@return inline_explorer.Ctx? ctx nil when ir is
 ---@return string? err
@@ -280,7 +304,7 @@ function M.analyze_call_node(caller_src, callee_src, fname, N, call)
   local arglist = call:field("arguments")[1]
   local args = {}
   for i = 0, arglist:named_child_count() - 1 do
-    args[#args + 1] = csrc.text(arglist:named_child(i), caller_src)
+    args[#args + 1] = csrc.text(arglist:named_child(i) --[[@as TSNode]], caller_src)
   end
   if #args ~= #ir.params then
     return nil, nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)

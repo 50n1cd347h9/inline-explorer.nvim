@@ -43,9 +43,8 @@ local function trimmed_line(path, lnum0)
   return text and vim.trim(text) or ""
 end
 
--- Keeps the first M._grep_max hits; `truncated` says whether there were more.
----@return table<string, { lnum: integer, col: integer }[]> hits_by_file by path; 0-based line and byte column
----@return boolean truncated
+-- The hits by path, with 0-based lines and byte columns. Keeps the first
+-- M._grep_max hits; `truncated` says whether there were more.
 local function parse_grep_output(stdout, name)
   local hits_by_file, count, truncated = {}, 0, false
   for line in stdout:gmatch("[^\n]+") do
@@ -148,7 +147,6 @@ local function grep_root(bufnr)
   return vim.fn.getcwd()
 end
 
----@return inline_explorer.CallerItem[]
 local function items_from_calls(calls, encoding)
   local items = {}
   for _, call in ipairs(calls) do
@@ -212,6 +210,8 @@ end
 -- to `bufnr`, or with grep when none offers call hierarchy or the lookup fails
 -- (see call_hierarchy). Calls `cb` once, with the items sorted by file, then
 -- line, and `note` a message to show with them, or nil.
+---@param name string
+---@param bufnr integer
 ---@param cb fun(items: inline_explorer.CallerItem[], provider: "lsp"|"grep", note: string?)
 function M.get(name, bufnr, cb)
   local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/prepareCallHierarchy" })

@@ -92,10 +92,11 @@ local function statement_end(node, row)
   return math.max(last, row)
 end
 
--- Where to put the expansion of the call at (row, col), as 0-based rows.
--- Without a statement around the call (see statement_at), both are `row`.
----@return integer at insert below this row: where the statement ends, so it is not split (see statement_end)
----@return integer indent_row copy this row's indentation: the statement's first row, not a continuation
+-- Where to put the expansion of the call at (row, col), as two 0-based rows.
+-- The first is the row to insert below: where the statement ends, so that it
+-- is not split (see statement_end). The second is the row whose indentation
+-- to copy: the statement's first row, not a continuation. Without a statement
+-- around the call (see statement_at), both are `row`.
 local function splice_row(bufnr, row, col)
   local node = statement_at(bufnr, row, col)
   if not node then
@@ -132,9 +133,10 @@ local function insert(st, bufnr, at, indent_row, name, body, label)
   end)
 end
 
--- `prefetched` ({ name, body, label }) is a definition that inliner.lua has
--- already fetched: it is inserted without a lookup. A user command passes its
--- opts table here instead, so a table without a non-empty `body` is ignored.
+-- `prefetched` is a definition that inliner.lua has already fetched: it is
+-- inserted without a lookup. A user command passes its opts table here
+-- instead, so a table without a non-empty `body` is ignored.
+---@param prefetched? { name?: string, body: string[], label: string }|vim.api.keyset.create_user_command.command_args
 function M.expand(prefetched)
   local st = view.current()
   if not st then

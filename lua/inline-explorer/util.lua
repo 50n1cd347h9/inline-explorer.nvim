@@ -1,5 +1,7 @@
 local M = {}
 
+---@param msg string
+---@param level? integer a vim.log.levels value
 function M.notify(msg, level)
   vim.notify("[inline-explorer] " .. msg, level)
 end
@@ -14,6 +16,10 @@ local STRICT_INDEXING = false
 
 -- LSP `character` -> byte column. A character past the end of the line gives
 -- the line's length.
+---@param line_text string
+---@param character integer
+---@param encoding? string
+---@return integer
 function M.byte_col(line_text, character, encoding)
   if not encoding or encoding == "utf-8" or character == 0 then
     return character
@@ -30,6 +36,10 @@ end
 
 -- Byte column -> LSP `character`. A byte past the end of the line counts as
 -- the line's end, and a failed conversion returns `byte`.
+---@param line_text string
+---@param byte integer
+---@param encoding? string
+---@return integer
 function M.lsp_col(line_text, byte, encoding)
   if not encoding or encoding == "utf-8" or byte == 0 then
     return byte
@@ -47,6 +57,10 @@ end
 
 -- Drop the least recently used entries of `cache`, by their `at` stamps, until
 -- `cap` remain. `on_evict(key, entry)` runs after each entry is removed.
+---@generic K, V: { at: number }
+---@param cache table<K, V>
+---@param cap integer
+---@param on_evict? fun(key: K, entry: V)
 function M.evict_lru(cache, cap, on_evict)
   local entries = {}
   for k, e in pairs(cache) do
