@@ -18,7 +18,8 @@ local M = {}
 ---@field text string the call's line, trimmed
 ---@field encoding? string the server's offset encoding; nil (grep) means bytes
 
--- How long each call hierarchy request may take before grep answers instead.
+-- How long the call hierarchy requests may take, together, before grep
+-- answers instead.
 M._timeout_ms = 4000
 -- The most grep hits checked; with more, the answer is marked as truncated.
 M._grep_max = 200
@@ -187,6 +188,7 @@ end
 -- prepareCallHierarchy, then incomingCalls. Grep answers instead on an error,
 -- an empty answer or a timeout, which also cancels the request. Calls cb once.
 local function call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
+  local deadline = vim.uv.now() + M._timeout_ms
   local function fall_back_to_grep()
     grep_callers(name, root_dir, cb)
   end
@@ -201,7 +203,8 @@ local function call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
       return fall_back_to_grep()
     end
     local request = { item = items[1] }
-    async.request(client, "callHierarchy/incomingCalls", request, target_bufnr, M._timeout_ms, on_incoming_calls)
+    local remaining = math.max(deadline - vim.uv.now(), 0)
+    async.request(client, "callHierarchy/incomingCalls", request, target_bufnr, remaining, on_incoming_calls)
   end
   async.request(client, "textDocument/prepareCallHierarchy", params, target_bufnr, M._timeout_ms, on_prepared)
 end

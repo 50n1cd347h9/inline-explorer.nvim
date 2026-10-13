@@ -488,6 +488,60 @@ do
   end, 20)
 end
 
+-- 3d. prepareCallHierarchy and incomingCalls share one budget: a slow
+-- prepare leaves incomingCalls only what remains, so grep answers after
+-- callers._timeout_ms, not up to twice that.
+do
+  local resolver = require("inline-explorer.resolver")
+  local liburi = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c"))
+  local name_range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } }
+  vim.api.nvim_set_current_buf(buf) -- fake_lsp.start attaches to the current buffer
+  local cid6, log6 = fake_lsp.start({
+    name = "slowhier",
+    buf = buf,
+    root_dir = dir,
+    capabilities = { callHierarchyProvider = true, workspaceSymbolProvider = true },
+    handle = function(method, _, callback)
+      if method == "workspace/symbol" then
+        callback(nil, { { name = "target_fn", kind = 12, location = { uri = liburi, range = name_range } } })
+      elseif method == "textDocument/prepareCallHierarchy" then
+        vim.defer_fn(function()
+          callback(
+            nil,
+            { { name = "target_fn", kind = 12, uri = liburi, range = name_range, selectionRange = name_range } }
+          )
+        end, 420)
+      end -- incomingCalls: never answered
+    end,
+    skip = "shared call hierarchy budget checks (in-process LSP server unavailable)",
+  })
+  if cid6 then
+    resolver.clear_caches()
+    local saved = callers._timeout_ms
+    callers._timeout_ms = 600
+    local started, elapsed, source = vim.uv.hrtime(), nil, nil
+    callers.get("target_fn", buf, function(_, s2)
+      elapsed, source = (vim.uv.hrtime() - started) / 1e6, s2
+    end)
+    vim.wait(5000, function()
+      return elapsed ~= nil
+    end, 10)
+    callers._timeout_ms = saved
+    check(
+      "shared budget: grep answers once the one budget is spent",
+      source == "grep"
+        and elapsed
+        and elapsed < 900
+        and fake_lsp.count(log6.requests, "callHierarchy/incomingCalls") == 1,
+      ("source=%s elapsed=%s"):format(tostring(source), tostring(elapsed))
+    )
+    vim.lsp.stop_client(cid6, true)
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 20)
+  end
+end
+
 -- callers.get must reach the LSP path with the REAL file, regardless of
 -- which window is current. The old code built position params from window
 -- 0; the plugin's own keymap lives inside the reading view -- a detached
