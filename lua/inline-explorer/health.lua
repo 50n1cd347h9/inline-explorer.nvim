@@ -25,12 +25,10 @@ local function check_client(client)
   else
     health.warn(("%s: no documentSymbol -- falling back to tree-sitter extraction"):format(client.name))
   end
-  if client.name == "clangd" then
-    if macro.supports_tweak(client) then
-      health.ok("clangd: applyTweak supported (ExpandMacro path)")
-    else
-      health.warn("clangd: no applyTweak -- macro expansion uses hover scraping only")
-    end
+  if macro.supports_tweak(client) then
+    health.ok(("%s: applyTweak supported (macro expansion)"):format(client.name))
+  elseif client.name == "clangd" then
+    health.warn("clangd: no applyTweak -- macros are block-pasted, not expanded")
   end
 end
 

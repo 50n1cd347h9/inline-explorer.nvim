@@ -302,6 +302,85 @@ do
   end
 end
 
+-- 3c. Two call hierarchy servers, the first of which never answers: the
+-- question goes to the server that found the symbol, and only that one is
+-- attached to the symbol's file.
+do
+  local resolver = require("inline-explorer.resolver")
+  local liburi = vim.uri_from_fname(vim.fn.resolve(dir .. "/lib.c"))
+  local use1 = vim.uri_from_fname(vim.fn.resolve(dir .. "/use1.c"))
+  local hung_prepares = 0
+  local caps = { callHierarchyProvider = true, workspaceSymbolProvider = true }
+  vim.cmd.edit(dir .. "/use2.c")
+  local ubuf = vim.api.nvim_get_current_buf()
+  local hung_id = fake_lsp.start({
+    name = "hunghier",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method)
+      if method == "textDocument/prepareCallHierarchy" then
+        hung_prepares = hung_prepares + 1
+      end
+    end,
+    skip = "two-server callers checks (in-process LSP server unavailable)",
+  })
+  local found_id = fake_lsp.start({
+    name = "foundhier",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method, _, callback)
+      local name_range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 13 } }
+      if method == "workspace/symbol" then
+        callback(nil, { { name = "target_fn", kind = 12, location = { uri = liburi, range = name_range } } })
+      elseif method == "textDocument/prepareCallHierarchy" then
+        callback(
+          nil,
+          { { name = "target_fn", kind = 12, uri = liburi, range = name_range, selectionRange = name_range } }
+        )
+      elseif method == "callHierarchy/incomingCalls" then
+        local from_range = { start = { line = 1, character = 0 }, ["end"] = { line = 4, character = 1 } }
+        callback(nil, {
+          {
+            from = { name = "u1", kind = 12, uri = use1, range = from_range, selectionRange = from_range },
+            fromRanges = { { start = { line = 3, character = 11 }, ["end"] = { line = 3, character = 20 } } },
+          },
+        })
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "two-server callers checks (in-process LSP server unavailable)",
+  })
+  if hung_id and found_id then
+    resolver.clear_caches()
+    local saved_r, saved_c = resolver._timeout_ms, callers._timeout_ms
+    resolver._timeout_ms, callers._timeout_ms = 300, 3000
+    local done, source = false, nil
+    callers.get("target_fn", ubuf, function(_, s2)
+      source, done = s2, true
+    end)
+    vim.wait(10000, function()
+      return done
+    end, 10)
+    resolver._timeout_ms, callers._timeout_ms = saved_r, saved_c
+    local libbuf = vim.uri_to_bufnr(liburi)
+    check(
+      "two servers: the call hierarchy of the server that found the symbol answers",
+      done and source == "lsp" and hung_prepares == 0,
+      ("source=%s hung prepares=%d"):format(tostring(source), hung_prepares)
+    )
+    check("two servers: the other server is not attached for it", not vim.lsp.buf_is_attached(libbuf, hung_id))
+  end
+  for _, id in ipairs({ hung_id, found_id }) do
+    vim.lsp.stop_client(id, true)
+  end
+  vim.wait(1000, function()
+    return #vim.lsp.get_clients({ bufnr = ubuf }) == 0
+  end, 20)
+end
+
 -- callers.get must reach the LSP path with the REAL file, regardless of
 -- which window is current. The old code built position params from window
 -- 0; the plugin's own keymap lives inside the reading view -- a detached

@@ -133,10 +133,11 @@ executed via `workspace/executeCommand`, and the `workspace/applyEdit` it sends
 back is intercepted — kept out of the real file (a reply straggling past the
 timeout + grace window, ~5 s, is the one exception) — with the `newText` of its
 edit at the macro use taken as the expansion (clangd formats the result, so the
-other edits only change whitespace). When the tweak is unavailable (older
-clangd, no action at the position, errors, timeout) the fallback scrapes
+other edits only change whitespace). When the tweak finds no action at the
+position, errors or times out, the fallback scrapes the same server's
 `textDocument/hover` markdown (clangd puts `#define` and the expansion in one
 code block separated by an "Expands to" marker; we take the part after it).
+Both go only to the server that offers the tweak, whatever its name.
 
 The smart `ei` action splices that expansion **in place** of the macro use (the
 same fetch→replace path as functions, with the fetch preferring the tweak and

@@ -644,4 +644,132 @@ do
   end
 end
 
+-- The expansion comes from the server with the tweak, whatever it is called,
+-- and only that server is asked for the hover: another server's hover text
+-- hid clangd's expansion when its client id was lower, and one that never
+-- answered held the fetch forever.
+do
+  local fake_lsp = require("tests.lib.fake_lsp")
+  local dir = H.tmpdir()
+  H.writef(dir .. "/h.c", "#define TWICE(x) ((x) * 2)\nint f(int a) { return TWICE(a); }\n")
+  vim.cmd.edit(dir .. "/h.c")
+  local buf = vim.api.nvim_get_current_buf()
+  local uri = vim.uri_from_bufnr(buf)
+  local tweak_caps = {
+    codeActionProvider = true,
+    hoverProvider = true,
+    executeCommandProvider = { commands = { "clangd.applyTweak" } },
+  }
+  local clangd_hover = {
+    contents = {
+      kind = "markdown",
+      value = "### macro `TWICE`\n\n---\n```cpp\n#define TWICE(x) ((x) * 2)\n\n// Expands to\n((a) * 2)\n```",
+    },
+  }
+  local function start(name, capabilities, handle)
+    return fake_lsp.start({
+      name = name,
+      buf = buf,
+      root_dir = dir,
+      capabilities = capabilities,
+      handle = handle,
+      skip = "expansion-server checks (in-process LSP server unavailable)",
+    })
+  end
+  local function stop_all()
+    for _, c in ipairs(vim.lsp.get_clients({ bufnr = buf })) do
+      vim.lsp.stop_client(c.id, true)
+    end
+    vim.wait(1000, function()
+      return #vim.lsp.get_clients({ bufnr = buf }) == 0
+    end, 10)
+  end
+  local function fetch()
+    local got, t0 = nil, vim.uv.hrtime()
+    macro.fetch_expansion({ source_bufnr = buf }, 1, 22, function(lines)
+      got = lines or false
+    end)
+    vim.wait(5000, function()
+      return got ~= nil
+    end, 10)
+    return got, (vim.uv.hrtime() - t0) / 1e6
+  end
+  -- clangd with no tweak at the position, so the hover is asked.
+  local function hover_only(reply)
+    return function(method, _, callback)
+      if method == "textDocument/codeAction" then
+        callback(nil, {})
+      elseif method == "textDocument/hover" then
+        if reply then
+          callback(nil, reply)
+        end
+      else
+        callback(nil, nil)
+      end
+    end
+  end
+
+  local other_hovers = 0
+  local other = start("typos", { hoverProvider = true }, function(method, _, callback)
+    if method == "textDocument/hover" then
+      other_hovers = other_hovers + 1
+      callback(nil, { contents = { kind = "markdown", value = "spelling: `TWICE` looks fine" } })
+    end
+  end)
+  local clangd = start("clangd", tweak_caps, hover_only(clangd_hover))
+  if other and clangd then
+    local got = fetch()
+    check(
+      "hover: only the server with the tweak is asked, so no other text can hide the expansion",
+      got and got[1] == "((a) * 2)" and other_hovers == 0,
+      { got = got, other_hovers = other_hovers }
+    )
+  end
+  stop_all()
+
+  local hung = start("hung", { hoverProvider = true }, function() end)
+  clangd = start("clangd", tweak_caps, hover_only(clangd_hover))
+  if hung and clangd then
+    local got, ms = fetch()
+    check(
+      "hover: a second server that never answers does not hold the fetch",
+      got and got[1] == "((a) * 2)" and ms < 1500,
+      { got = got, ms = ms }
+    )
+  end
+  stop_all()
+
+  clangd = start("clangd", tweak_caps, hover_only(nil))
+  if clangd then
+    local got, ms = fetch()
+    check("hover: an unanswered hover ends the fetch, empty, at its timeout", got == false and ms < 4500, {
+      got = got,
+      ms = ms,
+    })
+  end
+  stop_all()
+
+  -- Not called "clangd" (a versioned binary, say), but it has the tweak.
+  local renamed = start("clangd-18", tweak_caps, function(method, _, callback, server)
+    if method == "textDocument/codeAction" then
+      local cmd = { title = "Expand macro", command = "clangd.applyTweak", arguments = { { tweakID = "ExpandMacro" } } }
+      callback(nil, { { title = "Expand macro TWICE", kind = "refactor", command = cmd } })
+    elseif method == "workspace/executeCommand" then
+      local range = { start = { line = 1, character = 22 }, ["end"] = { line = 1, character = 30 } }
+      server.request(
+        "workspace/applyEdit",
+        { edit = { changes = { [uri] = { { range = range, newText = "((a) * 2)" } } } } }
+      )
+      callback(nil, vim.NIL)
+    else
+      callback(nil, nil)
+    end
+  end)
+  if renamed then
+    local got = fetch()
+    check("tweak: a server with the tweak is used whatever its name", got and got[1] == "((a) * 2)", got)
+  end
+  stop_all()
+end
+
 H.finish("MACRO")

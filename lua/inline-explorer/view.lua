@@ -314,7 +314,8 @@ M.FETCH_GUARD_MS = nil
 -- extract), and either extract can be cold. 3 * timeout + max(cold, timeout)
 -- covers them while cold <= timeout (the defaults are 2000 and 4000); one
 -- second of slack is added. An inline that goes on to macro.fetch_expansion
--- can outlast the guard: its hover request has no timeout.
+-- adds up to 2000ms each for the tweak and the hover, which fits because a
+-- macro is never chased.
 local function guard_ms()
   if M.FETCH_GUARD_MS then
     return M.FETCH_GUARD_MS

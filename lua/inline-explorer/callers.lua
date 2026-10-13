@@ -206,17 +206,17 @@ local function call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
   client:request("textDocument/prepareCallHierarchy", params, on_prepared, target_bufnr)
 end
 
--- Find the call sites of function `name` with the language servers attached
--- to `bufnr`, or with grep when none offers call hierarchy or the lookup fails
--- (see call_hierarchy). Calls `cb` once, with the items sorted by file, then
--- line, and `note` a message to show with them, or nil.
+-- Find the call sites of function `name` with the language server that
+-- finds it from `bufnr`, or with grep when no server offers call hierarchy or
+-- the lookup fails (see call_hierarchy). Calls `cb` once, with the items
+-- sorted by file, then line, and `note` a message to show with them, or nil.
 ---@param name string
 ---@param bufnr integer
 ---@param cb fun(items: inline_explorer.CallerItem[], provider: "lsp"|"grep", note: string?)
 function M.get(name, bufnr, cb)
-  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/prepareCallHierarchy" })
+  local method = "textDocument/prepareCallHierarchy"
   local root_dir = grep_root(bufnr)
-  if #clients == 0 then
+  if #vim.lsp.get_clients({ bufnr = bufnr, method = method }) == 0 then
     grep_callers(name, root_dir, cb)
     return
   end
@@ -225,16 +225,12 @@ function M.get(name, bufnr, cb)
   -- locate, not locate_definition: call hierarchy accepts a declaration, so no
   -- extract or chase is needed.
   resolver.locate(name, bufnr, function(loc)
-    if not loc then
+    local client = loc and resolver.client_for(loc, bufnr, method)
+    if not (loc and client) then
       grep_callers(name, root_dir, cb)
       return
     end
-    local target_bufnr = resolver.ensure_attached(loc.uri, bufnr)
-    if not target_bufnr then
-      grep_callers(name, root_dir, cb)
-      return
-    end
-    local client = clients[1]
+    local target_bufnr = resolver.ensure_attached(loc.uri, client)
     local params = {
       textDocument = { uri = loc.uri },
       position = resolver.name_position(target_bufnr, loc, client.offset_encoding),

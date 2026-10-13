@@ -28,6 +28,7 @@
 ---@field kind? lsp.SymbolKind
 ---@field name? string
 ---@field encoding? string offset_encoding of the server that answered; nil counts as bytes
+---@field client_id? integer the server that answered; requests about the loc go to it
 
 local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
@@ -185,14 +186,45 @@ local function unsupported(bufnr, method)
   )
 end
 
--- Only an exact name match counts.
+-- The first exact match in the replies, taken in client order. workspace/symbol
+-- matches fuzzily, and its first result can be an unrelated symbol whose
+-- lines would be shown without warning.
+local function pick_symbol(name, clients, replies)
+  local closest
+  for i, client in ipairs(clients) do
+    local symbols = replies[i]
+    for _, s in ipairs(type(symbols) == "table" and symbols or {}) do
+      if s.name == name then
+        local l = s.location
+        return {
+          uri = l.uri,
+          range = l.range,
+          kind = s.kind,
+          name = s.name,
+          encoding = client.offset_encoding,
+          client_id = client.id,
+        }
+      end
+      closest = closest or s.name or "?"
+    end
+  end
+  if not closest then
+    return nil, "no symbol named '" .. name .. "'"
+  end
+  return nil, ("no symbol named exactly '%s' (closest: %s -- index incomplete?)"):format(name, closest)
+end
+
+-- Only an exact name match counts. Every server that supports
+-- workspace/symbol is asked; the answer comes once all have replied, or at
+-- the deadline from the replies that have arrived, so a server that hangs
+-- cannot hide another's answer.
 ---@param name string
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(loc: inline_explorer.Loc?, err: string?)
 function M.locate(name, source_bufnr, cb)
   local bufnr = source_buf(source_bufnr)
-  -- Without one, buf_request_all would never call back.
-  if #vim.lsp.get_clients({ bufnr = bufnr, method = "workspace/symbol" }) == 0 then
+  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "workspace/symbol" })
+  if #clients == 0 then
     return cb(nil, unsupported(bufnr, "workspace/symbol"))
   end
 
@@ -205,6 +237,7 @@ function M.locate(name, source_bufnr, cb)
   end
 
   local span = profile.start()
+  local replies = {}
   local finish = once_with_timeout(function(loc, err)
     if loc then
       span("locate:ok", describe(loc.name or name, loc.uri))
@@ -214,40 +247,29 @@ function M.locate(name, source_bufnr, cb)
     end
     cb(loc, err)
   end, function()
+    local loc = pick_symbol(name, clients, replies)
+    if loc then
+      return loc, nil
+    end
     return nil, "workspace/symbol timed out (server busy or stuck?)"
   end)
-  vim.lsp.buf_request_all(bufnr, "workspace/symbol", { query = name }, function(results)
-    local all, encoding_of = {}, {}
-    for client_id, r in pairs(results or {}) do
-      local client = vim.lsp.get_client_by_id(client_id)
-      for _, s in ipairs(r.result or {}) do
-        all[#all + 1] = s
-        encoding_of[s] = client and client.offset_encoding
-      end
-    end
-    if #all == 0 then
-      return finish(nil, "no symbol named '" .. name .. "'")
-    end
 
-    -- workspace/symbol matches fuzzily, and its first result can be an
-    -- unrelated symbol whose lines would be shown without warning.
-    local pick
-    for _, s in ipairs(all) do
-      if s.name == name then
-        pick = s
-        break
-      end
+  local unanswered = #clients
+  local function on_reply(i, result)
+    replies[i] = result or {}
+    unanswered = unanswered - 1
+    if unanswered == 0 then
+      finish(pick_symbol(name, clients, replies))
     end
-    if not pick then
-      return finish(
-        nil,
-        ("no symbol named exactly '%s' (closest: %s -- index incomplete?)"):format(name, all[1].name or "?")
-      )
+  end
+  for i, client in ipairs(clients) do
+    local sent = client:request("workspace/symbol", { query = name }, function(_, result)
+      on_reply(i, result)
+    end, bufnr)
+    if not sent then
+      on_reply(i, nil)
     end
-
-    local loc = pick.location
-    finish({ uri = loc.uri, range = loc.range, kind = pick.kind, name = pick.name, encoding = encoding_of[pick] }, nil)
-  end)
+  end
 end
 
 -- Function-like kinds get the label tree-sitter gives a C function,
@@ -324,16 +346,11 @@ function M._symbol_range(symbols, ref_range, name, uri)
 end
 
 -- Raises on a malformed reply.
-local function lines_from_symbols(results, loc, target)
-  local range, label
-  for _, r in pairs(results or {}) do
-    if r.result then
-      range, label = M._symbol_range(r.result, loc.range, loc.name, loc.uri)
-      if range then
-        break
-      end
-    end
+local function lines_from_symbols(symbols, loc, target)
+  if type(symbols) ~= "table" then
+    return nil, nil
   end
+  local range, label = M._symbol_range(symbols, loc.range, loc.name, loc.uri)
   if not range then
     return nil, nil
   end
@@ -475,51 +492,69 @@ M._attach_cache_max = 8
 ---@type table<integer, {ids: integer[], at: integer}>
 M._attach_cache = {}
 
--- A buffer whose clients were all attached already is not recorded, so
--- eviction only detaches clients this module attached.
-local function cache_attachment(target, newly_attached)
+-- A buffer whose client was attached already is not recorded, so eviction
+-- only detaches clients this module attached.
+local function cache_attachment(target, newly_attached_id)
   local cache = M._attach_cache
-  if cache[target] then
-    cache[target].at = vim.uv.now()
-  elseif #newly_attached > 0 then
-    cache[target] = { ids = newly_attached, at = vim.uv.now() }
+  local entry = cache[target]
+  if not entry and newly_attached_id then
+    entry = { ids = {} }
+    cache[target] = entry
   end
-  util.evict_lru(cache, M._attach_cache_max, function(evicted_buf, entry)
+  if entry then
+    entry.at = vim.uv.now()
+    entry.ids[#entry.ids + 1] = newly_attached_id
+  end
+  util.evict_lru(cache, M._attach_cache_max, function(evicted_buf, evicted)
     if vim.api.nvim_buf_is_valid(evicted_buf) and #vim.fn.win_findbuf(evicted_buf) == 0 then
-      for _, id in ipairs(entry.ids) do
+      for _, id in ipairs(evicted.ids) do
         pcall(vim.lsp.buf_detach_client, evicted_buf, id)
       end
     end
   end)
 end
 
-local function attach_clients(target, clients)
+-- True when client was not attached to target yet.
+local function attach_client(target, client)
   vim.fn.bufload(target)
-  local newly_attached = {}
-  for _, c in ipairs(clients) do
-    local already_attached = c.attached_buffers and c.attached_buffers[target]
-    vim.lsp.buf_attach_client(target, c.id)
-    if not already_attached then
-      newly_attached[#newly_attached + 1] = c.id
-    end
+  local newly_attached = not client.attached_buffers[target]
+  if newly_attached then
+    vim.lsp.buf_attach_client(target, client.id)
   end
-  cache_attachment(target, newly_attached)
+  cache_attachment(target, newly_attached and client.id or nil)
   return newly_attached
 end
 
--- Attaches source_bufnr's clients to uri's file, since clangd answers
--- position requests only about documents it has open.
+-- Attaches `client` to uri's file, since clangd answers position requests
+-- only about documents it has open.
 ---@param uri string
----@param source_bufnr integer? nil or invalid counts as the current buffer
----@return integer? target the file's bufnr, nil when source_bufnr has no clients
-function M.ensure_attached(uri, source_bufnr)
-  local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
-  if #clients == 0 then
-    return nil
-  end
+---@param client vim.lsp.Client
+---@return integer target the file's bufnr
+function M.ensure_attached(uri, client)
   local target = vim.uri_to_bufnr(uri)
-  attach_clients(target, clients)
+  attach_client(target, client)
   return target
+end
+
+-- Where requests about loc go: to the server that found it, else to the
+-- first one on the source buffer that supports `method`. nil when the server
+-- that found it does not: another server's ranges, encoding and index need
+-- not agree with the loc.
+---@param loc inline_explorer.Loc
+---@param source_bufnr integer? nil or invalid counts as the current buffer
+---@param method string
+---@return vim.lsp.Client?
+function M.client_for(loc, source_bufnr, method)
+  local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr), method = method })
+  if not loc.client_id then
+    return clients[1]
+  end
+  for _, c in ipairs(clients) do
+    if c.id == loc.client_id then
+      return c
+    end
+  end
+  return nil
 end
 
 local function extract_local(loc, target)
@@ -537,7 +572,8 @@ end
 -- Calls cb exactly once on every path, possibly synchronously.
 -- The steps, in order:
 --   1. no client on source_bufnr -> local extraction
---   2. load the definition file and attach the source buffer's clients
+--   2. load the definition file and attach the documentSymbol client
+--      (M.client_for)
 --   3. cached lines              -> done
 --   4. C/C++                     -> local extraction, if tree-sitter finds a node
 --   5. no documentSymbol client  -> local extraction
@@ -548,7 +584,8 @@ end
 ---@param cb fun(lines: string[], label: string)
 function M.extract(loc, source_bufnr, cb)
   local span = profile.start()
-  local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr) })
+  local src = source_buf(source_bufnr)
+  local clients = vim.lsp.get_clients({ bufnr = src })
   for _, c in ipairs(clients) do
     profile.identify(c)
   end
@@ -577,13 +614,15 @@ function M.extract(loc, source_bufnr, cb)
   end
 
   -- Attach even on a cache hit (step 3): the attach cache may have detached
-  -- this file since its lines were cached (detaching keeps the changedtick),
-  -- and the chase in M.locate_definition asks its clients.
-  local attach_span = profile.start()
-  local newly_attached = attach_clients(target, clients)
-  local cold = #newly_attached > 0
-  if cold then
-    attach_span("extract:attach", detail())
+  -- this file since its lines were cached (detaching keeps the changedtick).
+  local client = M.client_for(loc, src, "textDocument/documentSymbol")
+  local cold = false
+  if client then
+    local attach_span = profile.start()
+    cold = attach_client(target, client)
+    if cold then
+      attach_span("extract:attach", detail())
+    end
   end
 
   local key = extract_key(loc)
@@ -611,9 +650,8 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
 
-  -- 5. With no client supporting the method, buf_request_all reports an
-  -- error and never calls its handler.
-  if #vim.lsp.get_clients({ bufnr = target, method = "textDocument/documentSymbol" }) == 0 then
+  -- 5.
+  if not client then
     local lines, label = M.extract_sync(loc)
     span("extract:no-capability", detail())
     return cb(lines, label)
@@ -644,8 +682,8 @@ function M.extract(loc, source_bufnr, cb)
   -- budget the server needed.
   local function retry_in_background()
     local probe = profile.enabled and profile.start() or nil
-    vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
-      local ok, lines, label = pcall(lines_from_symbols, results, loc, target)
+    client:request("textDocument/documentSymbol", params, function(_, result)
+      local ok, lines, label = pcall(lines_from_symbols, result, loc, target)
       local got_lines = ok and lines ~= nil
       if got_lines then
         local now_tick = tick_of(target)
@@ -656,7 +694,7 @@ function M.extract(loc, source_bufnr, cb)
       if probe then
         probe(got_lines and "extract:retry-after-timeout" or "extract:retry-failed", detail())
       end
-    end)
+    end, target)
   end
 
   local function on_timeout()
@@ -674,16 +712,16 @@ function M.extract(loc, source_bufnr, cb)
   end
 
   local finish = once_with_timeout(on_reply, on_timeout, budget)
-  vim.lsp.buf_request_all(target, "textDocument/documentSymbol", params, function(results)
+  client:request("textDocument/documentSymbol", params, function(_, result)
     -- pcall: on a malformed reply, extract locally now rather than at the
     -- timeout.
-    local ok, lines, label = pcall(lines_from_symbols, results, loc, target)
+    local ok, lines, label = pcall(lines_from_symbols, result, loc, target)
     if ok and lines then
       finish(lines, label)
     else
       finish(M.extract_sync(loc))
     end
-  end)
+  end, target)
 end
 
 -- Where loc.name appears as a whole word in the 4 lines from loc's start
@@ -710,17 +748,15 @@ function M.name_position(target, loc, out_encoding)
 end
 
 ---@param loc inline_explorer.Loc a declaration
+---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(dloc: inline_explorer.Loc?) nil on no client or answer, an error, a timeout, or loc itself
-function M._chase_definition(loc, cb)
-  local target = existing_buf(loc.uri)
-  if not target then
+function M._chase_definition(loc, source_bufnr, cb)
+  local client = M.client_for(loc, source_bufnr, "textDocument/definition")
+  if not client then
     return cb(nil)
   end
-  local clients = vim.lsp.get_clients({ bufnr = target, method = "textDocument/definition" })
-  if #clients == 0 then
-    return cb(nil)
-  end
-  local encoding = clients[1].offset_encoding
+  local target = M.ensure_attached(loc.uri, client)
+  local encoding = client.offset_encoding
   local pos = M.name_position(target, loc, encoding)
 
   local span = profile.start()
@@ -735,7 +771,7 @@ function M._chase_definition(loc, cb)
   end, function()
     return nil, "timeout"
   end)
-  clients[1]:request("textDocument/definition", {
+  client:request("textDocument/definition", {
     textDocument = { uri = loc.uri },
     position = pos,
   }, function(err, result)
@@ -763,7 +799,7 @@ function M._chase_definition(loc, cb)
     if uri == loc.uri and range.start.line == pos.line then
       return finish(nil, "self -- the index does not know the defining file (compile_commands.json missing?)")
     end
-    finish({ uri = uri, range = range, kind = loc.kind, name = loc.name, encoding = encoding })
+    finish({ uri = uri, range = range, kind = loc.kind, name = loc.name, encoding = encoding, client_id = client.id })
   end, target)
 end
 
@@ -801,7 +837,7 @@ function M.locate_definition(name, source_bufnr, cb)
       if miss_at and (vim.uv.now() - miss_at) < M._chase_miss_ttl_ms then
         return keep_declaration()
       end
-      M._chase_definition(loc, function(dloc)
+      M._chase_definition(loc, source_bufnr, function(dloc)
         if not dloc then
           M._chase_miss[miss_key] = vim.uv.now()
           return keep_declaration()

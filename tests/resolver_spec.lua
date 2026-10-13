@@ -1030,6 +1030,133 @@ do
   end
 end
 
+-- Two servers on one buffer: "found" knows the symbol, "hung" accepts every
+-- request and answers none. The lookup must not wait for "hung" past its
+-- deadline, and everything asked about the symbol afterwards goes to the
+-- server that found it -- not to the other one, and not to an arbitrary
+-- first client.
+do
+  local dir = H.tmpdir()
+  H.writef(dir .. "/api.h", "int two_fn(int a);\n")
+  H.writef(dir .. "/impl.c", "int two_fn(int a)\n{\n    return a;\n}\n")
+  local huri = vim.uri_from_fname(vim.fn.resolve(dir .. "/api.h"))
+  local curi = vim.uri_from_fname(vim.fn.resolve(dir .. "/impl.c"))
+  vim.cmd.edit(dir .. "/use.c")
+  local ubuf = vim.api.nvim_get_current_buf()
+  local asked = { found = {}, hung = {} }
+  local function count(server, method)
+    asked[server][method] = (asked[server][method] or 0) + 1
+  end
+  local caps = { workspaceSymbolProvider = true, documentSymbolProvider = true, definitionProvider = true }
+  -- Started first, so that it is the first client of the buffer.
+  local hung_id = fake_lsp.start({
+    name = "hung",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method)
+      count("hung", method)
+    end,
+    skip = "two-server checks (in-process LSP server unavailable)",
+  })
+  local found_id = fake_lsp.start({
+    name = "found",
+    buf = ubuf,
+    root_dir = dir,
+    capabilities = caps,
+    handle = function(method, _, callback)
+      count("found", method)
+      if method == "workspace/symbol" then
+        callback(nil, { { name = "two_fn", kind = 12, location = { uri = huri, range = range(0, 4, 0, 10) } } })
+      elseif method == "textDocument/definition" then
+        callback(nil, { { uri = curi, range = range(0, 4, 0, 10) } })
+      elseif method == "textDocument/documentSymbol" then
+        callback(nil, {})
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "two-server checks (in-process LSP server unavailable)",
+  })
+  if hung_id and found_id then
+    resolver.clear_caches()
+    local saved_t, saved_c, saved_lf = resolver._timeout_ms, resolver._cold_timeout_ms, resolver._local_first
+    resolver._timeout_ms, resolver._cold_timeout_ms = 300, 300
+    local done, loc, lerr = false, nil, nil
+    resolver.locate("two_fn", ubuf, function(l, e)
+      loc, lerr, done = l, e, true
+    end)
+    vim.wait(3000, function()
+      return done
+    end, 5)
+    check(
+      "two servers: at the deadline, the answer that arrived is used",
+      loc ~= nil and loc.uri == huri,
+      { loc = loc, err = lerr }
+    )
+    check("two servers: the loc records the server that found it", loc ~= nil and loc.client_id == found_id, loc)
+
+    -- The loc locate returns, so that the checks below do not depend on it.
+    local found_loc = {
+      uri = huri,
+      range = range(0, 4, 0, 10),
+      kind = 12,
+      name = "two_fn",
+      client_id = found_id,
+    }
+    do
+      -- The server path, so that documentSymbol is asked at all.
+      resolver._local_first = false
+      local got = false
+      resolver.extract(found_loc, ubuf, function()
+        got = true
+      end)
+      vim.wait(3000, function()
+        return got
+      end, 5)
+      local hbuf = vim.uri_to_bufnr(huri)
+      check(
+        "two servers: documentSymbol goes only to the server that found the symbol",
+        got and asked.found["textDocument/documentSymbol"] == 1 and asked.hung["textDocument/documentSymbol"] == nil,
+        asked
+      )
+      check(
+        "two servers: only that server is attached to the definition file",
+        vim.lsp.buf_is_attached(hbuf, found_id) and not vim.lsp.buf_is_attached(hbuf, hung_id),
+        vim.tbl_map(function(c)
+          return c.name
+        end, vim.lsp.get_clients({ bufnr = hbuf }))
+      )
+
+      local chased
+      pcall(resolver._chase_definition, found_loc, ubuf, function(dloc)
+        chased = dloc or false
+      end)
+      vim.wait(3000, function()
+        return chased ~= nil
+      end, 5)
+      check(
+        "two servers: the chase asks only the server that found the symbol",
+        chased and chased.uri == curi and asked.hung["textDocument/definition"] == nil,
+        { chased = chased, asked = asked }
+      )
+      check(
+        "two servers: the chased loc records the server that answered",
+        chased and chased.client_id == found_id,
+        chased
+      )
+    end
+    resolver._timeout_ms, resolver._cold_timeout_ms, resolver._local_first = saved_t, saved_c, saved_lf
+    resolver.clear_caches()
+  end
+  for _, id in ipairs({ hung_id, found_id }) do
+    vim.lsp.stop_client(id, true)
+  end
+  vim.wait(1000, function()
+    return #vim.lsp.get_clients({ bufnr = ubuf }) == 0
+  end, 10)
+end
+
 -- A server attached to the buffer that cannot answer workspace/symbol is no
 -- server for locate. Asking anyway sent nothing, raised Neovim's own "not
 -- supported" error, and reported a timeout once the whole budget had passed.

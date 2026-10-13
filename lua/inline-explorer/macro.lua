@@ -7,6 +7,7 @@
 -- GRACE_MS (the grace window) discards a late matching applyEdit rather than
 -- let it edit the source buffer.
 
+local async = require("inline-explorer.async")
 local csrc = require("inline-explorer.csrc")
 local profile = require("inline-explorer.profile")
 local simplify = require("inline-explorer.simplify")
@@ -115,7 +116,8 @@ function M.replace_in_src(src, row, col, exp_lines, root)
   return src:sub(1, csrc.start_byte(invocation)) .. rep .. src:sub(csrc.end_byte(invocation) + 1)
 end
 
-local TWEAK_TIMEOUT_MS = 2000
+-- Budget for the tweak (codeAction through applyEdit), and again for the hover.
+local TIMEOUT_MS = 2000
 
 ---@param actions any
 ---@return lsp.Command? cmd the command of the "Expand macro" action in a codeAction reply
@@ -374,15 +376,23 @@ local function source_position(bufnr, row, col, client)
   return { line = row, character = util.lsp_col(line, col, client.offset_encoding) }
 end
 
+-- The server with the tweak (clangd), if it supports `method`. Only its hover
+-- shows an expansion, and other servers' replies could hide it.
+local function expansion_client(bufnr, method)
+  for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr, method = method })) do
+    if M.supports_tweak(client) then
+      return client
+    end
+  end
+  return nil
+end
+
 -- Calls cb(lines) exactly once, with nil on any failure (no clangd or tweak, a
 -- request error, the timeout) so that the caller can fall back.
 local function fetch_via_tweak(bufnr, row, col, cb)
   prune_dead_clients()
-  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd", method = "textDocument/codeAction" })[1]
+  local client = expansion_client(bufnr, "textDocument/codeAction")
   if not client then
-    return cb(nil)
-  end
-  if not M.supports_tweak(client) then
     return cb(nil)
   end
 
@@ -406,7 +416,7 @@ local function fetch_via_tweak(bufnr, row, col, cb)
   end
   vim.defer_fn(function()
     finish(nil)
-  end, TWEAK_TIMEOUT_MS)
+  end, TIMEOUT_MS)
 
   local code_action_params = {
     textDocument = { uri = uri },
@@ -454,11 +464,10 @@ local function fetch_via_tweak(bufnr, row, col, cb)
   end
 end
 
--- Calls cb(lines) once, with expansion_lines' result, or nil with no hover.
+-- Calls cb(lines) once, with expansion_lines' result, or nil with no hover,
+-- an error or the timeout.
 local function fetch_via_hover(bufnr, row, col, cb)
-  -- clangd's position encoding is needed, and with no client that supports
-  -- hover, buf_request_all would never call back.
-  local client = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd", method = "textDocument/hover" })[1]
+  local client = expansion_client(bufnr, "textDocument/hover")
   if not client then
     return cb(nil)
   end
@@ -466,20 +475,21 @@ local function fetch_via_hover(bufnr, row, col, cb)
     textDocument = { uri = vim.uri_from_bufnr(bufnr) },
     position = source_position(bufnr, row, col, client),
   }
-  vim.lsp.buf_request_all(bufnr, "textDocument/hover", params, function(results)
-    local md
-    for _, r in pairs(results or {}) do
-      if r.result and r.result.contents then
-        md = hover_markdown(r.result.contents)
-        break
-      end
-    end
-    local lines
+  local finish = async.once_with_timeout(cb, function()
+    return nil
+  end, TIMEOUT_MS)
+  local sent = client:request("textDocument/hover", params, function(err, result)
+    local contents = not err and type(result) == "table" and result.contents
+    local md = contents and hover_markdown(contents)
     if md and md ~= "" then
-      lines = expansion_lines(md)
+      finish(expansion_lines(md))
+    else
+      finish(nil)
     end
-    cb(lines)
-  end)
+  end, bufnr)
+  if not sent then
+    finish(nil)
+  end
 end
 
 -- Calls cb(lines) exactly once: nil when neither the tweak nor the hover has
