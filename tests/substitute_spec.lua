@@ -1181,6 +1181,178 @@ do
   end
 end
 
+-- Case 35: names in the caller's function. Renaming only the names it
+-- declared missed three silent cases: a hoisted callee local hid the global
+-- the caller reads after the call, a parameter named like a global argument
+-- bound `int scale = (scale);`, and a callee's local typedef and enumerator
+-- captured the caller's later uses. Any name the caller spells is renamed.
+do
+  local prelude = "typedef char dim;\nenum { SCALE = 3 };\nstatic int limit = 5;\nstatic int scale = 3;\n"
+  local clamp = [[static int clamp(int v)
+{
+    int limit = 100;
+    return v > limit ? limit : v;
+}]]
+  local caller = [[static int caller(int x)
+{
+    int r = clamp(x) + limit;
+    return r;
+}]]
+  local t = transform(caller, clamp, "clamp", { { N = 1 } })
+  local main = "int main(void){ return (caller(50)==55 && caller(500)==105)?0:1; }\n"
+  check("case35 hoisted local renamed away from the caller's global", t:find("int limit__ie1 = 100;", 1, true), t)
+  check("case35 hoisted local runs equal", (run_ok(prelude .. clamp .. "\n" .. t .. main, "c35a")), t)
+
+  local twice = "static int twice(int scale)\n{\n    return scale * 2;\n}"
+  local caller2 = "static int caller(void)\n{\n    int r = twice(scale);\n    return r;\n}"
+  local main2 = "int main(void){ return (caller()==6)?0:1; }\n"
+  for _, printer in ipairs({ "pretty", "canonical" }) do
+    local t2 = assert(S._render(caller2, twice, "twice", 1, 1, printer))
+    check(
+      "case35 " .. printer .. " binds the argument to a renamed parameter",
+      t2:find("int scale__ie1 = (scale);", 1, true),
+      t2
+    )
+    check(
+      "case35 " .. printer .. " argument runs equal",
+      (run_ok(prelude .. twice .. "\n" .. t2 .. main2, "c35b" .. printer)),
+      t2
+    )
+  end
+
+  local area = [[static int area(int w)
+{
+    typedef int dim;
+    enum { SCALE = 2 };
+    dim v = w * SCALE;
+    return v;
+}]]
+  local caller3 = [[static int caller(int w)
+{
+    int r = area(w);
+    dim d = SCALE;
+    return r * 10 + (int)sizeof(d) + d;
+}]]
+  local t3 = transform(caller3, area, "area", { { N = 1 } })
+  local main3 = "int main(void){ return (caller(4)==84)?0:1; }\n"
+  check(
+    "case35 callee typedef and enumerator renamed",
+    t3:find("dim__ie1 v", 1, true) and t3:find("SCALE__ie1 = 2", 1, true),
+    t3
+  )
+  check("case35 callee typedef and enumerator run equal", (run_ok(prelude .. area .. "\n" .. t3 .. main3, "c35c")), t3)
+
+  local by = "static int scale_by(int LIMIT)\n{\n    return LIMIT * 2;\n}"
+  local caller4 =
+    "static int caller(void)\n{\n    enum { LIMIT = 10 };\n    int r = scale_by(3);\n    return r + LIMIT;\n}"
+  local t4 = transform(caller4, by, "scale_by", { { N = 1 } })
+  local main4 = "int main(void){ return (caller()==16)?0:1; }\n"
+  check("case35 parameter named like a caller enumerator compiles", (compiles(by .. "\n" .. t4 .. main4, "c35d")), t4)
+  check("case35 parameter named like a caller enumerator runs equal", (run_ok(by .. "\n" .. t4 .. main4, "c35d")), t4)
+
+  -- tree-sitter-c leaves the name of `int ret __maybe_unused = ...;` in an
+  -- ERROR node; it is still the name the hoist declares.
+  local attr = "#define __maybe_unused __attribute__((unused))\nstatic int ret = 40;\n"
+  local doubled = "static int doubled(int x)\n{\n    int ret __maybe_unused = x * 2;\n    return ret + 1;\n}"
+  local caller5 = "static int caller(int n)\n{\n    int r = doubled(n);\n    return r + ret;\n}"
+  local t5 = transform(caller5, doubled, "doubled", { { N = 1 } })
+  local main5 = "int main(void){ return (caller(1)==43)?0:1; }\n"
+  check("case35 local named inside an ERROR node renamed", t5:find("int ret__ie1 __maybe_unused", 1, true), t5)
+  check(
+    "case35 local named inside an ERROR node runs equal",
+    (run_ok(attr .. doubled .. "\n" .. t5 .. main5, "c35e")),
+    t5
+  )
+end
+
+-- Case 36: a caller local named like a global the callee reads would capture
+-- that read, renamed or not, so the inline is refused (block paste). Only a
+-- use no declaration around it binds counts: the callee's own block-local
+-- `limit` does not cover the read after its block.
+do
+  local caller = [[static int caller(int x)
+{
+    int limit = 7;
+    int i = 0;
+    return f(x) + limit + i;
+}]]
+  local callees = {
+    { "reads a global", "static int f(int x)\n{\n    return limit + x;\n}" },
+    {
+      "reads it after its own block-local one",
+      "static int f(int x)\n{\n    {\n        int limit = 3;\n        x += limit;\n    }\n    return x + limit;\n}",
+    },
+  }
+  for _, c in ipairs(callees) do
+    local new, err = S.inline_call(caller, c[2], "f", 1, 1)
+    check(
+      "case36 refused: callee " .. c[1],
+      new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
+      new or tostring(err)
+    )
+  end
+  local attr_caller = caller:gsub("int limit = 7;", "u32 __maybe_unused limit = 7;")
+  local new, err = S.inline_call(attr_caller, callees[1][2], "f", 1, 1)
+  check(
+    "case36 refused: the caller's name sits in an ERROR node",
+    new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
+    new or tostring(err)
+  )
+
+  -- An annotation macro such as zlib's FAR lands in an ERROR node of a
+  -- declaration on both sides; the caller does not declare it.
+  local far = "#define FAR\nstruct st { int v; };\n"
+  local peek = "static int peek(struct st FAR *q)\n{\n    struct st FAR *r = q;\n    return r->v;\n}"
+  local far_caller = "static int caller(struct st *s)\n{\n    struct st FAR *p = s;\n    return peek(p) + p->v;\n}"
+  local tf, ferr = S.inline_call(far_caller, peek, "peek", 1, 1)
+  local far_main = "int main(void){ struct st s = { 4 }; return (caller(&s)==8)?0:1; }\n"
+  check("case36 a macro both sides misparse is no reason to refuse", tf ~= nil, tostring(ferr))
+  check(
+    "case36 misparsed macro runs equal",
+    tf ~= nil and (run_ok(far .. peek .. "\n" .. tf .. far_main, "c36far")),
+    tf
+  )
+
+  -- Without a function node around the call (an #ifdef straddling braces),
+  -- the declarations that count are those of the function's ERROR node, not
+  -- the file's: a global the callee reads is fine, a local named like it is
+  -- not.
+  local get = "static int get(void)\n{\n    return limit;\n}"
+  local wrapped = "static int limit = 5;\n"
+    .. get
+    .. "\nstatic int caller(int x)\n{\n#ifdef SOMETHING_UNDEFINED\n    if (x) {\n#endif\n%s    int r = get() + x;\n    return r;\n}\n"
+  local tw, werr = S.inline_call(wrapped:format(""), get, "get", 1, 1)
+  check("case36 a file-scope global is no reason to refuse", tw ~= nil, tostring(werr))
+  local wrapped_main = "int main(void){ return (caller(1)==6)?0:1; }\n"
+  check("case36 file-scope global runs equal", tw ~= nil and (run_ok(tw .. wrapped_main, "c36wrap")), tw)
+  local tl, lerr = S.inline_call(wrapped:format("    int limit = 7;\n"), get, "get", 1, 1)
+  check(
+    "case36 refused: a local of a function without a function node",
+    tl == nil and tostring(lerr):find("'limit'", 1, true) ~= nil,
+    tl or tostring(lerr)
+  )
+
+  -- Its own declarations do not count, wherever they sit.
+  local own = [[static int f(int x)
+{
+    int s = 0;
+    for (int i = 0; i < x; i++)
+        s += i;
+    {
+        int limit = 2;
+        s *= limit;
+    }
+    return s;
+}]]
+  local t = transform(caller, own, "f", { { N = 1 } })
+  local main = "int main(void){ return (caller(4)==19)?0:1; }\n"
+  check(
+    "case36 callee's own locals are no reason to refuse",
+    (run_ok("static int limit = 5;\n" .. own .. "\n" .. t .. main, "c36")),
+    t
+  )
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be

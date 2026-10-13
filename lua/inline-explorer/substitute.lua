@@ -48,8 +48,7 @@ function M._probe(caller_src, callee_src, fname, occ, mode)
     return nil, "call to '" .. fname .. "' not found"
   end
   local expansion_id = 1
-  local caller_names = canalyze.names_in_scope(call, caller_src)
-  local ir, err = canalyze.analyze_callee(callee_src, fname, expansion_id, caller_names)
+  local ir, err = canalyze.analyze_callee(callee_src, fname, expansion_id, canalyze.caller_names(call, caller_src))
   if not ir then
     return nil, err
   end

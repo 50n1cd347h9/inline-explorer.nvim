@@ -78,7 +78,8 @@ end
 ---@param src string
 ---@return string
 function M.text(node, src)
-  return src:sub(M.start_byte(node) + 1, M.end_byte(node))
+  local _, _, start_byte, _, _, end_byte = node:range(true)
+  return src:sub(start_byte + 1, end_byte)
 end
 
 ---@param node TSNode
@@ -118,22 +119,30 @@ local function inner_declarator(d)
   end
   for _, child in ipairs(M.code_children(d)) do
     local t = child:type()
-    if t == "identifier" or t:match("declarator$") then
+    if t == "identifier" or t == "type_identifier" or t:match("declarator$") then
       return child
     end
   end
 end
 
--- The name that declarator `decl` declares: "p" for `*p`, `p[4]`, `(*p)(int)`
--- or `p = 0`.
+-- The name node of declarator `decl`: `p` in `*p`, `p[4]`, `(*p)(int)` or
+-- `p = 0`, and the type_identifier a typedef declares.
 ---@param decl TSNode
----@param src string
----@return string? name nil for a declarator without one, such as the `*` of `char *`
-function M.decl_name(decl, src)
+---@return TSNode? name nil for a declarator without one, such as the `*` of `char *`
+function M.decl_identifier(decl)
   local d = decl
-  while d and d:type() ~= "identifier" do
+  while d and d:type() ~= "identifier" and d:type() ~= "type_identifier" do
     d = inner_declarator(d)
   end
+  return d
+end
+
+-- The text of decl_identifier.
+---@param decl TSNode
+---@param src string
+---@return string? name
+function M.decl_name(decl, src)
+  local d = M.decl_identifier(decl)
   if d then
     return M.text(d, src)
   end

@@ -79,12 +79,14 @@ Mechanism:
   `return E;` rewritten to `{ __ie_retN = E; goto __ie_endN; }` and the
   reconstructed declared return type as `__ie_retN`'s value slot. This makes
   *any* function inlinable as an expression.
-- Callee labels (function-scoped), and parameters and top-level locals that
-  collide with the caller scope, are suffixed `name__ieN`, keyed by a
-  per-expansion id N, so repeated and nested inlining stays correct.
-- Calls the analysis rejects (variadic functions, for example) are not
-  rewritten: the inliner falls back to block-paste (`<leader>ee`) rather than
-  produce wrong code. Macros are expanded through clangd instead.
+- Callee labels (function-scoped) are suffixed `name__ieN`, keyed by a
+  per-expansion id N, and so are its parameters and top-level locals
+  (typedefs and enumerators included) whose name appears anywhere in the
+  caller's function, so repeated and nested inlining stays correct.
+- Calls the analysis rejects (variadic functions, or a callee that reads a
+  name the caller's function declares too, which a rename cannot keep apart)
+  are not rewritten: the inliner falls back to block-paste (`<leader>ee`)
+  rather than produce wrong code. Macros are expanded through clangd instead.
 
 Output modes (`mode` option, toggle with `:InlineExplorerToggleMode`):
 
