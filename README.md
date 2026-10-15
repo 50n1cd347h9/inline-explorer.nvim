@@ -11,16 +11,31 @@ lua_ls, ...).
 
 ![Expanding a call inline, then expanding again inside the body, in the Linux kernel](assets/inline-explorer-demo.gif)
 
-## Requirements
 
+## Inline substitution (C)
+
+`<leader>ei` **rewrites the call into what the function body does**, as a
+compiler would.
+
+```c
+return snap != acquire(c);
+```
+
+```c
+int cpu = (c);
+struct ct *p = per_cpu_ptr(CT, cpu);
+return snap != (p->state & MASK);
+```
+
+## Installation
+
+reruirements:
 - Neovim 0.11+
 - A language server attached to the files you read
 - Recommended: the tree-sitter parser for the language (`:TSInstall <lang>`);
   required for C inline substitution
 - For C, a `compile_commands.json` clangd can find. For the kernel:
   `make defconfig && ./scripts/clang-tools/gen_compile_commands.py`
-
-## Installation
 
 With [lazy.nvim](https://github.com/folke/lazy.nvim):
 
@@ -102,23 +117,6 @@ expansions around the cursor (`do_work > helper`):
 vim.o.statusline = "%f %{v:lua.require'inline-explorer'.breadcrumb()} %=%l:%c"
 ```
 
-## Inline substitution (C)
-
-`<leader>ei` **rewrites the call into what the function body does**, as a
-compiler would.
-
-```c
-return snap != acquire(c);
-```
-
-```c
-int cpu = (c);
-struct ct *p = per_cpu_ptr(CT, cpu);
-return snap != (p->state & MASK);
-```
-
-Calls that cannot be inlined (variadic functions, or a function that reads
-a name your function declares too) fall back to `<leader>ee`.
 
 ## Cross-compiled kernels (Buildroot)
 
