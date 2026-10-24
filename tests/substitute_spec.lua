@@ -1644,6 +1644,58 @@ do
   end
 end
 
+-- Case 42: a renamed callee local takes along the uses its declaration
+-- binds, no others. Renamed by spelling, a read of the global `acc` ahead of
+-- the callee's own `int acc` became `acc__ie1`, which nothing declares
+-- there; so did a read past a block-local's block, and one in an earlier
+-- declarator of the same declaration. A local whose name tree-sitter-c
+-- leaves in an ERROR node is the callee's own too: a caller declaring that
+-- name is no reason to refuse.
+do
+  local prelude = "#define __maybe_unused __attribute__((unused))\nstatic int acc = 5;\n"
+  local caller = "static int caller(void)\n{\n    int r = f(acc);\n    return r;\n}"
+  local callees = {
+    {
+      "ahead of the local",
+      "static int f(int x)\n{\n    int y = acc + x;\n    int acc = y * 2;\n    return acc;\n}",
+      "int y = acc + x;",
+      20,
+    },
+    {
+      "in an earlier declarator",
+      "static int f(int x)\n{\n    int y = acc + x, acc = y * 2;\n    return acc;\n}",
+      "int y = acc + x, acc__ie1 = y * 2;",
+      20,
+    },
+    {
+      "past a block-local's block",
+      "static int f(int x)\n{\n    {\n        int acc = 1;\n        x += acc;\n    }\n    x += acc;\n    int acc = x * 2;\n    return acc;\n}",
+      "x += acc;",
+      22,
+    },
+  }
+  for i, c in ipairs(callees) do
+    local main = ("int main(void){ return (caller()==%d)?0:1; }\n"):format(c[4])
+    for _, printer in ipairs({ "pretty", "canonical" }) do
+      local t = assert(S._render(caller, c[2], "f", 1, 1, printer))
+      local label = ("case42 global read %s, %s,"):format(c[1], printer)
+      check(label .. " keeps its name", t:find(c[3], 1, true) ~= nil, t)
+      check(label .. " runs equal", (run_ok(prelude .. c[2] .. "\n" .. t .. main, "c42" .. i .. printer)), t)
+    end
+  end
+
+  local doubled = "static int doubled(int x)\n{\n    int ret __maybe_unused = x * 2;\n    return ret + 1;\n}"
+  local caller2 = "static int caller(int n)\n{\n    int ret = doubled(n);\n    return ret;\n}"
+  local t2, err = S.inline_call(caller2, doubled, "doubled", 1, 1)
+  local main2 = "int main(void){ return (caller(1)==3)?0:1; }\n"
+  check("case42 a local named inside an ERROR node is no reason to refuse", t2 ~= nil, tostring(err))
+  check(
+    "case42 local named inside an ERROR node, caller declaring it, runs equal",
+    t2 ~= nil and (run_ok(prelude .. doubled .. "\n" .. t2 .. main2, "c42e")),
+    t2
+  )
+end
+
 -- A buffer's own tree stands in for parsing the caller text. The inliner
 -- hands over the view's tree (kept parsed by its highlighter); the result
 -- must be the same as parsing the string, and the caller text must not be
