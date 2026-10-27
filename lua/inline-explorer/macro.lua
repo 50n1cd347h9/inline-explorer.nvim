@@ -217,8 +217,10 @@ local function edit_matches(workspace_edit, uri, pos)
 end
 
 -- The newText of the edit at `pos` in document `uri` (see edit_at), without
--- blank edge lines. It reads only edits that edit_matches accepted, so other
--- documents are not checked again.
+-- blank edge lines. Like edits_only_for, it reads every documentChanges
+-- entry for `uri`, so an edit edit_matches accepted is found here too, in
+-- whichever entry it is; edits to other documents are passed over, as
+-- edit_matches has already refused them.
 ---@param workspace_edit lsp.WorkspaceEdit?
 ---@param uri string
 ---@param pos lsp.Position
@@ -233,8 +235,8 @@ local function edit_lines(workspace_edit, uri, pos)
   elseif type(workspace_edit.documentChanges) == "table" then
     for _, dc in ipairs(workspace_edit.documentChanges) do
       if type(dc) == "table" and dc.textDocument and dc.textDocument.uri == uri and type(dc.edits) == "table" then
-        edits = dc.edits
-        break
+        edits = edits or {}
+        vim.list_extend(edits, dc.edits)
       end
     end
   end
