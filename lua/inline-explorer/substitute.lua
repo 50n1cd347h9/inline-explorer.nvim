@@ -27,11 +27,11 @@ end
 local function named_call_at(caller_src, row, col, root)
   local call = csrc.ancestor_at(root or csrc.parse(caller_src), row, col, "call_expression")
   if not call then
-    return nil, "no call under the cursor"
+    return nil, canalyze.refuse("no-call", "no call under the cursor")
   end
   local fn = call:field("function")[1]
   if not fn or fn:type() ~= "identifier" then
-    return nil, "call target is not a plain function name"
+    return nil, canalyze.refuse("not-plain", "call target is not a plain function name")
   end
   return call, csrc.text(fn, caller_src)
 end
@@ -60,7 +60,7 @@ end
 ---@param mode? "correct"|"readable" default "correct"
 ---@param root? TSNode caller_src's tree, if already parsed
 ---@return string? new_src
----@return string? err
+---@return inline_explorer.Refusal? err
 function M.inline_at(caller_src, row, col, callee_src, N, mode, root)
   local call, name_or_reason = named_call_at(caller_src, row, col, root)
   if not call then

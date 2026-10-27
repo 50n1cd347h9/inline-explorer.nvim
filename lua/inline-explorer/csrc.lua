@@ -26,6 +26,24 @@ function M.parse(src)
   return root
 end
 
+-- A tree of `src` that stays out of the cache, for throwaway text that would
+-- evict the trees worth keeping; nil when the C parser is missing.
+---@param src string
+---@return TSNode?
+function M.parse_once(src)
+  local ok, parser = pcall(vim.treesitter.get_string_parser, src, "c")
+  if not ok or not parser then
+    return nil
+  end
+  return parser:parse()[1]:root()
+end
+
+-- Whether the tree-sitter C parser is installed.
+---@return boolean
+function M.has_parser()
+  return M.parse_once("int __ie;") ~= nil
+end
+
 ---@param node TSNode
 ---@return integer
 function M.start_byte(node)

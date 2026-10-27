@@ -1766,4 +1766,22 @@ do
   end
 end
 
+-- A refusal carries a stable code, which the inliner's profile labels use,
+-- besides its message: rewording a message used to change the label.
+do
+  local caller = "int g(int a)\n{\n    return f(a, 1);\n}"
+  local _, variadic = T.inline_call(caller, "static int f(int x, ...)\n{\n    return x;\n}", "f", 1, 1)
+  local _, arity = T.inline_call(caller, "static int f(int x)\n{\n    return x;\n}", "f", 1, 1)
+  local _, none = S.inline_at(caller, 0, 0, "static int f(int x)\n{\n    return x;\n}", 1)
+  check("refusal: variadic code", type(variadic) == "table" and variadic.code == "variadic", variadic)
+  check("refusal: arity code", type(arity) == "table" and arity.code == "arity", arity)
+  check("refusal: no call under the cursor", type(none) == "table" and none.code == "no-call", none)
+  check(
+    "refusal: reads as its message",
+    tostring(variadic):find("variadic function 'f'", 1, true) ~= nil
+      and ("x: " .. arity):find("arity mismatch", 1, true),
+    tostring(variadic)
+  )
+end
+
 H.finish("SUBSTITUTE")

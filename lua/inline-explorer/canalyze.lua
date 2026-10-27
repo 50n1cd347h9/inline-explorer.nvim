@@ -4,6 +4,26 @@ local csrc = require("inline-explorer.csrc")
 
 local M = {}
 
+-- Why a call cannot be inlined: a stable `code`, for callers that sort
+-- refusals, and the message, which tostring() and `..` give.
+---@class inline_explorer.Refusal
+---@field code string
+---@field message string
+local Refusal = {}
+Refusal.__tostring = function(r)
+  return r.message
+end
+Refusal.__concat = function(a, b)
+  return tostring(a) .. tostring(b)
+end
+
+---@param code string
+---@param message string
+---@return inline_explorer.Refusal
+function M.refuse(code, message)
+  return setmetatable({ code = code, message = message }, Refusal)
+end
+
 -- The names an expansion injects or renames to. N, an id unique to each
 -- expansion, keeps them apart.
 local INJECTED = {
@@ -452,29 +472,29 @@ end
 ---@param N integer
 ---@param caller inline_explorer.CallerNames
 ---@return inline_explorer.IR? ir without binds
----@return string? err
+---@return inline_explorer.Refusal? err
 function M.analyze_callee(callee_src, fname, N, caller)
   local fn_def, fn_declarator = csrc.find_function_def(csrc.parse(callee_src), callee_src, fname)
   if not fn_def then
-    return nil, "definition of '" .. fname .. "' not found"
+    return nil, M.refuse("not-found", "definition of '" .. fname .. "' not found")
   end
   ---@cast fn_declarator -nil
   local params, variadic = csrc.get_params(fn_declarator, callee_src)
   if variadic then
-    return nil, "cannot inline variadic function '" .. fname .. "'"
+    return nil, M.refuse("variadic", "cannot inline variadic function '" .. fname .. "'")
   end
   -- What it declares is out of sight: no name in it can be checked or renamed.
   if #csrc.query_nodes(fn_def, callee_src, "(preproc_include) @i") > 0 then
-    return nil, fname .. " has an #include in its body"
+    return nil, M.refuse("include", fname .. " has an #include in its body")
   end
   local body = fn_def:field("body")[1]
   if has_stray_return(body, callee_src) then
-    return nil, "a `return` in " .. fname .. " does not parse as a return statement"
+    return nil, M.refuse("stray-return", "a `return` in " .. fname .. " does not parse as a return statement")
   end
   -- Pasted into the caller, such a use would mean the caller's declaration.
   for _, nm in ipairs(free_names(fn_def, fn_declarator, callee_src)) do
     if caller.declared[nm] then
-      return nil, ("'%s' in %s would mean the caller's own '%s'"):format(nm, fname, nm)
+      return nil, M.refuse("capture", ("'%s' in %s would mean the caller's own '%s'"):format(nm, fname, nm))
     end
   end
 
@@ -483,7 +503,7 @@ function M.analyze_callee(callee_src, fname, N, caller)
     stmts[#stmts + 1] = body:named_child(i)
   end
   if #stmts == 0 then
-    return nil, "empty function body"
+    return nil, M.refuse("empty", "empty function body")
   end
   local returns = csrc.query_nodes(body, callee_src, "(return_statement) @r")
 
@@ -701,12 +721,12 @@ end
 ---@param call TSNode
 ---@return inline_explorer.IR? ir with binds
 ---@return inline_explorer.Ctx? ctx nil when ir is
----@return string? err
+---@return inline_explorer.Refusal? err
 function M.analyze_call_node(caller_src, callee_src, fname, N, call)
   -- Its arguments cannot be told apart: in `f(a, 2 ADD)` the 2 is in an
   -- ERROR node.
   if call:has_error() then
-    return nil, nil, "the call to " .. fname .. " does not parse cleanly"
+    return nil, nil, M.refuse("parse", "the call to " .. fname .. " does not parse cleanly")
   end
   local ir, err = M.analyze_callee(callee_src, fname, N, M.caller_names(call, caller_src))
   if not ir then
@@ -718,7 +738,7 @@ function M.analyze_call_node(caller_src, callee_src, fname, N, call)
     args[#args + 1] = csrc.text(arg, caller_src)
   end
   if #args ~= #ir.params then
-    return nil, nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
+    return nil, nil, M.refuse("arity", string.format("arity mismatch (%d args, %d params)", #args, #ir.params))
   end
   -- Only the parameters are in scope in a parameter's declaration.
   local param_rename = {}

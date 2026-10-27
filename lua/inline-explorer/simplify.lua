@@ -18,15 +18,12 @@ function M.parens(text)
   local chosen, wrapped, root
   for _, w in ipairs(wrappers) do
     local candidate = w.pre .. text .. w.post
-    local ok, parser = pcall(vim.treesitter.get_string_parser, candidate, "c")
-    if ok and parser then
-      local r = parser:parse()[1]:root()
-      if not r:has_error() then
-        chosen = w
-        wrapped = candidate
-        root = r
-        break
-      end
+    local r = csrc.parse_once(candidate)
+    if r and not r:has_error() then
+      chosen = w
+      wrapped = candidate
+      root = r
+      break
     end
   end
   if not root then

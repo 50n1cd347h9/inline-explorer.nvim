@@ -1,9 +1,13 @@
--- Smart inline, the primary expansion action. In a C buffer a function call
--- is substituted in place and a macro use replaced by clangd's expansion of
--- it. Anything else, or a failure, block-pastes the definition
--- (expander.expand), as in any other language.
+-- Smart inline (<leader>ei), the primary expansion action. In a C buffer, a
+-- call of a function whose definition is found is substituted in place.
+-- Any other name with a definition is offered to clangd as a macro use and
+-- replaced by its expansion: clangd expands only macros, so for anything
+-- else that step finds nothing. A name found only as a declaration, and
+-- every failure, block-pastes the definition (expander.expand), as in any
+-- other language.
 local resolver = require("inline-explorer.resolver")
 local substitute = require("inline-explorer.substitute")
+local csrc = require("inline-explorer.csrc")
 local macro = require("inline-explorer.macro")
 local expander = require("inline-explorer.expander")
 local view = require("inline-explorer.view")
@@ -12,11 +16,6 @@ local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
 
 local M = {}
-
-local function has_c_parser()
-  local ok = pcall(vim.treesitter.get_string_parser, "int __ie;", "c")
-  return ok
-end
 
 -- The view buffer's tree, which the highlighter keeps parsed incrementally,
 -- so a keypress does not parse the whole file. nil on failure; substitute and
@@ -31,16 +30,11 @@ local function buffer_root(bufnr)
   return root
 end
 
--- The profile span name for a failed substitution. The keys are words of the
--- reasons that canalyze and substitute return.
+-- The profile span name for a failed substitution: the refusal's code, or
+-- "other" for an error raised inside the engine.
 local function rejection_label(reason)
-  local message = tostring(reason)
-  for _, key in ipairs({ "variadic", "arity", "not found", "empty" }) do
-    if message:find(key, 1, true) then
-      return "substitute:rejected-" .. (key:gsub(" ", "-"))
-    end
-  end
-  return "substitute:rejected-other"
+  local code = type(reason) == "table" and reason.code or "other"
+  return "substitute:rejected-" .. code
 end
 
 -- One smart-inline keypress, as M.smart sets it up.
@@ -133,7 +127,7 @@ function M.smart()
     util.notify("open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
     return
   end
-  if vim.bo.filetype ~= "c" or not has_c_parser() then
+  if vim.bo.filetype ~= "c" or not csrc.has_parser() then
     expander.expand()
     return
   end
