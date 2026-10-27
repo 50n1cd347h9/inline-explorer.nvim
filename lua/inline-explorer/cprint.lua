@@ -10,110 +10,6 @@ local M = {}
 -- Declarations: the result variable, of the callee's return type, and one
 -- line per parameter that binds its argument.
 
-local TYPE_KEYWORDS = {
-  void = true,
-  char = true,
-  short = true,
-  int = true,
-  long = true,
-  float = true,
-  double = true,
-  signed = true,
-  unsigned = true,
-  ["_Bool"] = true,
-  struct = true,
-  union = true,
-  enum = true,
-  const = true,
-  volatile = true,
-}
-
-local TAG_KEYWORDS = { struct = true, union = true, enum = true }
-
-local function tokenize(text)
-  local tokens = {}
-  for tok in text:gmatch("%S+") do
-    tokens[#tokens + 1] = tok
-  end
-  return tokens
-end
-
-local function contains_type_keyword(text)
-  for tok in text:gmatch("%S+") do
-    if TYPE_KEYWORDS[tok] then
-      return true
-    end
-  end
-  return false
-end
-
--- The base type in a run of tokens: from the first type keyword (else the
--- first token) through the keywords and struct/union/enum tag after it. In
--- `local unsigned long ZEXPORT`, that is "unsigned long".
-local function base_type_from_run(text)
-  local tokens = tokenize(text)
-  if #tokens == 0 then
-    return "int" -- C's implicit int
-  end
-  local first = 1
-  for i, tok in ipairs(tokens) do
-    if TYPE_KEYWORDS[tok] then
-      first = i
-      break
-    end
-  end
-  local last = first
-  while last < #tokens and (TYPE_KEYWORDS[tokens[last + 1]] or TAG_KEYWORDS[tokens[last]]) do
-    last = last + 1
-  end
-  return table.concat(tokens, " ", first, last)
-end
-
--- Identifiers that a project #defines to a storage class, such as zlib's
--- `#define local static`. See return_base_type.
-local KNOWN_LEADING_MACROS = { ["local"] = true }
-
--- Calling-convention and export macros, which are not types.
-local KNOWN_DECORATOR_MACROS = { ZEXPORT = true, WINAPI = true }
-
-local function is_single_known_decorator(text)
-  local tokens = tokenize(text)
-  return #tokens == 1 and KNOWN_DECORATOR_MACROS[tokens[1]] == true
-end
-
--- The base of `def`'s return type, without the declarator's `*`s. The type
--- field is right as it is (even for `CJSON_PUBLIC(cJSON *) f()`), except
--- around zlib's macros. A sized_type_specifier absorbs one on either side, as
--- in `local unsigned long f()` or `unsigned long ZEXPORT f()`, so every
--- sized_type_specifier is rescanned. In `local block_state f()`, the type is
--- `local` and the real one is in the ERROR node after it. That is used if it
--- has a type keyword, or if the type is a known leading macro and the ERROR is
--- not a lone known decorator: `local WINAPI f()` parses the same way, and
--- there `local` may be a real typedef. An unlisted decorator, as in
--- `local DLLEXPORT f()`, is taken for the type.
-local function return_base_type(def, src)
-  local ty = def:field("type")[1]
-  if not ty then
-    return "int" -- C's implicit int
-  end
-  local ty_text = csrc.text(ty, src)
-  if ty:type() == "sized_type_specifier" then
-    return base_type_from_run(ty_text)
-  end
-  if ty:type() == "type_identifier" and not TYPE_KEYWORDS[ty_text] then
-    local sib = ty:next_sibling()
-    if sib and sib:type() == "ERROR" then
-      local sib_text = csrc.text(sib, src)
-      local sib_has_keyword = contains_type_keyword(sib_text)
-      local macro_before_typedef = KNOWN_LEADING_MACROS[ty_text] and not is_single_known_decorator(sib_text)
-      if sib_has_keyword or macro_before_typedef then
-        return base_type_from_run(sib_text)
-      end
-    end
-  end
-  return ty_text
-end
-
 -- The pointer_declarator that makes `func_decl`'s result a pointer, as the
 -- `*const` of `char *const f(void)`, if any.
 local function result_pointer(func_decl)
@@ -135,8 +31,9 @@ end
 ---@param def TSNode a function_definition that csrc.func_declarator finds a function in
 ---@param src string
 ---@param name string
+---@param base_type string the return type without the declarator's `*`s (see canalyze's ir.ret_type)
 ---@return string
-local function result_decl(def, src, name)
+local function result_decl(def, src, name, base_type)
   local decl = def:field("declarator")[1]
   local func_decl = csrc.func_declarator(decl)
   ---@cast func_decl -nil
@@ -153,7 +50,7 @@ local function result_decl(def, src, name)
     d = csrc.inner_declarator(d)
   end
   local declarator = csrc.apply_edits(src, csrc.start_byte(decl), csrc.end_byte(decl), edits):gsub("%s+", " ")
-  return return_base_type(def, src) .. " " .. declarator
+  return base_type .. " " .. declarator
 end
 
 -- The edit that turns parameter name `ident` into `name` and adjusts its
@@ -226,7 +123,7 @@ end
 ---@param ir inline_explorer.IR
 ---@return string
 function M.ret_decl(ir)
-  return result_decl(ir.fn_def, ir.src, ir.ret_var)
+  return result_decl(ir.fn_def, ir.src, ir.ret_var, ir.ret_type)
 end
 
 -- One level of indentation, in the style of `indent`.
