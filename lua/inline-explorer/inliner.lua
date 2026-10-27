@@ -99,13 +99,14 @@ local function expand_macro(action, prefetched)
   local st = action.st
   -- clangd knows only the source file.
   local src_row = view.src_line(st, action.row)
-  macro.fetch_expansion(st, src_row, action.col, function(expansion)
+  macro.fetch_expansion(st.source_bufnr, src_row, action.col, function(expansion)
     if not expansion or #expansion == 0 then
       block_fallback(action, prefetched)
       return
     end
     vim.schedule(function()
-      local ok, new_text = pcall(macro.replace_in_src, action.view_text, action.row, action.col, expansion, action.root)
+      local ok, new_text =
+        pcall(substitute.replace_macro_use, action.view_text, action.row, action.col, expansion, action.root)
       if ok and new_text then
         view.end_fetch(st)
         view.rewrite(st, action.bufnr, new_text, action.row)

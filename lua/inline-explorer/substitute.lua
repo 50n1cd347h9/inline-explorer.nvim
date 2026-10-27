@@ -1,5 +1,6 @@
 -- C inline substitution: rewrites a call `f(args)` into the effect of f's
--- body, as a GNU C source transform on text and tree-sitter trees. canalyze
+-- body, as a GNU C source transform on text and tree-sitter trees, and a
+-- macro use into clangd's expansion of it (replace_macro_use). canalyze
 -- analyses the call and decides on a layout, cprint prints it, and this module
 -- holds the public API. `N`, an id unique to each expansion, suffixes the
 -- names it injects or renames. See DESIGN.md. The specs reach the analysis
@@ -7,6 +8,7 @@
 local csrc = require("inline-explorer.csrc")
 local canalyze = require("inline-explorer.canalyze")
 local cprint = require("inline-explorer.cprint")
+local simplify = require("inline-explorer.simplify")
 
 local M = {}
 
@@ -72,6 +74,69 @@ function M.inline_at(caller_src, row, col, callee_src, N, mode, root)
     return nil, err
   end
   return M.print(caller_src, ir, ctx, mode)
+end
+
+-- The macro use at (row, col), and whether it is a whole expression statement.
+-- The use is the call_expression when the identifier there is its callee, else
+-- the identifier.
+local function find_invocation(root, row, col)
+  local node = csrc.ancestor_at(root, row, col, "identifier")
+  if not node then
+    return nil
+  end
+  local invocation = node
+  local parent = node:parent()
+  if parent and parent:type() == "call_expression" then
+    local callee = parent:field("function")[1]
+    if callee and csrc.start_byte(callee) == csrc.start_byte(node) then
+      invocation = parent
+    end
+  end
+  local outer = invocation:parent()
+  local is_statement = outer ~= nil and outer:type() == "expression_statement"
+  return invocation, is_statement
+end
+
+-- `src` with the macro use at (row, col) replaced by `exp_lines`, its
+-- expansion (see macro.fetch_expansion). `root` is
+-- src's parsed root, when the caller has it.
+---@param src string
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param exp_lines string[]
+---@param root? TSNode
+---@return string? new_src
+---@return inline_explorer.Refusal? err
+function M.replace_macro_use(src, row, col, exp_lines, root)
+  local invocation, is_statement = find_invocation(root or csrc.parse(src), row, col)
+  if not invocation then
+    return nil, canalyze.refuse("no-macro", "no macro use under the cursor")
+  end
+  local parts = {}
+  for i, l in ipairs(exp_lines) do
+    parts[i] = l
+  end
+  if #parts > 1 then
+    -- The indent of the use's line, not all text before the use, which would
+    -- repeat `foo = ` on each line.
+    local indent = csrc.line_indent(src, invocation)
+    for i = 2, #parts do
+      parts[i] = indent .. parts[i]
+    end
+  end
+  -- Trimmed because clangd's text can start with a space, which would fail
+  -- the anchored `^%b()$` check below.
+  local exp = vim.trim(simplify.parens(table.concat(parts, "\n")))
+  local rep = exp
+  if not is_statement then
+    -- Parenthesized to keep its precedence in an expression; simplify.parens
+    -- then drops a pair if the wrap doubled one.
+    if not exp:match("^%b()$") then
+      rep = "(" .. exp .. ")"
+    end
+    rep = simplify.parens(rep)
+  end
+  return src:sub(1, csrc.start_byte(invocation)) .. rep .. src:sub(csrc.end_byte(invocation) + 1)
 end
 
 return M
