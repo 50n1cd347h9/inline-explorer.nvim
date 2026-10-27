@@ -12,6 +12,7 @@ local root = vim.fn.fnamemodify(here, ":h:h")
 vim.opt.rtp:append(root)
 local H = require("tests.lib.harness")
 local S = require("inline-explorer.substitute")
+local T = require("tests.lib.inline")
 
 if vim.fn.executable("gcc") == 0 then
   print("SKIP: gcc not found")
@@ -38,7 +39,7 @@ end
 local function transform(caller, callee, fname, seq)
   local src = caller
   for _, step in ipairs(seq) do
-    local new, err = S.inline_call(src, callee, fname, step.N, step.occ or 1, step.mode)
+    local new, err = T.inline_call(src, callee, fname, step.N, step.occ or 1, step.mode)
     assert(new, ("inline_call failed (N=%d): %s"):format(step.N, tostring(err)))
     src = new
   end
@@ -365,19 +366,19 @@ do
   local caller = "static int caller(int n)\n{\n    return f(n);\n}"
 
   local variadic = "static int f(int x, ...)\n{\n    return x;\n}"
-  local new, err = S.inline_call(caller, variadic, "f", 1, 1)
+  local new, err = T.inline_call(caller, variadic, "f", 1, 1)
   check("case14 variadic -> error", new == nil and tostring(err):find("variadic") ~= nil, tostring(err))
 
   local two_params = "static int f(int a, int b)\n{\n    return a + b;\n}"
-  new, err = S.inline_call(caller, two_params, "f", 1, 1)
+  new, err = T.inline_call(caller, two_params, "f", 1, 1)
   check("case14 arity mismatch -> error", new == nil and tostring(err):find("arity") ~= nil, tostring(err))
 
   local empty = "static int f(int x)\n{\n}"
-  new, err = S.inline_call(caller, empty, "f", 1, 1)
+  new, err = T.inline_call(caller, empty, "f", 1, 1)
   check("case14 empty body -> error", new == nil and tostring(err):find("empty") ~= nil, tostring(err))
 
   local ok_callee = "static int g(int x)\n{\n    return x;\n}"
-  new, err = S.inline_call(caller, ok_callee, "g", 1, 1)
+  new, err = T.inline_call(caller, ok_callee, "g", 1, 1)
   check("case14 no call in caller -> error", new == nil and tostring(err):find("not found") ~= nil, tostring(err))
 end
 
@@ -1128,7 +1129,7 @@ do
 
   local add = "static int add(int a, int b)\n{\n    return a + b;\n}"
   local add_caller = "static int caller(void)\n{\n    int r = add(1, /* two */ 2);\n    return r;\n}"
-  local t4, err4 = S.inline_call(add_caller, add, "add", 1, 1)
+  local t4, err4 = T.inline_call(add_caller, add, "add", 1, 1)
   check("case33 a comment between arguments is not an argument", t4 ~= nil, tostring(err4))
   local main4 = "int main(void){ return (caller()==3)?0:1; }\n"
   check("case33 commented argument list runs equal", t4 ~= nil and (run_ok(add .. "\n" .. t4 .. main4, "c33d")), t4)
@@ -1175,7 +1176,7 @@ do
   local n_calls = #C.find_calls(tree, program, "bump")
   check("case34 original builds, one call per site", want ~= nil and n_calls == #sites, n_calls)
   for occ = 1, n_calls do
-    local t, err = S.inline_call(program, callee, "bump", 1, occ)
+    local t, err = T.inline_call(program, callee, "bump", 1, occ)
     local got = t and cc.build_run(t, tmp .. "/c34_" .. occ .. ".c", tmp .. "/c34_" .. occ .. ".out")
     check(("case34 %s prints what the original prints"):format(sites[occ][1]), got ~= nil and got == want, t or err)
   end
@@ -1207,7 +1208,7 @@ do
   local caller2 = "static int caller(void)\n{\n    int r = twice(scale);\n    return r;\n}"
   local main2 = "int main(void){ return (caller()==6)?0:1; }\n"
   for _, printer in ipairs({ "pretty", "canonical" }) do
-    local t2 = assert(S._render(caller2, twice, "twice", 1, 1, printer))
+    local t2 = assert(T.render(caller2, twice, "twice", 1, 1, printer))
     check(
       "case35 " .. printer .. " binds the argument to a renamed parameter",
       t2:find("int scale__ie1 = (scale);", 1, true),
@@ -1284,7 +1285,7 @@ do
     },
   }
   for _, c in ipairs(callees) do
-    local new, err = S.inline_call(caller, c[2], "f", 1, 1)
+    local new, err = T.inline_call(caller, c[2], "f", 1, 1)
     check(
       "case36 refused: callee " .. c[1],
       new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
@@ -1292,7 +1293,7 @@ do
     )
   end
   local attr_caller = caller:gsub("int limit = 7;", "u32 __maybe_unused limit = 7;")
-  local new, err = S.inline_call(attr_caller, callees[1][2], "f", 1, 1)
+  local new, err = T.inline_call(attr_caller, callees[1][2], "f", 1, 1)
   check(
     "case36 refused: the caller's name sits in an ERROR node",
     new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
@@ -1304,7 +1305,7 @@ do
   local far = "#define FAR\nstruct st { int v; };\n"
   local peek = "static int peek(struct st FAR *q)\n{\n    struct st FAR *r = q;\n    return r->v;\n}"
   local far_caller = "static int caller(struct st *s)\n{\n    struct st FAR *p = s;\n    return peek(p) + p->v;\n}"
-  local tf, ferr = S.inline_call(far_caller, peek, "peek", 1, 1)
+  local tf, ferr = T.inline_call(far_caller, peek, "peek", 1, 1)
   local far_main = "int main(void){ struct st s = { 4 }; return (caller(&s)==8)?0:1; }\n"
   check("case36 a macro both sides misparse is no reason to refuse", tf ~= nil, tostring(ferr))
   check(
@@ -1321,11 +1322,11 @@ do
   local wrapped = "static int limit = 5;\n"
     .. get
     .. "\nstatic int caller(int x)\n{\n#ifdef SOMETHING_UNDEFINED\n    if (x) {\n#endif\n%s    int r = get() + x;\n    return r;\n}\n"
-  local tw, werr = S.inline_call(wrapped:format(""), get, "get", 1, 1)
+  local tw, werr = T.inline_call(wrapped:format(""), get, "get", 1, 1)
   check("case36 a file-scope global is no reason to refuse", tw ~= nil, tostring(werr))
   local wrapped_main = "int main(void){ return (caller(1)==6)?0:1; }\n"
   check("case36 file-scope global runs equal", tw ~= nil and (run_ok(tw .. wrapped_main, "c36wrap")), tw)
-  local tl, lerr = S.inline_call(wrapped:format("    int limit = 7;\n"), get, "get", 1, 1)
+  local tl, lerr = T.inline_call(wrapped:format("    int limit = 7;\n"), get, "get", 1, 1)
   check(
     "case36 refused: a local of a function without a function node",
     tl == nil and tostring(lerr):find("'limit'", 1, true) ~= nil,
@@ -1396,7 +1397,7 @@ do
     return lenfix[v];
 }]]
   local tables_caller = "static int caller(int v)\n{\n    int lenfix = fixed(v);\n    return lenfix;\n}"
-  local tnew, terr = S.inline_call(tables_caller, tables, "fixed", 1, 1)
+  local tnew, terr = T.inline_call(tables_caller, tables, "fixed", 1, 1)
   check(
     "case37 refused: an #include in the callee's body",
     tnew == nil and tostring(terr):find("#include", 1, true) ~= nil,
@@ -1406,7 +1407,7 @@ do
   local get = "static int get(void)\n{\n    return limit;\n}"
   local caller2 =
     "static int caller(int x)\n{\n#ifdef WIDE\n    long limit = 7;\n#else\n    int limit = 7;\n#endif\n    return get() + limit + x;\n}"
-  local new, err = S.inline_call(caller2, get, "get", 1, 1)
+  local new, err = T.inline_call(caller2, get, "get", 1, 1)
   check(
     "case37 refused: the caller declares the name in an #if block",
     new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
@@ -1533,7 +1534,7 @@ int main(void)
     local callee = def and C.text(def, program) or ""
     for occ = 1, #C.find_calls(tree, program, fname) do
       local label = ("case38 %s (call %d)"):format(fname, occ)
-      local t, err = S.inline_call(program, callee, fname, 1, occ)
+      local t, err = T.inline_call(program, callee, fname, 1, occ)
       if expect[fname] then
         check(
           label .. " writes `" .. expect[fname] .. "`",
@@ -1563,7 +1564,7 @@ out: __maybe_unused
     return 0;
 }]]
   local caller = "static int caller(int v)\n{\n    int r = f(v);\n    return r + 1;\n}"
-  local new, err = S.inline_call(caller, stray, "f", 1, 1)
+  local new, err = T.inline_call(caller, stray, "f", 1, 1)
   check(
     "case39 refused: a `return` that is not a return statement",
     new == nil and tostring(err):find("return", 1, true) ~= nil,
@@ -1594,7 +1595,7 @@ out: __maybe_unused
   end
 
   local added = "static int caller(int a)\n{\n    int r = step(a, 2 ADD);\n    return r;\n}"
-  local new2, err2 = S.inline_call(added, step, "step", 1, 1)
+  local new2, err2 = T.inline_call(added, step, "step", 1, 1)
   check(
     "case39 refused: a call with an ERROR among its arguments",
     new2 == nil and tostring(err2):find("parse", 1, true) ~= nil,

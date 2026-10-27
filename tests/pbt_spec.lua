@@ -14,7 +14,7 @@ local H = require("tests.lib.harness")
 local check = H.check
 local cc = require("tests.lib.cc")
 local gen = require("tests.lib.gen")
-local S = require("inline-explorer.substitute")
+local T = require("tests.lib.inline")
 local C = require("inline-explorer.csrc")
 
 if vim.fn.executable("gcc") == 0 then
@@ -71,7 +71,7 @@ local function violation(case)
     return nil -- original does not build: generator edge, not an engine bug; skip
   end
 
-  local new, err = S.inline_call(rc.caller_src, rc.callee_src, "f", 1, 1, "correct")
+  local new, err = T.inline_call(rc.caller_src, rc.callee_src, "f", 1, 1, "correct")
   if not new then
     -- The engine may legitimately reject; but on our vocabulary it never
     -- should (no variadics, arity always matches) -- except the grammar-
@@ -93,9 +93,9 @@ local function violation(case)
 
   -- Structure property: when decide() chose pretty, the canonical rendering
   -- of the very same call must agree as well.
-  local probe = S._probe(rc.caller_src, rc.callee_src, "f", 1, "correct")
+  local probe = T.probe(rc.caller_src, rc.callee_src, "f", 1, "correct")
   if probe and probe.decision == "pretty" then
-    local canon, cerr = S._render(rc.caller_src, rc.callee_src, "f", 1, 1, "canonical")
+    local canon, cerr = T.render(rc.caller_src, rc.callee_src, "f", 1, 1, "canonical")
     if not canon then
       -- A nil here must not silently disable the structure property.
       return "canonical rendering unavailable: " .. tostring(cerr)
@@ -139,7 +139,7 @@ for i = 1, N_CASES do
 
   -- readable: compile-only statistics, never a failure (documented trade-off)
   local rc = gen.render(case)
-  local readable = S.inline_call(rc.caller_src, rc.callee_src, "f", 1, 1, "readable")
+  local readable = T.inline_call(rc.caller_src, rc.callee_src, "f", 1, 1, "readable")
   if readable then
     readable_total = readable_total + 1
     local r_out = build_run(program_with(rc, readable), "read")
@@ -166,8 +166,8 @@ do
     local case = gen.case(gen.rng(seed))
     local rc = gen.render(case)
     local two = gen.render_double(case)
-    local once = S.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
-    local twice = once and S.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
+    local once = T.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
+    local twice = once and T.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
     if twice then
       local ok, out = cc.syntax_ok(tmp .. "/uniq" .. i .. ".c", rc.callee_src .. "\n" .. twice .. "\n" .. rc.main_src)
       if not ok then

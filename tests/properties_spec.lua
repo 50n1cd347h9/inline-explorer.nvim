@@ -8,7 +8,7 @@ local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
 local H = require("tests.lib.harness")
 local gen = require("tests.lib.gen")
-local S = require("inline-explorer.substitute")
+local T = require("tests.lib.inline")
 local C = require("inline-explorer.csrc")
 
 if not H.require_c_parser() then
@@ -48,7 +48,7 @@ local exempted = 0
 -- One case, one mode. Returns nil if healthy, else a short violation tag.
 local function violation(case, mode)
   local rc = gen.render(case)
-  local new, err = S.inline_call(rc.caller_src, rc.callee_src, "f", 1, 1, mode)
+  local new, err = T.inline_call(rc.caller_src, rc.callee_src, "f", 1, 1, mode)
   if not new then
     -- The engine may legitimately reject; but on our vocabulary it never
     -- should (no variadics, arity always matches) -- except the grammar-
@@ -112,9 +112,9 @@ do
     local case = gen.case(gen.rng(seed))
     local rc = gen.render(case)
     local two = gen.render_double(case)
-    local once = S.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
+    local once = T.inline_call(two, rc.callee_src, "f", 1, 1, "correct")
     if once then
-      local twice = S.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
+      local twice = T.inline_call(once, rc.callee_src, "f", 2, 1, "correct")
       if twice and C.parse(twice):has_error() then
         bad, bad_seed = "second inlining produced ERROR nodes", seed
       end
@@ -138,7 +138,7 @@ do
     local case = gen.case(gen.rng(seed))
     local rc = gen.render(case)
     -- unknown function name
-    local ok1, r1, e1 = pcall(S.inline_call, rc.caller_src, rc.callee_src, "nosuch", 1, 1, "correct")
+    local ok1, r1, e1 = pcall(T.inline_call, rc.caller_src, rc.callee_src, "nosuch", 1, 1, "correct")
     if not ok1 or r1 ~= nil or e1 == nil then
       bad = "unknown-name case misbehaved @seed=" .. seed
       break
@@ -148,7 +148,7 @@ do
     if fat == rc.callee_src then
       fat = rc.callee_src:gsub("static int f%(", "static int f(int zz, ", 1)
     end
-    local ok2, r2, e2 = pcall(S.inline_call, rc.caller_src, fat, "f", 1, 1, "correct")
+    local ok2, r2, e2 = pcall(T.inline_call, rc.caller_src, fat, "f", 1, 1, "correct")
     if not ok2 or r2 ~= nil or e2 == nil then
       bad = "arity case misbehaved @seed=" .. seed .. " err=" .. tostring(e2)
       break
@@ -170,14 +170,14 @@ do
     end
     local frag = table.concat(lines, "\n")
     local target = string.rep(" ", r.int(0, 8))
-    local out = S._rebase(frag, target)
+    local out = C.reindent(frag, target)
     local nonblank = {}
     for _, l in ipairs(out) do
       if l:match("%S") then
         nonblank[#nonblank + 1] = l
       end
     end
-    local prefix = S._common_ws_prefix(nonblank)
+    local prefix = C.common_ws_prefix(nonblank)
     if prefix:sub(1, #target) ~= target then
       bad = "roundtrip broke @case " .. i .. ": prefix=" .. vim.inspect(prefix) .. " target=" .. vim.inspect(target)
       break
