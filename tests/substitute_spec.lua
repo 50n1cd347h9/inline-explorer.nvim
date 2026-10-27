@@ -1757,7 +1757,7 @@ do
   local callee = "static int f(int x)\n{\n    int t = x + 1;\n    return t;\n}"
   local caller = "int g(int a)\n{\n    if (a)\n        a = f(a) +\n            1;\n    return a;\n}"
   for _, mode in ipairs({ "correct", "readable" }) do
-    local new = S.inline_call(caller, callee, "f", 1, 1, mode) or ""
+    local new = T.inline_call(caller, callee, "f", 1, 1, mode) or ""
     check(
       "wrapped target: a continuation line keeps its place (" .. mode .. ")",
       new:find("\n            a = %(t%) %+\n                1;\n        }") ~= nil,
