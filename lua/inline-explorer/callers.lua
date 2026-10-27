@@ -38,6 +38,10 @@ local function sort_items(items)
   return items
 end
 
+-- The line of a call-hierarchy item, from the buffer when it is loaded: the
+-- server answered about the buffer's text, which can differ from the disk's.
+-- (A grep hit is read from the disk instead, as grep read it: see
+-- add_confirmed_calls.)
 local function trimmed_line(path, lnum0)
   local buf = vim.fn.bufnr(path)
   if buf ~= -1 and vim.api.nvim_buf_is_loaded(buf) then
@@ -92,6 +96,8 @@ end
 
 -- Adds to `items` the hits that are the callee of a call of `name`. A hit
 -- elsewhere in a call (in an argument, a comment or a string) is not one.
+-- The file is read from the disk, where grep found the hits, so their rows
+-- and columns hold even when a loaded buffer of it has unsaved edits.
 local function add_confirmed_calls(items, file, hits, name)
   local read_ok, file_lines = pcall(vim.fn.readfile, file)
   if not read_ok then

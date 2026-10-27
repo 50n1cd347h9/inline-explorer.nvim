@@ -238,11 +238,13 @@ do
 end
 
 -- Re-entrancy guard: while a resolver round trip is in flight, a second
--- expand is refused; the stamp goes stale after FETCH_GUARD_MS so a leaked
--- flag self-heals.
+-- expand is refused; the stamp goes stale after the fetch's budget so a
+-- leaked flag self-heals.
 do
   resolver.locate = function() end -- swallow: the fetch never completes
-  view.FETCH_GUARD_MS = 200
+  resolver.fetch_budget_ms = function()
+    return 200
+  end
   local col2 = ("    int r = helper(1);"):find("helper") - 1
   vim.api.nvim_win_set_cursor(0, { 3, col2 })
 
@@ -277,7 +279,7 @@ do
       refused_again = true
     end
   end
-  check("stale guard self-heals after FETCH_GUARD_MS", not refused_again, table.concat(notes, " | "))
+  check("stale guard self-heals after the fetch budget", not refused_again, table.concat(notes, " | "))
 end
 
 -- Profiling: off by default records nothing; on, the real expand path

@@ -174,7 +174,7 @@ function M.expand(prefetched)
     return
   end
 
-  if not view.begin_fetch(st) then
+  if not view.begin_fetch(st, resolver.fetch_budget_ms()) then
     return notify("a lookup is already in flight", vim.log.levels.INFO)
   end
 

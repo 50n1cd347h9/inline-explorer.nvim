@@ -784,6 +784,16 @@ function M.locate_definition(name, source_bufnr, cb)
   end)
 end
 
+-- How long a fetch can take, for a caller's re-entrancy guard (see
+-- view.begin_fetch). It makes up to four requests in a row (locate,
+-- extract, chase, extract), and either extract can be cold. 3 * timeout +
+-- max(cold, timeout) covers them while cold <= timeout (the defaults are
+-- 2000 and 4000); one second of slack is added.
+---@return integer ms
+function M.fetch_budget_ms()
+  return 3 * M._timeout_ms + math.max(M._cold_timeout_ms, M._timeout_ms) + 1000
+end
+
 -- M.locate_definition without the loc.
 ---@param name string
 ---@param source_bufnr integer? nil or invalid counts as the current buffer

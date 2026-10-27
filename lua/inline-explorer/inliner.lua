@@ -17,6 +17,11 @@ local util = require("inline-explorer.util")
 
 local M = {}
 
+-- Calls inlined so far in each view, by its state: an inline numbers the
+-- names it injects with it. Weak keys: a closed view's count goes with it.
+---@type table<inline_explorer.ViewState, integer>
+local inlined = setmetatable({}, { __mode = "k" })
+
 -- The view buffer's tree, which the highlighter keeps parsed incrementally,
 -- so a keypress does not parse the whole file. nil on failure; substitute and
 -- macro then parse the text themselves.
@@ -60,7 +65,7 @@ end
 
 local function inline_function(action, prefetched)
   local st = action.st
-  local expansion_id = (st.subst_n or 0) + 1
+  local expansion_id = (inlined[st] or 0) + 1
   local finish_substitute = profile.start()
   local callee_src = table.concat(prefetched.body, "\n")
   local ok, result, reason = pcall(
@@ -89,7 +94,7 @@ local function inline_function(action, prefetched)
   end
   vim.schedule(function()
     view.end_fetch(st)
-    st.subst_n = expansion_id
+    inlined[st] = expansion_id
     view.rewrite(st, action.bufnr, new_text, action.row)
     action.finish_total("total:inline-function", action.ident)
   end)
@@ -149,7 +154,10 @@ function M.smart()
     return
   end
 
-  if not view.begin_fetch(st) then
+  -- An inline that goes on to macro.fetch_expansion adds up to 2000ms each
+  -- for the tweak and the hover. That fits the fetch's budget: only a
+  -- declaration is chased, and no expansion is asked for one.
+  if not view.begin_fetch(st, resolver.fetch_budget_ms()) then
     util.notify("a lookup is already in flight", vim.log.levels.INFO)
     return
   end

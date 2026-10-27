@@ -24,7 +24,6 @@ local util = require("inline-explorer.util")
 ---@field blocks inline_explorer.Block[]
 ---@field ranges_at table<integer, inline_explorer.BlockRange[]> the blocks of each undo state, by seq (see M.change)
 ---@field fetch_started? integer vim.uv.now() when the lookup in flight began (see M.begin_fetch)
----@field subst_n? integer calls inlined so far; inliner.lua numbers the names it injects with it
 
 local M = {}
 
@@ -329,30 +328,14 @@ end
 
 -- Re-entrancy guard: while a lookup is in flight for a view, M.begin_fetch()
 -- refuses another, so two quick keypresses cannot interleave their splices.
--- It expires after guard_ms(), so a missed M.end_fetch() cannot lock a view.
-
--- Tests set this (ms) to override guard_ms().
-M.FETCH_GUARD_MS = nil
-
--- resolver.fetch makes up to four requests in a row (locate, extract, chase,
--- extract), and either extract can be cold. 3 * timeout + max(cold, timeout)
--- covers them while cold <= timeout (the defaults are 2000 and 4000); one
--- second of slack is added. An inline that goes on to macro.fetch_expansion
--- adds up to 2000ms each for the tweak and the hover, which fits because
--- only a declaration is chased, and the inliner asks for no expansion of one.
-local function guard_ms()
-  if M.FETCH_GUARD_MS then
-    return M.FETCH_GUARD_MS
-  end
-  local r = require("inline-explorer.resolver")
-  return 3 * r._timeout_ms + math.max(r._cold_timeout_ms, r._timeout_ms) + 1000
-end
-
+-- It expires after `guard_ms`, which the caller sets from how long its
+-- lookup can take, so a missed M.end_fetch() cannot lock a view.
 ---@param st inline_explorer.ViewState
----@return boolean taken false while an earlier lookup holds the guard
-function M.begin_fetch(st)
+---@param guard_ms integer
+---@return boolean ok false while another lookup is in flight
+function M.begin_fetch(st, guard_ms)
   local now = vim.uv.now()
-  if st.fetch_started and (now - st.fetch_started) < guard_ms() then
+  if st.fetch_started and (now - st.fetch_started) < guard_ms then
     return false
   end
   st.fetch_started = now
