@@ -9,6 +9,15 @@ local cprint = require("inline-explorer.cprint")
 
 local M = {}
 
+-- canalyze.analyze_call_node for the occ-th call to fname in caller_src.
+local function analyze_call(caller_src, callee_src, fname, N, occ)
+  local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ)[occ]
+  if not call then
+    return nil, nil, "call to '" .. fname .. "' not found"
+  end
+  return canalyze.analyze_call_node(caller_src, callee_src, fname, N, call)
+end
+
 -- Inlines the occ-th call to fname in caller_src; callee_src holds fname's
 -- definition.
 ---@param caller_src string
@@ -20,7 +29,7 @@ local M = {}
 ---@return string? new_src
 ---@return string? err
 function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
-  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
+  local ir, ctx, err = analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
   if not ir then
     return nil, err
   end
@@ -66,7 +75,7 @@ function M.render(caller_src, callee_src, fname, N, occ, printer_name)
   if not printer then
     return nil, "unknown printer '" .. tostring(printer_name) .. "'"
   end
-  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
+  local ir, ctx, err = analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
   if not ir then
     return nil, err
   end

@@ -553,23 +553,9 @@ function M.decide(ir, ctx, mode)
   return "canonical"
 end
 
--- analyze_call_node for the occ-th call to fname in caller_src.
----@param caller_src string
----@param callee_src string
----@param fname string
----@param N integer
----@param occ integer
----@return inline_explorer.IR? ir
----@return inline_explorer.Ctx? ctx
----@return string? err
-function M.analyze_call(caller_src, callee_src, fname, N, occ)
-  local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ)[occ]
-  if not call then
-    return nil, nil, "call to '" .. fname .. "' not found"
-  end
-  return M.analyze_call_node(caller_src, callee_src, fname, N, call)
-end
-
+-- Analyses `call`, a call to fname in caller_src, with callee_src as
+-- fname's definition: the callee's IR with the arguments bound, and the call
+-- site's ctx.
 ---@param caller_src string
 ---@param callee_src string
 ---@param fname string
