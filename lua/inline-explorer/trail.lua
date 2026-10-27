@@ -110,9 +110,8 @@ local function share_clients(from, to)
   end
 end
 
--- Show the reading view of `loc`'s file in the current window, on `loc`'s
--- source row (expansions above it in a reused view shift it), and push the
--- view the window leaves.
+-- Show the reading view of `loc`'s file in the current window, on the view
+-- row that holds `loc`'s source row, and push the view the window leaves.
 ---@param loc inline_explorer.Loc|inline_explorer.CallerItem
 ---@return boolean ok false, changing nothing, if the file cannot be read
 function M.goto_location(loc)
@@ -138,8 +137,9 @@ function M.goto_location(loc)
   vim.api.nvim_set_current_buf(target)
   -- Stacked or only shown, a view on the trail must survive buffer switches.
   vim.bo[target].bufhidden = "hide"
-  local row = loc.range.start.line
-  local line = vim.api.nvim_buf_get_lines(src_buf, row, row + 1, false)[1] or ""
+  -- Expansions above loc's line in a reused view move it down.
+  local row = view.view_row(view.state[target], loc.range.start.line)
+  local line = vim.api.nvim_buf_get_lines(target, row, row + 1, false)[1] or ""
   pcall(vim.api.nvim_win_set_cursor, 0, { row + 1, util.byte_col(line, loc.range.start.character, loc.encoding) })
   return true
 end

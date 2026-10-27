@@ -151,6 +151,26 @@ do
   trail.clear()
 end
 
+-- A location names a source row. In a reused view, expansions above it move
+-- its line down, and the cursor goes where the line is, not to the row the
+-- location names.
+do
+  trail.clear()
+  local rpath = dir .. "/reused.c"
+  H.writef(rpath, "int a;\nint b;\nint target(void)\n{\n    return 0;\n}\n")
+  vim.cmd.edit(rpath)
+  local v = view.open()
+  view.set_lines(v, 1, 1, { "/* one */", "/* two */", "/* three */" })
+  trail.goto_location({
+    uri = vim.uri_from_fname(rpath),
+    range = { start = { line = 2, character = 4 }, ["end"] = { line = 2, character = 10 } },
+  })
+  local c = vim.api.nvim_win_get_cursor(0)
+  check("reused view: the cursor is on the target's line", c[1] == 6 and c[2] == 4, c)
+  check("reused view: that line is the target's", vim.api.nvim_get_current_line() == "int target(void)")
+  trail.clear()
+end
+
 -- Without a FileType autostart, a file a jump opens has no server. It gets
 -- the servers of the file the jump came from: lookups from its view go
 -- through them, and before definition files were attached only on demand,
