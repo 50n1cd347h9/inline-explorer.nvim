@@ -1,12 +1,11 @@
 -- View (a "reading view"): a read-only copy of the source file where
 -- expansions are inserted as real (cursor-navigable) text, so they can be
 -- expanded again in turn.
-local config = require("inline-explorer.config")
 local lsp = require("inline-explorer.lsp")
 local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
--- history, nav, pick and trail require this module, so they are required
--- where they are used: requiring them here would be a require loop.
+-- It requires nothing above it: the keymaps a view gets are set by
+-- keymaps.lua, on the User InlineExplorerViewOpen event that M.open fires.
 
 ---@class inline_explorer.Block
 ---@field name string the expanded symbol
@@ -86,42 +85,6 @@ local function create_view_buffer(src)
   return view
 end
 
-local function set_keymaps(view)
-  local hist = require("inline-explorer.history")
-  local nav = require("inline-explorer.nav")
-  local trail = require("inline-explorer.trail")
-  local pick = require("inline-explorer.pick")
-  local km = config.options.keymaps or {}
-  local maps = {
-    { key = km.undo, fn = hist.undo, desc = "undo expansion" },
-    { key = km.redo, fn = hist.redo, desc = "redo expansion" },
-    { key = km.next_block, fn = nav.next, desc = "next expansion block" },
-    { key = km.prev_block, fn = nav.prev, desc = "previous expansion block" },
-    { key = km.list_blocks, fn = nav.list, desc = "list expansion blocks" },
-    {
-      key = km.callers,
-      fn = function()
-        pick.callers()
-      end,
-      desc = "callers of the function under the cursor",
-    },
-    {
-      key = km.goto_def,
-      fn = function()
-        pick.definition()
-      end,
-      desc = "go to the definition, in a view of its file",
-    },
-    { key = km.trail_back, fn = trail.back, desc = "back along the trail" },
-    { key = km.trail_forward, fn = trail.forward, desc = "forward along the trail" },
-  }
-  for _, map in ipairs(maps) do
-    if map.key then
-      vim.keymap.set("n", map.key, map.fn, { buffer = view, desc = "Inline Explorer: " .. map.desc })
-    end
-  end
-end
-
 -- Open a reading view of `src` in the current window.
 ---@param src? integer|vim.api.keyset.create_user_command.command_args a table or nil means the current buffer
 ---@return integer? view nil if `src` is itself a view
@@ -154,17 +117,18 @@ function M.open(src)
   vim.wo[0][0].foldenable = true
   pcall(vim.api.nvim_win_set_cursor, 0, cursor)
 
-  set_keymaps(view)
+  vim.api.nvim_exec_autocmds("User", { pattern = "InlineExplorerViewOpen", modeline = false, data = { buf = view } })
   return view
 end
 
+-- Close the reading view on screen. (trail.close also drops the views the
+-- trail keeps hidden.)
 function M.close()
   local view = vim.api.nvim_get_current_buf()
   if not M.is_view(view) then
     util.notify("not in a reading view", vim.log.levels.WARN)
     return
   end
-  require("inline-explorer.trail").clear()
   M.forget(view)
   vim.api.nvim_buf_delete(view, { force = true })
 end
@@ -220,6 +184,24 @@ local function block_range(bufnr, block)
   return nil
 end
 
+-- The blocks that contain row `row` (0-based), outermost first.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param row integer
+---@return inline_explorer.BlockRange[]
+function M.blocks_at(st, bufnr, row)
+  local out = {}
+  for _, range in ipairs(M.block_ranges(st, bufnr)) do
+    if row >= range.s and row <= range.e then
+      out[#out + 1] = range
+    end
+  end
+  table.sort(out, function(a, b)
+    return a.s < b.s
+  end)
+  return out
+end
+
 -- The blocks whose first and last lines are both still there, in st.blocks order.
 ---@param st inline_explorer.ViewState
 ---@param bufnr integer
@@ -241,7 +223,8 @@ local function undo_seq(bufnr)
   end)
 end
 
--- The view is 'nomodifiable', so every write goes through here.
+-- The view is 'nomodifiable': its text changes only through here and
+-- M.undo_step.
 ---@param bufnr integer
 ---@param s integer first row, 0-based
 ---@param e integer end row, 0-based, exclusive
@@ -314,6 +297,25 @@ function M.change(st, bufnr, fn)
   end
   st.blocks = kept
   st.ranges_at[undo_seq(bufnr)] = M.block_ranges(st, bufnr)
+end
+
+-- Neovim's :undo or :redo (`cmd`) in view bufnr, which the current window
+-- shows, then the blocks of the undo state reached. False when there was
+-- nothing to undo or redo.
+---@param st inline_explorer.ViewState
+---@param bufnr integer
+---@param cmd "undo"|"redo"
+---@return boolean moved
+function M.undo_step(st, bufnr, cmd)
+  local before = undo_seq(bufnr)
+  vim.bo[bufnr].modifiable = true
+  pcall(vim.cmd, "silent " .. cmd)
+  vim.bo[bufnr].modifiable = false
+  if undo_seq(bufnr) == before then
+    return false
+  end
+  M.restore_blocks(st, bufnr)
+  return true
 end
 
 -- After an undo or redo, rebuild the blocks recorded for the undo state reached.

@@ -1,8 +1,9 @@
 -- Trail: the reading views visited through definition and caller jumps, as a
--- stack that back() and forward() step through like a browser's history.
--- Stacked views stay alive (bufhidden=hide) while hidden, so going back finds
--- their expansions, folds and undo history intact. The trail wipes a view only
--- when its last entry is evicted or on clear(), never while a window shows it.
+-- stack that back() and forward() step through like a browser's history, and
+-- that list() puts in the location list. The views it keeps stay alive
+-- (bufhidden=hide) while hidden, so going back finds their expansions, folds
+-- and undo history intact. The trail wipes a view it keeps only when its last
+-- entry is evicted, or on clear() and close(), never while a window shows it.
 local lsp = require("inline-explorer.lsp")
 local view = require("inline-explorer.view")
 local util = require("inline-explorer.util")
@@ -21,6 +22,10 @@ local M = {}
 ---@type inline_explorer.TrailEntry[]
 M._stack = {}
 M._pos = 0
+-- The views the trail made bufhidden=hide, as a set: the ones it must wipe
+-- itself. Any other view is wiped by Neovim once hidden (bufhidden=wipe).
+---@type table<integer, true>
+M._kept = {}
 -- The most entries; a module field so that tests can lower it.
 M._stack_max = 8
 
@@ -35,15 +40,21 @@ local function wipe_unless_shown(buf)
   end
 end
 
--- Empty the trail and wipe every view in view.state that no window shows, not
--- only the stacked ones: a view dropped from forward history would otherwise
+-- Keep view `buf` alive while hidden.
+local function keep(buf)
+  vim.bo[buf].bufhidden = "hide"
+  M._kept[buf] = true
+end
+
+-- Empty the trail and wipe every view it kept that no window shows, not only
+-- the stacked ones: a view dropped from forward history would otherwise
 -- outlive the trail.
 function M.clear()
-  for v in pairs(view.state) do
+  for v in pairs(M._kept) do
     wipe_unless_shown(v)
   end
   local cur = vim.api.nvim_get_current_buf()
-  M._stack, M._pos = {}, 0
+  M._stack, M._pos, M._kept = {}, 0, {}
   -- The stack no longer protects the view on screen: let it be wiped once the
   -- window leaves it.
   if view.is_view(cur) then
@@ -78,7 +89,7 @@ local function push_current()
   for i = #M._stack, M._pos + 1, -1 do
     table.remove(M._stack, i)
   end
-  vim.bo[cur].bufhidden = "hide"
+  keep(cur)
   M._stack[#M._stack + 1] = { buf = cur, cursor = vim.api.nvim_win_get_cursor(0) }
   M._pos = #M._stack
   while #M._stack > M._stack_max do
@@ -125,7 +136,7 @@ function M.goto_location(loc)
   local target = view_of(src_buf) or view.open(src_buf)
   vim.api.nvim_set_current_buf(target)
   -- Stacked or only shown, a view on the trail must survive buffer switches.
-  vim.bo[target].bufhidden = "hide"
+  keep(target)
   -- Expansions above loc's line in a reused view move it down.
   local row = view.view_row(view.state[target], loc.range.start.line)
   local line = vim.api.nvim_buf_get_lines(target, row, row + 1, false)[1] or ""
@@ -165,6 +176,17 @@ end
 ---@return boolean moved
 function M.forward()
   return step(1, "already at the end of the trail")
+end
+
+-- Close the reading view on screen, and drop the trail with the views it
+-- keeps hidden: they are reached only through it.
+function M.close()
+  if not view.current() then
+    util.notify("not in a reading view", vim.log.levels.WARN)
+    return
+  end
+  M.clear()
+  view.close()
 end
 
 function M.list()

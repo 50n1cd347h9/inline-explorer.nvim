@@ -149,13 +149,19 @@ do
     notified = msg
   end
   local done = false
+  local prev_buf = vim.api.nvim_get_current_buf()
+  local scratch = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "no_such_function_xyz();" })
+  vim.api.nvim_set_current_buf(scratch)
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
   pick.callers(function()
     done = true
-  end, "no_such_function_xyz")
+  end)
   vim.wait(10000, function()
     return done
   end, 10)
   vim.notify = orig
+  vim.api.nvim_set_current_buf(prev_buf)
   check(
     "picker: zero callers -> no picker, an explicit notification",
     select_ui._state == nil and notified ~= nil and notified:find("no_such_function_xyz", 1, true) ~= nil,

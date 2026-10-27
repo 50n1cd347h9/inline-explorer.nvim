@@ -11,10 +11,8 @@ local M = {}
 -- The names of the blocks that contain row `row` (0-based), as a set.
 local function ancestor_names(st, bufnr, row)
   local names = {}
-  for _, range in ipairs(view.block_ranges(st, bufnr)) do
-    if row >= range.s and row <= range.e then
-      names[range.name] = true
-    end
+  for _, range in ipairs(view.blocks_at(st, bufnr, row)) do
+    names[range.name] = true
   end
   return names
 end

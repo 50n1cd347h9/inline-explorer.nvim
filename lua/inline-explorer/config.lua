@@ -63,6 +63,12 @@ local function check(opts)
   end
 end
 
+-- Switches the inline mode between "correct" and "readable".
+function M.toggle_mode()
+  M.options.mode = M.options.mode == "correct" and "readable" or "correct"
+  util.notify("substitution mode = " .. M.options.mode)
+end
+
 ---@param opts? table
 ---@return table options
 function M.setup(opts)

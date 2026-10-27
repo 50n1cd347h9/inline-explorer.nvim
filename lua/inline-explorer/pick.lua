@@ -31,10 +31,9 @@ local function format_caller(item)
 end
 
 ---@param done_cb? fun() called once, however the flow ends; tests wait on it
----@param name_override? string looked up instead of the word under the cursor
-function M.callers(done_cb, name_override)
+function M.callers(done_cb)
   local done = done_cb or function() end
-  local name = name_override or word_under_cursor()
+  local name = word_under_cursor()
   if name == "" then
     util.notify("no identifier under the cursor", vim.log.levels.WARN)
     done()
