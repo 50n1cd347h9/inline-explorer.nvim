@@ -71,6 +71,25 @@ do
   check("extract_sync: body includes the return", table.concat(lines, "\n"):find("return per_cpu", 1, true) ~= nil)
 end
 
+-- extract_sync loads the definition file. Like the files extract loads, it
+-- goes in the attach cache, so that eviction unloads it again; it used to
+-- stay loaded for the rest of the session.
+do
+  local saved_cap = resolver._attach_cache_max
+  resolver._attach_cache_max = 1
+  local function extract_file(body)
+    local p = vim.fn.tempname() .. ".c"
+    H.writef(p, body)
+    resolver.extract_sync({ uri = vim.uri_from_fname(p), range = range(0, 4, 0, 6) })
+    return vim.fn.bufnr(p)
+  end
+  local first = extract_file("int f1(void)\n{\n    return 1;\n}\n")
+  check("extract_sync: the file it read is loaded", vim.api.nvim_buf_is_loaded(first))
+  extract_file("int f2(void)\n{\n    return 2;\n}\n")
+  check("extract_sync: a file past the cache's capacity is unloaded", not vim.api.nvim_buf_is_loaded(first))
+  resolver._attach_cache_max = saved_cap
+end
+
 -- extract_sync: macro definition -> a preproc node type, continuation kept,
 -- and nothing after it. A #define's node ends at column 0 of the next row,
 -- so taking its end row as the last line added the line below the macro.

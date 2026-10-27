@@ -173,6 +173,23 @@ do
     lines and vim.inspect(lines)
   )
 
+  -- edit_matches reads every entry for the document; so must this, or an
+  -- edit it accepted in a later entry is lost and the fetch falls back.
+  local split_entries = {
+    documentChanges = {
+      { textDocument = { uri = uri, version = 1 }, edits = { { range = range, newText = " " } } },
+      { textDocument = { uri = uri, version = 1 }, edits = { { range = range, newText = "((x) * 2)" } } },
+    },
+  }
+  split_entries.documentChanges[1].edits[1].range =
+    { start = { line = 1, character = 0 }, ["end"] = { line = 1, character = 1 } }
+  check("edit: the matching edit in a later entry is accepted", macro._edit_matches(split_entries, uri, pos))
+  check(
+    "edit: and read",
+    table.concat(macro._edit_lines(split_entries, uri, pos) or {}, "\n") == "((x) * 2)",
+    macro._edit_lines(split_entries, uri, pos)
+  )
+
   check("edit: wrong uri -> nil", macro._edit_lines(changes_shape, "file:///nope.c", pos) == nil)
   check(
     "edit: empty newText -> nil",

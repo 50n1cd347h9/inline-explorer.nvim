@@ -440,12 +440,16 @@ local function outermost_in_window(root, srow, scol)
   return found
 end
 
+-- Defined with the attach cache below: a file this module loads is
+-- recorded there, so that eviction unloads it again.
+local load_buffer
+
 ---@param loc inline_explorer.Loc
 ---@return string[] lines
 ---@return string label
 function M.extract_sync(loc)
   local bufnr = vim.uri_to_bufnr(loc.uri)
-  vim.fn.bufload(bufnr)
+  load_buffer(bufnr)
   local srow = loc.range.start.line
   local sline = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
   local scol = util.byte_col(sline, loc.range.start.character, loc.encoding)
@@ -579,7 +583,7 @@ local function remember(target, loaded, attached_id)
 end
 
 -- True when this call loaded target.
-local function load_buffer(target)
+function load_buffer(target)
   local loaded = not vim.api.nvim_buf_is_loaded(target)
   if loaded then
     vim.fn.bufload(target)

@@ -1750,4 +1750,20 @@ do
   vim.treesitter.get_string_parser = real
 end
 
+-- A target that spans lines, in an `if` without braces, is wrapped in a new
+-- block. Its lines after the first keep their place relative to the first:
+-- they carry the target's own indent, which the block's indent replaces.
+do
+  local callee = "static int f(int x)\n{\n    int t = x + 1;\n    return t;\n}"
+  local caller = "int g(int a)\n{\n    if (a)\n        a = f(a) +\n            1;\n    return a;\n}"
+  for _, mode in ipairs({ "correct", "readable" }) do
+    local new = S.inline_call(caller, callee, "f", 1, 1, mode) or ""
+    check(
+      "wrapped target: a continuation line keeps its place (" .. mode .. ")",
+      new:find("\n            a = %(t%) %+\n                1;\n        }") ~= nil,
+      new
+    )
+  end
+end
+
 H.finish("SUBSTITUTE")
