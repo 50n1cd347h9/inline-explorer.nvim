@@ -1,11 +1,12 @@
 -- C inline substitution as the specs drive it: by a function's name and
 -- the occurrence of its call, rather than by a cursor position as
--- substitute.inline_in_buffer, and through the analysis and printers
+-- substitute.inline_at does, and through the analysis and printers
 -- directly, to test them one at a time. `N`, an id unique to each
 -- expansion, suffixes the names the engine injects or renames.
 local csrc = require("inline-explorer.csrc")
 local canalyze = require("inline-explorer.canalyze")
 local cprint = require("inline-explorer.cprint")
+local substitute = require("inline-explorer.substitute")
 
 local M = {}
 
@@ -34,11 +35,11 @@ function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
     return nil, err
   end
   ---@cast ctx -nil
-  return cprint.PRINTERS[canalyze.decide(ir, ctx, mode or "correct")](caller_src, ir, ctx)
+  return substitute.print(caller_src, ir, ctx, mode)
 end
 
 -- The analysis of the occ-th call to fname, without printing it. Unlike
--- analyze_call it binds no arguments: no arity check, and ir.binds is nil.
+-- analyze_call it binds no arguments: no arity check, and ir.args is nil.
 ---@param caller_src string
 ---@param callee_src string
 ---@param fname string
@@ -80,7 +81,7 @@ function M.render(caller_src, callee_src, fname, N, occ, printer_name)
     return nil, err
   end
   ---@cast ctx -nil
-  return printer(caller_src, ir, ctx)
+  return printer(caller_src, ir, ctx, canalyze.placement(ctx))
 end
 
 return M

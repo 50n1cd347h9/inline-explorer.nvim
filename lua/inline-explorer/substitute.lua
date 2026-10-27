@@ -10,9 +10,16 @@ local cprint = require("inline-explorer.cprint")
 
 local M = {}
 
-local function print_call(caller_src, ir, ctx, mode)
-  local printer_name = canalyze.decide(ir, ctx, mode or "correct")
-  return cprint.PRINTERS[printer_name](caller_src, ir, ctx)
+-- The caller's text with the analysed call printed in the form, and at the
+-- placement, canalyze.decide picks for `mode`.
+---@param caller_src string
+---@param ir inline_explorer.IR with args
+---@param ctx inline_explorer.Ctx
+---@param mode? "correct"|"readable" default "correct"
+---@return string new_src
+function M.print(caller_src, ir, ctx, mode)
+  local printer_name, placement = canalyze.decide(ir, ctx, mode or "correct")
+  return cprint.PRINTERS[printer_name](caller_src, ir, ctx, placement)
 end
 
 -- The innermost call at (row, col) and the name it calls, or nil and the
@@ -54,7 +61,7 @@ end
 ---@param root? TSNode caller_src's tree, if already parsed
 ---@return string? new_src
 ---@return string? err
-function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)
+function M.inline_at(caller_src, row, col, callee_src, N, mode, root)
   local call, name_or_reason = named_call_at(caller_src, row, col, root)
   if not call then
     return nil, name_or_reason
@@ -64,7 +71,7 @@ function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)
   if not ir then
     return nil, err
   end
-  return print_call(caller_src, ir, ctx, mode)
+  return M.print(caller_src, ir, ctx, mode)
 end
 
 return M

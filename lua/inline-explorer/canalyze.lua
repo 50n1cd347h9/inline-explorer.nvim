@@ -4,6 +4,24 @@ local csrc = require("inline-explorer.csrc")
 
 local M = {}
 
+-- The names an expansion injects or renames to. N, an id unique to each
+-- expansion, keeps them apart.
+local INJECTED = {
+  renamed = function(name, N)
+    return name .. "__ie" .. N
+  end,
+  ret_var = function(N)
+    return "__ie_ret" .. N
+  end,
+  end_label = function(N)
+    return "__ie_end" .. N
+  end,
+  -- A parameter without a name, by its position.
+  arg = function(idx, N)
+    return "__ie_arg" .. idx .. "_" .. N
+  end,
+}
+
 local NAMES = "[(identifier) (type_identifier)] @i"
 
 -- Struct, union and enum tags are a namespace of their own.
@@ -242,7 +260,7 @@ local function plan_renames(params, stmts, body, callee_src, spelled, N)
   local rename = {}
   local function maybe_rename(nm)
     if nm and spelled[nm] then
-      rename[nm] = nm .. "__ie" .. N
+      rename[nm] = INJECTED.renamed(nm, N)
     end
   end
   for _, p in ipairs(params) do
@@ -271,7 +289,7 @@ local function plan_body_edits(body, callee_src, rename, N)
   -- Labels have function scope, so the callee's could clash with the caller's
   -- own labels or with another expansion's.
   local function suffix_label(n)
-    edits[#edits + 1] = { csrc.start_byte(n), csrc.end_byte(n), csrc.text(n, callee_src) .. "__ie" .. N }
+    edits[#edits + 1] = { csrc.start_byte(n), csrc.end_byte(n), INJECTED.renamed(csrc.text(n, callee_src), N) }
   end
   for _, n in ipairs(csrc.query_nodes(body, callee_src, "(labeled_statement label: (statement_identifier) @l)")) do
     suffix_label(n)
@@ -315,12 +333,14 @@ end
 ---@field stmts TSNode[] the body's top-level named nodes, comments and preprocessor blocks included
 ---@field returns TSNode[] every return_statement in the body
 ---@field body_edits inline_explorer.Edit[] the label suffixes and renames on src (see plan_body_edits)
----@field ret_decl string the declaration of ret_var, of the callee's return type, without its `;`
+---@field fn_def TSNode the callee's function_definition in src
 ---@field has_value boolean whether the first return carries a value (false when there is none)
 ---@field simple boolean exactly one return, carrying a value and last of stmts: a trailing comment makes it false
 ---@field ret_var string __ie_retN, which holds the result
 ---@field end_label string __ie_endN, which the returns jump to
----@field binds string[]? one `T name = (arg);` per parameter, set by analyze_call_node after the arity check
+---@field args string[]? each parameter's argument text, set by analyze_call_node after the arity check
+---@field param_rename table<string, string>? the parameters' renames: only parameters are in scope in their types
+---@field bind_names string[]? each parameter's declared name: its new name, its own, or one made up for it
 
 ---@param callee_src string
 ---@param fname string
@@ -373,11 +393,11 @@ function M.analyze_callee(callee_src, fname, N, caller)
     stmts = stmts,
     returns = returns,
     body_edits = body_edits,
-    ret_decl = csrc.result_decl(fn_def, callee_src, "__ie_ret" .. N),
+    fn_def = fn_def,
     has_value = returns[1] ~= nil and #csrc.code_children(returns[1]) > 0,
     simple = #returns == 1 and last:type() == "return_statement" and #csrc.code_children(last) > 0,
-    ret_var = "__ie_ret" .. N,
-    end_label = "__ie_end" .. N,
+    ret_var = INJECTED.ret_var(N),
+    end_label = INJECTED.end_label(N),
   }
 end
 
@@ -492,7 +512,6 @@ end
 ---@field unconditional boolean hoisting the call above target keeps its meaning (see is_unconditional)
 ---@field stmt_bol integer the byte offset of the start of target's line
 ---@field indent string the leading spaces and tabs of that line
----@field indent_unit string one level of indentation
 
 ---@param caller_src string
 ---@param call TSNode
@@ -522,7 +541,6 @@ function M.analyze_context(caller_src, call)
     unconditional = unconditional,
     stmt_bol = stmt_bol,
     indent = indent,
-    indent_unit = indent:find("\t") and "\t" or "    ",
   }
 end
 
@@ -532,25 +550,39 @@ end
 -- picks "pretty" for a simple callee whose call is unconditional, else
 -- "canonical", which is valid in any expression context; readable mode avoids
 -- ({...}) and goto: "pretty" for any simple callee, else "readable_multi".
+--
+-- The second value says where the hoisting forms, "pretty" and
+-- "readable_multi", put their lines: "above" target, or "wrap", in a new
+-- block that holds them and then target (see M.placement).
 ---@param ir inline_explorer.IR
 ---@param ctx inline_explorer.Ctx
 ---@param mode "correct"|"readable"
----@return "pretty"|"canonical"|"readable_multi"
+---@return "pretty"|"canonical"|"readable_multi" printer
+---@return "above"|"wrap" placement
 function M.decide(ir, ctx, mode)
+  local placement = M.placement(ctx)
   -- Wrapping a declaration in a block would end its scope early: later code
   -- would see whatever it shadowed. Canonical leaves it in place. So it does
   -- with a misparsed target, such as `WHEN(c) x = f(a);` where WHEN expands
   -- to an `if`: hoisted, f would run whatever c is.
   if ctx.wrap_unsafe or ctx.parse_error then
-    return "canonical"
+    return "canonical", placement
   end
   if ir.simple and (mode == "readable" or ctx.unconditional) then
-    return "pretty"
+    return "pretty", placement
   end
   if mode == "readable" then
-    return "readable_multi"
+    return "readable_multi", placement
   end
-  return "canonical"
+  return "canonical", placement
+end
+
+-- Where hoisted lines go: directly "above" target where they can, else
+-- "wrap": a new block replaces target, holding them and then target.
+---@param ctx inline_explorer.Ctx
+---@return "above"|"wrap"
+function M.placement(ctx)
+  return ctx.can_insert_above and "above" or "wrap"
 end
 
 -- Analyses `call`, a call to fname in caller_src, with callee_src as
@@ -589,10 +621,11 @@ function M.analyze_call_node(caller_src, callee_src, fname, N, call)
       param_rename[p.name] = ir.rename[p.name]
     end
   end
-  ir.binds = {}
+  local bind_names = {}
   for i, p in ipairs(ir.params) do
-    ir.binds[i] = csrc.build_bind(p, args[i], param_rename, N, i, callee_src)
+    bind_names[i] = p.name and (param_rename[p.name] or p.name) or INJECTED.arg(i, N)
   end
+  ir.args, ir.param_rename, ir.bind_names = args, param_rename, bind_names
 
   return ir, M.analyze_context(caller_src, call)
 end

@@ -164,7 +164,7 @@ do
     return sq(a) + sq(b);
 }]]
   local col2 = ("    return sq(a) + sq(b);"):find("sq%(b") - 1
-  local new = assert(S.inline_in_buffer(caller, 2, col2, callee, 1))
+  local new = assert(S.inline_at(caller, 2, col2, callee, 1))
   local main = "int main(void){ return (caller(3,4)==25)?0:1; }\n"
   check("case6 inlined only the 2nd call", select(2, new:gsub("sq%(", "")) == 1, new)
   check("case6 compiles", (compiles(callee .. "\n" .. new .. main, "c6")))
@@ -464,7 +464,7 @@ do
       break
     end
   end
-  local t2 = assert(S.inline_in_buffer(t, grow, gcol, callee_g, 2))
+  local t2 = assert(S.inline_at(t, grow, gcol, callee_g, 2))
   local main = "int main(void){ return (caller(5)==31)?0:1; }\n"
   check("case16 nested inline removed the inner call", not t2:find("g(", 1, true), t2)
   check("case16 compiles (nested inline)", (compiles(callee_g .. "\n" .. callee_f .. "\n" .. t2 .. main, "c16")), t2)
@@ -1666,7 +1666,7 @@ do
   local tree = vim.treesitter.get_parser(buf, "c"):parse()[1]:root()
   local col = ("    int b = g(a);"):find("g%(") - 1
 
-  local from_string = S.inline_in_buffer(caller, 3, col, callee, 1)
+  local from_string = S.inline_at(caller, 3, col, callee, 1)
   local real = vim.treesitter.get_string_parser
   local parsed = {}
   vim.treesitter.get_string_parser = function(text, ...)
@@ -1674,7 +1674,7 @@ do
     return real(text, ...)
   end
   C._parse_cache = {}
-  local from_tree = S.inline_in_buffer(caller, 3, col, callee, 1, nil, tree)
+  local from_tree = S.inline_at(caller, 3, col, callee, 1, nil, tree)
   local name_from_tree = S.call_name_at(caller, 3, col, tree)
   vim.treesitter.get_string_parser = real
   check("buffer tree: same transform as parsing the text", from_tree ~= nil and from_tree == from_string, from_tree)
@@ -1691,7 +1691,7 @@ end
 -- a different source must not be answered from the first. Counted by
 -- instrumenting the tree-sitter entry point rather than by timing -- a cache
 -- that merely got lucky would pass a timing assertion. Smart-inline used to
--- parse the same caller source three times (call_name_at, inline_in_buffer,
+-- parse the same caller source three times (call_name_at, inline_at,
 -- analyze_call), which on a 15,005-line file measured 154.0ms without the
 -- cache against 40.6ms with it; it now hands over the view's own tree, and
 -- the cache serves string callers -- the real-source and property suites,

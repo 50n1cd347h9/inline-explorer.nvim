@@ -5,6 +5,7 @@ local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
 local H = require("tests.lib.harness")
 local T = require("tests.lib.inline")
+local cprint = require("inline-explorer.cprint")
 
 if not H.require_c_parser() then
   return
@@ -38,7 +39,7 @@ do
   check("simple+plain: ctx.unconditional", p.ctx.unconditional == true, p.ctx)
   check("simple+plain: ctx.can_insert_above", p.ctx.can_insert_above == true, p.ctx)
   check("simple+plain: decision pretty", p.decision == "pretty", p.decision)
-  check("ir.ret_decl reconstructed", p.ir.ret_decl == "int __ie_ret1", p.ir.ret_decl)
+  check("ret_decl reconstructed", cprint.ret_decl(p.ir) == "int __ie_ret1", cprint.ret_decl(p.ir))
   check("ir.has_value", p.ir.has_value == true)
 end
 
@@ -163,10 +164,10 @@ do
   check("collision: rename planned", p.ir.rename.t == "t__ie1", p.ir.rename)
 end
 
--- Tab-indented caller -> ctx.indent_unit is a tab.
+-- Tab-indented caller -> its indent unit is a tab.
 do
   local p = assert(T.probe("static int caller(int n)\n{\n\treturn acc(n) + 1;\n}", simple_callee, "acc"))
-  check("tab caller: ctx.indent_unit is tab", p.ctx.indent_unit == "\t", p.ctx.indent_unit)
+  check("tab caller: the indent unit is a tab", cprint.indent_unit(p.ctx.indent) == "\t", p.ctx.indent)
 end
 
 -- Errors surface as nil, err.

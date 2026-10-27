@@ -70,7 +70,7 @@ local function inline_function(action, prefetched)
   local finish_substitute = profile.start()
   local callee_src = table.concat(prefetched.body, "\n")
   local ok, result, reason = pcall(
-    substitute.inline_in_buffer,
+    substitute.inline_at,
     action.view_text,
     action.row,
     action.col,
