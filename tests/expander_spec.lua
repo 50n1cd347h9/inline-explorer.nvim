@@ -16,6 +16,17 @@ do
   assert(not ok, "config.setup accepted an invalid mode")
   local ok2 = pcall(config.setup, { indent = 4 })
   assert(not ok2, "config.setup accepted a non-string indent")
+  -- A mistyped keymap name warns, as a mistyped option does.
+  local warned = {}
+  local old_notify = vim.notify
+  vim.notify = function(msg)
+    warned[#warned + 1] = tostring(msg)
+  end
+  config.setup({ keymaps = { substitue = "<leader>x" }, modee = "correct" })
+  vim.notify = old_notify
+  local text = table.concat(warned, "\n")
+  assert(text:find("unknown keymap 'substitue'", 1, true), "no warning for a mistyped keymap: " .. text)
+  assert(text:find("unknown option 'modee'", 1, true), "no warning for a mistyped option: " .. text)
 end
 require("inline-explorer.config").setup({})
 

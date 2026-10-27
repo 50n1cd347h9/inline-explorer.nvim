@@ -5,7 +5,7 @@ local M = {}
 
 M.defaults = {
   keymaps = {
-    -- Global keymaps, set by setup().
+    -- Global keymaps, which init.lua's setup() maps.
 
     -- Inline the call or macro under the cursor in place (C only), else expand.
     substitute = "<leader>ei",
@@ -54,6 +54,11 @@ local function check(opts)
   for k in pairs(opts) do
     if M.defaults[k] == nil then
       util.notify(("unknown option '%s' (typo?)"):format(k), vim.log.levels.WARN)
+    end
+  end
+  for k in pairs(type(opts.keymaps) == "table" and opts.keymaps or {}) do
+    if M.defaults.keymaps[k] == nil then
+      util.notify(("unknown keymap '%s' (typo?)"):format(k), vim.log.levels.WARN)
     end
   end
 end
