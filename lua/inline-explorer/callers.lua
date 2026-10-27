@@ -6,6 +6,7 @@
 -- apart.
 local async = require("inline-explorer.async")
 local csrc = require("inline-explorer.csrc")
+local lsp = require("inline-explorer.lsp")
 local resolver = require("inline-explorer.resolver")
 
 local M = {}
@@ -229,15 +230,15 @@ function M.get(name, bufnr, cb)
   -- locate, not locate_definition: call hierarchy accepts a declaration, so no
   -- extract or chase is needed.
   resolver.locate(name, bufnr, function(loc)
-    local client = loc and resolver.client_for(loc, bufnr, method)
+    local client = loc and lsp.client_for(loc, bufnr, method)
     if not (loc and client) then
       grep_callers(name, root_dir, cb)
       return
     end
-    local target_bufnr = resolver.ensure_attached(loc.uri, client)
+    local target_bufnr = lsp.ensure_attached(loc.uri, client)
     local params = {
       textDocument = { uri = loc.uri },
-      position = resolver.name_position(target_bufnr, loc, client.offset_encoding),
+      position = lsp.name_position(target_bufnr, loc, client.offset_encoding),
     }
     call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
   end)

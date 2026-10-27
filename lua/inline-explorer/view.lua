@@ -2,6 +2,7 @@
 -- expansions are inserted as real (cursor-navigable) text, so they can be
 -- expanded again in turn.
 local config = require("inline-explorer.config")
+local lsp = require("inline-explorer.lsp")
 local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
 -- history, nav, pick and trail require this module, so they are required
@@ -52,6 +53,10 @@ end
 
 ---@param buf integer
 function M.forget(buf)
+  local st = M.state[buf]
+  if st then
+    lsp.unpin(st.source_bufnr)
+  end
   M.state[buf] = nil
 end
 
@@ -134,6 +139,8 @@ function M.open(src)
   local view = create_view_buffer(src)
 
   M.state[view] = { bufnr = view, source_bufnr = src, blocks = {}, ranges_at = { [0] = {} } }
+  -- Lookups from the view go through the source buffer's clients.
+  lsp.pin(src)
   -- bufhidden=wipe also wipes the view, without M.close(), once it is hidden.
   vim.api.nvim_create_autocmd("BufWipeout", {
     buffer = view,

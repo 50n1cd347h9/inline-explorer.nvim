@@ -3,6 +3,7 @@
 -- Stacked views stay alive (bufhidden=hide) while hidden, so going back finds
 -- their expansions, folds and undo history intact. The trail wipes a view only
 -- when its last entry is evicted or on clear(), never while a window shows it.
+local lsp = require("inline-explorer.lsp")
 local view = require("inline-explorer.view")
 local util = require("inline-explorer.util")
 
@@ -98,18 +99,6 @@ local function show(entry)
   return true
 end
 
--- A file a jump opens gets the servers of the file the jump came from when
--- it has none, as a FileType autostart would give it: lookups from its view
--- go through them.
-local function share_clients(from, to)
-  if from == to or #vim.lsp.get_clients({ bufnr = to }) > 0 then
-    return
-  end
-  for _, client in ipairs(vim.lsp.get_clients({ bufnr = from })) do
-    vim.lsp.buf_attach_client(to, client.id)
-  end
-end
-
 -- Show the reading view of `loc`'s file in the current window, on the view
 -- row that holds `loc`'s source row, and push the view the window leaves.
 ---@param loc inline_explorer.Loc|inline_explorer.CallerItem
@@ -132,7 +121,7 @@ function M.goto_location(loc)
 
   local src_buf = vim.fn.bufadd(path)
   vim.fn.bufload(src_buf)
-  share_clients(from, src_buf)
+  lsp.share_clients(from, src_buf)
   local target = view_of(src_buf) or view.open(src_buf)
   vim.api.nvim_set_current_buf(target)
   -- Stacked or only shown, a view on the trail must survive buffer switches.

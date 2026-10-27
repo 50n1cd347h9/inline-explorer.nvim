@@ -167,7 +167,12 @@ function M.smart()
     finish_total = profile.start(),
   }
 
-  resolver.fetch(ident, st.source_bufnr, function(lines, label)
+  resolver.fetch(ident, st.source_bufnr, function(lines, label, _, note)
+    if note then
+      vim.schedule(function()
+        util.notify(note, vim.log.levels.WARN)
+      end)
+    end
     if not lines then
       block_fallback(action) -- expand looks up <cword> itself, and reports a failure
       return

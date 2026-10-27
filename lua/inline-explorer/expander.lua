@@ -180,9 +180,12 @@ function M.expand(prefetched)
 
   profile.begin_action()
   local stop_timer = profile.start()
-  resolver.fetch(name, st.source_bufnr, function(body, label, err)
+  resolver.fetch(name, st.source_bufnr, function(body, label, err, note)
     vim.schedule(function()
       view.end_fetch(st)
+      if note then
+        notify(note, vim.log.levels.WARN)
+      end
       if not body or #body == 0 then
         stop_timer("total:expand-failed", name)
         return notify(err or ("could not extract a body for '" .. name .. "'"))

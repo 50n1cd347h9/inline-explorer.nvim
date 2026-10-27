@@ -5,6 +5,7 @@ local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
 local H = require("tests.lib.harness")
 local resolver = require("inline-explorer.resolver")
+local lsp = require("inline-explorer.lsp")
 
 if not H.require_c_parser() then
   return
@@ -75,8 +76,8 @@ end
 -- goes in the attach cache, so that eviction unloads it again; it used to
 -- stay loaded for the rest of the session.
 do
-  local saved_cap = resolver._attach_cache_max
-  resolver._attach_cache_max = 1
+  local saved_cap = lsp._attach_cache_max
+  lsp._attach_cache_max = 1
   local function extract_file(body)
     local p = vim.fn.tempname() .. ".c"
     H.writef(p, body)
@@ -87,7 +88,7 @@ do
   check("extract_sync: the file it read is loaded", vim.api.nvim_buf_is_loaded(first))
   extract_file("int f2(void)\n{\n    return 2;\n}\n")
   check("extract_sync: a file past the cache's capacity is unloaded", not vim.api.nvim_buf_is_loaded(first))
-  resolver._attach_cache_max = saved_cap
+  lsp._attach_cache_max = saved_cap
 end
 
 -- extract_sync: macro definition -> a preproc node type, continuation kept,
@@ -691,8 +692,8 @@ do
     -- Attachment hygiene: definition-file attachments are cached (dropping
     -- them makes clangd rebuild the header's preamble on every repeat), and
     -- the least recently used entry beyond the capacity is detached.
-    local saved_cap = resolver._attach_cache_max
-    resolver._attach_cache_max = 1
+    local saved_cap = lsp._attach_cache_max
+    lsp._attach_cache_max = 1
     local function extract_temp_header(name, body)
       local hp = vim.fn.tempname() .. ".h"
       H.writef(hp, body)
@@ -720,7 +721,7 @@ do
       evicted == 0 and newest > 0,
       ("old=%d new=%d"):format(evicted, newest)
     )
-    resolver._attach_cache_max = saved_cap
+    lsp._attach_cache_max = saved_cap
 
     resolver._timeout_ms = saved
     resolver._local_first = saved_lf
@@ -1499,8 +1500,8 @@ do
   end
   if cid then
     resolver.clear_caches()
-    local saved_cap, saved_lf = resolver._attach_cache_max, resolver._local_first
-    resolver._attach_cache_max = 1
+    local saved_cap, saved_lf = lsp._attach_cache_max, resolver._local_first
+    lsp._attach_cache_max = 1
 
     local a = header("lazy_a")
     local abuf = extract(a, "lazy_a")
@@ -1590,7 +1591,7 @@ do
       { autostarted = autostarted, notifications = log.notifications }
     )
 
-    resolver._attach_cache_max, resolver._local_first = saved_cap, saved_lf
+    lsp._attach_cache_max, resolver._local_first = saved_cap, saved_lf
     resolver.clear_caches()
     vim.lsp.stop_client(cid, true)
   end
@@ -1642,8 +1643,8 @@ do
   vim.fn.bufload(tbuf)
   vim.api.nvim_buf_set_lines(tbuf, 1, 2, false, { "/* é */ int target_fn(void);" })
   local loc = { uri = uri, range = range(1, 0, 1, 27), name = "target_fn" }
-  local p16 = resolver.name_position(tbuf, loc, "utf-16")
-  local p8 = resolver.name_position(tbuf, loc, "utf-8")
+  local p16 = lsp.name_position(tbuf, loc, "utf-16")
+  local p8 = lsp.name_position(tbuf, loc, "utf-8")
   check("encoding: name_position answers in the server's units (utf-16)", p16.character == 12, p16)
   check("encoding: name_position answers in the server's units (utf-8)", p8.character == 13, p8)
 end

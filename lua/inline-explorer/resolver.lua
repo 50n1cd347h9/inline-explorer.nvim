@@ -4,13 +4,15 @@
 --   C/C++:  tree-sitter -> server -> brace counter
 --   others: server -> tree-sitter -> brace counter
 -- "server" is the symbol's full range in a textDocument/documentSymbol reply.
+-- A definition file is loaded, and a client attached to it, through lsp.lua,
+-- which puts the file back as it was once it is no longer used.
 --
 -- Terms:
 --   label             what the lines are: a tree-sitter node type such as
 --                     "function_definition" or "declaration", "heuristic" for
 --                     the brace counter, or a server symbol's kind_label.
 --   local extraction  M.extract_sync: tree-sitter, else the brace counter
---                     (M.extract_heuristic). It needs no server.
+--                     (extract_heuristic). It needs no server.
 --   cold              step 6 of M.extract newly attached its client to the
 --                     definition file, so the server must build that file's
 --                     preamble before it can answer. A FileType autostart
@@ -31,6 +33,7 @@
 ---@field client_id? integer the server that answered; requests about the loc go to it
 
 local async = require("inline-explorer.async")
+local lsp = require("inline-explorer.lsp")
 local profile = require("inline-explorer.profile")
 local util = require("inline-explorer.util")
 
@@ -440,16 +443,15 @@ local function outermost_in_window(root, srow, scol)
   return found
 end
 
--- Defined with the attach cache below: a file this module loads is
--- recorded there, so that eviction unloads it again.
-local load_buffer
+-- The brace counter, defined below.
+local extract_heuristic
 
 ---@param loc inline_explorer.Loc
 ---@return string[] lines
 ---@return string label
 function M.extract_sync(loc)
   local bufnr = vim.uri_to_bufnr(loc.uri)
-  load_buffer(bufnr)
+  lsp.load_buffer(bufnr)
   local srow = loc.range.start.line
   local sline = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
   local scol = util.byte_col(sline, loc.range.start.character, loc.encoding)
@@ -473,7 +475,7 @@ function M.extract_sync(loc)
     end
   end
 
-  return M.extract_heuristic(bufnr, srow), HEURISTIC
+  return extract_heuristic(bufnr, srow), HEURISTIC
 end
 
 local MAX_SCAN_LINES = 500 -- so an unclosed brace cannot pull in the rest of the file
@@ -483,7 +485,7 @@ local MAX_SCAN_LINES = 500 -- so an unclosed brace cannot pull in the rest of th
 ---@param bufnr integer
 ---@param srow integer 0-based
 ---@return string[] lines
-function M.extract_heuristic(bufnr, srow)
+function extract_heuristic(bufnr, srow)
   local total = vim.api.nvim_buf_line_count(bufnr)
   local first = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
 
@@ -520,122 +522,6 @@ function M.extract_heuristic(bufnr, srow)
   return out
 end
 
--- Definition files this module loaded, or attached a client to, keyed by
--- bufnr: `ids` are the clients it attached, `loaded` says whether it loaded
--- the buffer. A client stays attached after its request, because
--- re-attaching a file makes the server rebuild its preamble. Eviction puts
--- the file back as it was: the clients this module attached are detached,
--- and a buffer it loaded is unloaded, which closes the file in every server,
--- also in one that a FileType autostart attached during the load.
-M._attach_cache_max = 8
----@type table<integer, {ids: integer[], loaded: boolean, at: integer}>
-M._attach_cache = {}
-
--- Whether a window shows buf, or a reading view reads from it: a view looks
--- names up through its source buffer's clients.
-local function in_use(buf)
-  if #vim.fn.win_findbuf(buf) > 0 then
-    return true
-  end
-  for _, st in pairs(require("inline-explorer.view").state) do
-    if st.source_bufnr == buf then
-      return true
-    end
-  end
-  return false
-end
-
-local function release(buf, entry)
-  if not vim.api.nvim_buf_is_valid(buf) or in_use(buf) then
-    return
-  end
-  if entry.loaded and not vim.bo[buf].modified and not vim.bo[buf].buflisted then
-    pcall(vim.api.nvim_buf_delete, buf, { unload = true })
-    return
-  end
-  for _, id in ipairs(entry.ids) do
-    -- The client may be gone, or detached by someone else.
-    if vim.lsp.buf_is_attached(buf, id) then
-      vim.lsp.buf_detach_client(buf, id)
-    end
-  end
-end
-
--- Marks target's entry as just used, recording that this module loaded the
--- buffer or attached `attached_id`, and evicts the least recently used
--- entries past the cap. A buffer this module did nothing to is not recorded.
--- hrtime, not the loop's millisecond clock: a tie with an older entry could
--- evict the file in use.
-local function remember(target, loaded, attached_id)
-  local entry = M._attach_cache[target]
-  if not entry and (loaded or attached_id) then
-    entry = { ids = {}, loaded = false, at = 0 }
-    M._attach_cache[target] = entry
-  end
-  if entry then
-    entry.at = vim.uv.hrtime()
-    entry.loaded = entry.loaded or loaded
-    if attached_id then
-      entry.ids[#entry.ids + 1] = attached_id
-    end
-  end
-  util.evict_lru(M._attach_cache, M._attach_cache_max, release)
-end
-
--- True when this call loaded target.
-function load_buffer(target)
-  local loaded = not vim.api.nvim_buf_is_loaded(target)
-  if loaded then
-    vim.fn.bufload(target)
-  end
-  remember(target, loaded, nil)
-  return loaded
-end
-
--- True when client was not attached to target, which must be loaded.
-local function attach_client(target, client)
-  local attached = not client.attached_buffers[target]
-  if attached then
-    vim.lsp.buf_attach_client(target, client.id)
-  end
-  remember(target, false, attached and client.id or nil)
-  return attached
-end
-
--- Attaches `client` to uri's file, loading it if needed. Called right
--- before a request about the file: clangd answers position requests only
--- about documents it has open.
----@param uri string
----@param client vim.lsp.Client
----@return integer target the file's bufnr
-function M.ensure_attached(uri, client)
-  local target = vim.uri_to_bufnr(uri)
-  load_buffer(target)
-  attach_client(target, client)
-  return target
-end
-
--- Where requests about loc go: to the server that found it, else to the
--- first one on the source buffer that supports `method`. nil when the server
--- that found it does not: another server's ranges, encoding and index need
--- not agree with the loc.
----@param loc inline_explorer.Loc
----@param source_bufnr integer? nil or invalid counts as the current buffer
----@param method string
----@return vim.lsp.Client?
-function M.client_for(loc, source_bufnr, method)
-  local clients = vim.lsp.get_clients({ bufnr = source_buf(source_bufnr), method = method })
-  if not loc.client_id then
-    return clients[1]
-  end
-  for _, c in ipairs(clients) do
-    if c.id == loc.client_id then
-      return c
-    end
-  end
-  return nil
-end
-
 local function extract_local(loc, target)
   local tlang = buffer_lang(target)
   if tlang ~= "c" and tlang ~= "cpp" then
@@ -660,7 +546,7 @@ end
 --      fills the cache).
 ---@param loc inline_explorer.Loc
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
----@param cb fun(lines: string[], label: string)
+---@param cb fun(lines: string[], label: string, note: string?) `note` says the server did not answer in time
 function M.extract(loc, source_bufnr, cb)
   local span = profile.start()
   local src = source_buf(source_bufnr)
@@ -686,7 +572,7 @@ function M.extract(loc, source_bufnr, cb)
   end
 
   local load_span = profile.start()
-  if load_buffer(target) then
+  if lsp.load_buffer(target) then
     load_span("extract:bufload", detail())
   end
 
@@ -715,7 +601,7 @@ function M.extract(loc, source_bufnr, cb)
     end
   end
 
-  local client = M.client_for(loc, src, "textDocument/documentSymbol")
+  local client = lsp.client_for(loc, src, "textDocument/documentSymbol")
   if not client then
     local lines, label = M.extract_sync(loc)
     span("extract:no-capability", detail())
@@ -724,7 +610,7 @@ function M.extract(loc, source_bufnr, cb)
 
   -- 6. Attached only now: a file read locally needs no server.
   local attach_span = profile.start()
-  local cold = attach_client(target, client)
+  local cold = lsp.attach_client(target, client)
   if cold then
     attach_span("extract:attach", detail())
   end
@@ -735,7 +621,7 @@ function M.extract(loc, source_bufnr, cb)
   -- profiling on, it shows how much longer than the budget the server needed.
   local late_span
 
-  local function on_reply(lines, label)
+  local function on_reply(lines, label, note)
     if late_span then
       span("extract:timeout", detail())
     elseif cold then
@@ -748,20 +634,19 @@ function M.extract(loc, source_bufnr, cb)
     if lines and tick and not late_span then
       extract_cache_put(key, lines, label, tick)
     end
-    cb(lines, label)
+    cb(lines, label, note)
   end
 
+  -- The caller decides whether to show `note`: this module only looks up.
   local function on_timeout()
     late_span = profile.start()
-    util.notify(
-      ("%s: no answer within %dms for %s; extracted locally. Looking again will use the server."):format(
-        loc.name or "?",
-        budget,
-        vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")
-      ),
-      vim.log.levels.WARN
+    local lines, label = M.extract_sync(loc)
+    local note = ("%s: no answer within %dms for %s; extracted locally. Looking again will use the server."):format(
+      loc.name or "?",
+      budget,
+      vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":t")
     )
-    return M.extract_sync(loc)
+    return lines, label, note
   end
 
   -- The request is neither cancelled nor sent again on timeout: its reply,
@@ -795,40 +680,17 @@ function M.extract(loc, source_bufnr, cb)
   end
 end
 
--- Where loc.name appears as a whole word in the 4 lines from loc's start
--- line, else loc.range.start. A position request needs the identifier, and
--- loc.range.start may sit on a keyword such as `void`.
----@param target integer bufnr of loc.uri
----@param loc inline_explorer.Loc
----@param out_encoding string encoding of the server the position is sent to
----@return lsp.Position
-function M.name_position(target, loc, out_encoding)
-  local from = loc.range.start.line
-  local lines = vim.api.nvim_buf_get_lines(target, from, from + 4, false)
-  if loc.name then
-    for i, l in ipairs(lines) do
-      local start1 = l:find("%f[%w_]" .. vim.pesc(loc.name) .. "%f[^%w_]")
-      if start1 then
-        return { line = from + i - 1, character = util.lsp_col(l, start1 - 1, out_encoding) }
-      end
-    end
-  end
-  local l = lines[1] or ""
-  local byte = util.byte_col(l, loc.range.start.character, loc.encoding)
-  return { line = from, character = util.lsp_col(l, byte, out_encoding) }
-end
-
 ---@param loc inline_explorer.Loc a declaration
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param cb fun(dloc: inline_explorer.Loc?) nil on no client or answer, an error, a timeout, or loc itself
 function M._chase_definition(loc, source_bufnr, cb)
-  local client = M.client_for(loc, source_bufnr, "textDocument/definition")
+  local client = lsp.client_for(loc, source_bufnr, "textDocument/definition")
   if not client then
     return cb(nil)
   end
-  local target = M.ensure_attached(loc.uri, client)
+  local target = lsp.ensure_attached(loc.uri, client)
   local encoding = client.offset_encoding
-  local pos = M.name_position(target, loc, encoding)
+  local pos = lsp.name_position(target, loc, encoding)
 
   local span = profile.start()
   local function finish(dloc, why)
@@ -875,7 +737,7 @@ end
 ---@param name string
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
 ---@param dloc inline_explorer.Loc
-function M._locate_cache_replace(name, source_bufnr, dloc)
+local function locate_cache_replace(name, source_bufnr, dloc)
   locate_cache_put(locate_key(source_buf(source_bufnr), name), dloc)
 end
 
@@ -886,18 +748,19 @@ end
 -- go-to-definition share this so both reach the same definition.
 ---@param name string
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
----@param cb fun(loc: inline_explorer.Loc?, lines: string[]?, label: string?, err: string?)
+-- `note`: see M.extract.
+---@param cb fun(loc: inline_explorer.Loc?, lines: string[]?, label: string?, err: string?, note: string?)
 function M.locate_definition(name, source_bufnr, cb)
   M.locate(name, source_bufnr, function(loc, err)
     if not loc then
       return cb(nil, nil, nil, err or "not found")
     end
-    M.extract(loc, source_bufnr, function(lines, label)
+    M.extract(loc, source_bufnr, function(lines, label, note)
       if label ~= "declaration" then
-        return cb(loc, lines, label, nil)
+        return cb(loc, lines, label, nil, note)
       end
       local function keep_declaration()
-        return cb(loc, lines, label, nil)
+        return cb(loc, lines, label, nil, note)
       end
       local miss_key = chase_miss_key(loc)
       local miss_at = M._chase_miss[miss_key]
@@ -909,12 +772,12 @@ function M.locate_definition(name, source_bufnr, cb)
           M._chase_miss[miss_key] = vim.uv.now()
           return keep_declaration()
         end
-        M.extract(dloc, source_bufnr, function(def_lines, def_label)
+        M.extract(dloc, source_bufnr, function(def_lines, def_label, def_note)
           if not def_lines or def_label == "declaration" then
             return keep_declaration()
           end
-          M._locate_cache_replace(name, source_bufnr, dloc)
-          cb(dloc, def_lines, def_label, nil)
+          locate_cache_replace(name, source_bufnr, dloc)
+          cb(dloc, def_lines, def_label, nil, def_note)
         end)
       end)
     end)
@@ -924,10 +787,10 @@ end
 -- M.locate_definition without the loc.
 ---@param name string
 ---@param source_bufnr integer? nil or invalid counts as the current buffer
----@param cb fun(lines: string[]?, label: string?, err: string?)
+---@param cb fun(lines: string[]?, label: string?, err: string?, note: string?) note: see M.extract
 function M.fetch(name, source_bufnr, cb)
-  M.locate_definition(name, source_bufnr, function(_, lines, label, err)
-    cb(lines, label, err)
+  M.locate_definition(name, source_bufnr, function(_, lines, label, err, note)
+    cb(lines, label, err, note)
   end)
 end
 
