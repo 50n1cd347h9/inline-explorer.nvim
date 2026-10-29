@@ -68,10 +68,10 @@ local LOCAL_DECLARATIONS = [[
 ]]
 local DECLARATIONS = LOCAL_DECLARATIONS .. "(parameter_declaration declarator: (_) @d)"
 
--- { name, byte } for each identifier that error recovery left in an ERROR
--- node of a declaration under `nodes`. It is the name declared, as `limit`
--- in `u32 __maybe_unused limit = 7;`, or an annotation macro, as FAR in
--- `struct state FAR *s;`; misparsed_names tells them apart.
+-- { name, byte, identifier } for each identifier that error recovery left in
+-- an ERROR node of a declaration under `nodes`. It is the name declared, as
+-- `limit` in `u32 __maybe_unused limit = 7;`, or an annotation macro, as FAR
+-- in `struct state FAR *s;`; misparsed_names tells them apart.
 local function error_held(nodes, src)
   local held = {}
   for _, node in ipairs(nodes) do
@@ -79,7 +79,7 @@ local function error_held(nodes, src)
     for _, id in ipairs(errors) do
       local holder = id:parent():parent()
       if holder and (holder:type() == "declaration" or holder:type():match("declarator$")) then
-        held[#held + 1] = { csrc.text(id, src), csrc.start_byte(id) }
+        held[#held + 1] = { csrc.text(id, src), csrc.start_byte(id), id }
       end
     end
   end
@@ -89,7 +89,7 @@ end
 -- The error_held names under `nodes` that an expression there also uses
 -- outside any ERROR node: an annotation macro is not used as a value,
 -- though tree-sitter-c may read it as a type elsewhere. Each is
--- { name, byte }.
+-- { name, byte, identifier }.
 local function misparsed_names(nodes, src)
   local held = error_held(nodes, src)
   if #held == 0 then
@@ -207,16 +207,23 @@ local function decl_scope(d, def, own_params)
 end
 
 -- name -> the places it is declared in `def`: its scope, and the byte its
--- declarator starts at.
+-- declarator starts at. A name error recovery left in an ERROR node counts
+-- as declared there, as misparsed_names decides.
 local function callee_declarations(def, fn_declarator, src)
   local own_params = fn_declarator:field("parameters")[1]
   local decls = {}
+  local function add(nm, node, from)
+    decls[nm] = decls[nm] or {}
+    table.insert(decls[nm], { scope = decl_scope(node, def, own_params), from = from })
+  end
   for _, d in ipairs(csrc.query_nodes(def, src, DECLARATIONS)) do
     local nm = csrc.decl_name(d, src)
     if nm then
-      decls[nm] = decls[nm] or {}
-      table.insert(decls[nm], { scope = decl_scope(d, def, own_params), from = csrc.start_byte(d) })
+      add(nm, d, csrc.start_byte(d))
     end
+  end
+  for _, h in ipairs(misparsed_names({ def }, src)) do
+    add(h[1], h[3], h[2])
   end
   return decls
 end
@@ -233,9 +240,9 @@ end
 
 -- The names `def` uses without declaring them first in a scope around the
 -- use, in document order: globals, functions, macros and typedefs from
--- elsewhere. The function's own name is left out.
-local function free_names(def, fn_declarator, src)
-  local decls = callee_declarations(def, fn_declarator, src)
+-- elsewhere. The function's own name is left out. `decls` is
+-- callee_declarations'.
+local function free_names(def, fn_declarator, src, decls)
   local own_name = csrc.decl_identifier(fn_declarator:field("declarator")[1])
   local free, seen = {}, {}
   for _, id in ipairs(ordinary_names(def, src)) do
@@ -303,8 +310,9 @@ local function plan_renames(params, stmts, body, callee_src, spelled, N)
 end
 
 -- Edits on callee_src that suffix the body's labels and apply `rename`. None
--- overlaps cprint's edits of `return` keywords and semicolons.
-local function plan_body_edits(body, callee_src, rename, N)
+-- overlaps cprint's edits of `return` keywords and semicolons. `decls` is
+-- callee_declarations'.
+local function plan_body_edits(body, callee_src, rename, N, decls)
   local edits = {}
   -- Labels have function scope, so the callee's could clash with the caller's
   -- own labels or with another expansion's.
@@ -318,14 +326,14 @@ local function plan_body_edits(body, callee_src, rename, N)
     suffix_label(n)
   end
   if next(rename) then
-    -- Every occurrence, `name(...)` and a typedef's uses included: in the
-    -- callee's body the keys mean its own declarations. Not so a use ahead of
-    -- a top-level local's declaration that means an outer name: renamed too,
-    -- it refers to nothing.
+    -- Every occurrence one of the callee's own declarations binds, `name(...)`
+    -- and a typedef's uses included. A use ahead of a top-level local's
+    -- declaration, or past a block-local's block, means an outer name and
+    -- keeps it: renamed, it would refer to nothing. free_names counts it.
     for _, id in ipairs(ordinary_names(body, callee_src)) do
-      local r = rename[csrc.text(id, callee_src)]
-      if r then
-        edits[#edits + 1] = { csrc.start_byte(id), csrc.end_byte(id), r }
+      local nm = csrc.text(id, callee_src)
+      if rename[nm] and is_bound(id, decls[nm]) then
+        edits[#edits + 1] = { csrc.start_byte(id), csrc.end_byte(id), rename[nm] }
       end
     end
   end
@@ -491,8 +499,9 @@ function M.analyze_callee(callee_src, fname, N, caller)
   if has_stray_return(body, callee_src) then
     return nil, M.refuse("stray-return", "a `return` in " .. fname .. " does not parse as a return statement")
   end
+  local decls = callee_declarations(fn_def, fn_declarator, callee_src)
   -- Pasted into the caller, such a use would mean the caller's declaration.
-  for _, nm in ipairs(free_names(fn_def, fn_declarator, callee_src)) do
+  for _, nm in ipairs(free_names(fn_def, fn_declarator, callee_src, decls)) do
     if caller.declared[nm] then
       return nil, M.refuse("capture", ("'%s' in %s would mean the caller's own '%s'"):format(nm, fname, nm))
     end
@@ -508,7 +517,7 @@ function M.analyze_callee(callee_src, fname, N, caller)
   local returns = csrc.query_nodes(body, callee_src, "(return_statement) @r")
 
   local rename = plan_renames(params, stmts, body, callee_src, caller.spelled, N)
-  local body_edits = plan_body_edits(body, callee_src, rename, N)
+  local body_edits = plan_body_edits(body, callee_src, rename, N, decls)
 
   local last = stmts[#stmts]
   return {
