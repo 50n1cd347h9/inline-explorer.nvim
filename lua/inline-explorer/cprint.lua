@@ -68,7 +68,12 @@ local function print_wrapped(caller_src, ctx, hoist, replacement)
   for _, l in ipairs(hoist) do
     out[#out + 1] = inner .. l
   end
-  for _, l in ipairs(vim.split(modified, "\n", { plain = true })) do
+  -- target's first line starts at its first character; the lines after it
+  -- carry target's own indent, which inner replaces.
+  for i, l in ipairs(vim.split(modified, "\n", { plain = true })) do
+    if i > 1 and l:sub(1, #ctx.indent) == ctx.indent then
+      l = l:sub(#ctx.indent + 1)
+    end
     out[#out + 1] = inner .. l
   end
   out[#out + 1] = ctx.indent .. "}"

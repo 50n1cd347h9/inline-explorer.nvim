@@ -178,6 +178,23 @@ function M.src_line(st, row)
   return nil
 end
 
+-- The view row of source row `src_row`: where its line is now, else, when
+-- that line has been rewritten, where the next source line still there is.
+---@param st inline_explorer.ViewState
+---@param src_row integer 0-based
+---@return integer row 0-based
+function M.view_row(st, src_row)
+  local last = vim.api.nvim_buf_line_count(st.bufnr) - 1
+  local src_count = vim.api.nvim_buf_line_count(st.source_bufnr)
+  for id = src_row + 1, src_count do
+    local row, _, details = unpack(vim.api.nvim_buf_get_extmark_by_id(st.bufnr, M.origin_ns, id, { details = true }))
+    if row and not details.invalid then
+      return math.min(row, last)
+    end
+  end
+  return math.min(src_row, last)
+end
+
 -- Expansion blocks. In functions that take (st, bufnr), bufnr is st.bufnr.
 
 local function mark_row(bufnr, id)

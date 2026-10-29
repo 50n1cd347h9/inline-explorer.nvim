@@ -151,29 +151,23 @@ do
   trail.clear()
 end
 
--- A jump to a definition in the same file stays in the same view. back()
--- took the entry the jump pushed for the view on screen, since its buffer
--- is the one shown, and found nothing before it (seen with gd to
--- qrfIsVt100 in SQLite's shell.c).
+-- A location names a source row. In a reused view, expansions above it move
+-- its line down, and the cursor goes where the line is, not to the row the
+-- location names.
 do
   trail.clear()
-  local spath = dir .. "/same.c"
-  H.writef(spath, "static int helper(void)\n{\n    return 1;\n}\n\nint main(void)\n{\n    return helper();\n}\n")
-  vim.cmd.edit(spath)
+  local rpath = dir .. "/reused.c"
+  H.writef(rpath, "int a;\nint b;\nint target(void)\n{\n    return 0;\n}\n")
+  vim.cmd.edit(rpath)
   local v = view.open()
-  vim.api.nvim_win_set_cursor(0, { 8, 11 })
+  view.set_lines(v, 1, 1, { "/* one */", "/* two */", "/* three */" })
   trail.goto_location({
-    uri = vim.uri_from_fname(spath),
-    range = { start = { line = 0, character = 11 }, ["end"] = { line = 0, character = 17 } },
+    uri = vim.uri_from_fname(rpath),
+    range = { start = { line = 2, character = 4 }, ["end"] = { line = 2, character = 10 } },
   })
-  check("same file: the jump stays in the view", vim.api.nvim_get_current_buf() == v)
-  check("same file: the cursor is on the definition", vim.api.nvim_win_get_cursor(0)[1] == 1)
-  check("same file: back returns to the call", trail.back() == true and vim.api.nvim_win_get_cursor(0)[1] == 8)
-  check(
-    "same file: forward returns to the definition",
-    trail.forward() == true and vim.api.nvim_win_get_cursor(0)[1] == 1
-  )
-  check("same file: back again returns to the call", trail.back() == true and vim.api.nvim_win_get_cursor(0)[1] == 8)
+  local c = vim.api.nvim_win_get_cursor(0)
+  check("reused view: the cursor is on the target's line", c[1] == 6 and c[2] == 4, c)
+  check("reused view: that line is the target's", vim.api.nvim_get_current_line() == "int target(void)")
   trail.clear()
 end
 
