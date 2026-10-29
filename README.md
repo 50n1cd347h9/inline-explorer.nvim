@@ -67,6 +67,7 @@ Then run `:checkhealth inline-explorer` in a file you want to read.
 | `]e` / `[e`       | `:InlineExplorerNext` / `Prev` | Next / previous expansion |
 | `<leader>el`      | `:InlineExplorerList`          | List expansions in the location list |
 | `gd`              |                                | Open the definition in its own view |
+| `K`               |                                | Show the language server's hover, as in a file |
 | `<leader>eu`      | `:InlineExplorerCallers`       | Pick a caller and go there |
 |                   | `:InlineExplorerTrail`         | List the visited views |
 | `<leader>eq`      | `:InlineExplorerClose`         | Close the reading view |
@@ -99,6 +100,7 @@ require("inline-explorer").setup({
     prev_block = "[e",
     list_blocks = "<leader>el",
     callers = "<leader>eu",
+    hover = "K",
     goto_def = "gd",
     trail_back = "<C-o>",
     trail_forward = "<C-i>",

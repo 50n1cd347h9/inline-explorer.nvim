@@ -24,6 +24,8 @@ M.defaults = {
     prev_block = "[e", -- jump to the previous expansion block
     list_blocks = "<leader>el", -- list the expansion blocks in the location list
     callers = "<leader>eu", -- pick a caller of the function under the cursor and go there
+    -- The language server's hover for the name under the cursor, as K is in a file.
+    hover = "K",
     -- Go to the definition, in a reading view of its file; the view you leave
     -- goes on the navigation trail.
     goto_def = "gd",
