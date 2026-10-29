@@ -24,6 +24,7 @@ local M = {}
 ---@type inline_explorer.TrailEntry[]
 M._stack = {}
 M._pos = 0
+M._shown = false
 -- The views the trail made bufhidden=hide, as a set: the ones it must wipe
 -- itself. Any other view is wiped by Neovim once hidden (bufhidden=wipe).
 ---@type table<integer, true>
@@ -56,7 +57,7 @@ function M.clear()
     wipe_unless_shown(v)
   end
   local cur = vim.api.nvim_get_current_buf()
-  M._stack, M._pos, M._kept = {}, 0, {}
+  M._stack, M._pos, M._shown, M._kept = {}, 0, false, {}
   -- The stack no longer protects the view on screen: let it be wiped once the
   -- window leaves it.
   if view.is_view(cur) then
