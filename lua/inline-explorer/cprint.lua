@@ -1,8 +1,137 @@
--- Printers: layout only, for the three forms canalyze.decide picks from.
+-- Printers: the text of the three forms canalyze.decide picks from. The
+-- analysis has made every judgement, the names included; a printer writes
+-- the C for them: the declarations that bind the arguments and hold the
+-- result, each `return` rewritten for its form, and the layout.
 local csrc = require("inline-explorer.csrc")
 local simplify = require("inline-explorer.simplify")
 
 local M = {}
+
+-- Declarations: the result variable, of the callee's return type, and one
+-- line per parameter that binds its argument.
+
+-- The pointer_declarator that makes `func_decl`'s result a pointer, as the
+-- `*const` of `char *const f(void)`, if any.
+local function result_pointer(func_decl)
+  local p = func_decl:parent()
+  while p and p:type() == "parenthesized_declarator" do
+    p = p:parent()
+  end
+  if p and p:type() == "pointer_declarator" then
+    return p
+  end
+  return nil
+end
+
+-- The declaration of a variable `name` of `def`'s return type: `def`'s
+-- declarator with `name` in place of the function's own, as `char (*name)`
+-- for `char (*f(void))` or `int (*name)(int)` for `int (*f(int k))(int)`.
+-- Extras in it, as zlib's ZEXPORT in `char * ZEXPORT f(void)`, are left out,
+-- and so is a qualifier on the pointer returned: the variable is assigned.
+---@param def TSNode a function_definition that csrc.func_declarator finds a function in
+---@param src string
+---@param name string
+---@param base_type string the return type without the declarator's `*`s (see canalyze's ir.ret_type)
+---@return string
+local function result_decl(def, src, name, base_type)
+  local decl = def:field("declarator")[1]
+  local func_decl = csrc.func_declarator(decl)
+  ---@cast func_decl -nil
+  local edits = { { csrc.start_byte(func_decl), csrc.end_byte(func_decl), name } }
+  local top_pointer = result_pointer(func_decl)
+  local d = decl
+  while d and d ~= func_decl do
+    for child in d:iter_children() do
+      if child:extra() or (d == top_pointer and child:type() == "type_qualifier") then
+        local stop = csrc.end_byte(child)
+        edits[#edits + 1] = { csrc.start_byte(child), stop + #src:match("^%s*", stop + 1), "" }
+      end
+    end
+    d = csrc.inner_declarator(d)
+  end
+  local declarator = csrc.apply_edits(src, csrc.start_byte(decl), csrc.end_byte(decl), edits):gsub("%s+", " ")
+  return base_type .. " " .. declarator
+end
+
+-- The edit that turns parameter name `ident` into `name` and adjusts its
+-- type as C adjusts a parameter's: an array declarator next to the name
+-- becomes a pointer, keeping the qualifiers in its brackets (`m[][4]` ->
+-- `(*m)[4]`, `a[const 4]` -> `*const a`), and a function declarator next to
+-- it a function pointer (`f(int)` -> `(*f)(int)`).
+local function decay_edit(ident, name, src)
+  local adj = ident:parent()
+  if adj and adj:type() == "array_declarator" and adj:field("declarator")[1] == ident then
+    local ptr = { "*" }
+    for _, child in ipairs(csrc.code_children(adj)) do
+      if child:type() == "type_qualifier" then
+        ptr[#ptr + 1] = csrc.text(child, src) .. " "
+      end
+    end
+    ptr[#ptr + 1] = name
+    local outer = adj:parent()
+    local postfix = outer and (outer:type() == "array_declarator" or outer:type() == "function_declarator")
+    local text = table.concat(ptr)
+    return { csrc.start_byte(adj), csrc.end_byte(adj), postfix and "(" .. text .. ")" or text }
+  end
+  if adj and adj:type() == "function_declarator" and adj:field("declarator")[1] == ident then
+    return { csrc.start_byte(ident), csrc.end_byte(ident), "(*" .. name .. ")" }
+  end
+  return { csrc.start_byte(ident), csrc.end_byte(ident), name }
+end
+
+-- The line `<param type> <name> = (<arg>);` that binds one argument: the
+-- parameter's own declaration, adjusted by decay_edit, so a NULL or 0
+-- argument keeps a pointer type and `const char *const argv[]` its inner
+-- const. A parameter without an identifier gets an __auto_type line.
+---@param param inline_explorer.Param
+---@param arg string the argument's text at the call site
+---@param name string the name to declare it as (see canalyze's bind_names)
+---@param rename table<string, string> parameter name -> its new name, for the other parameters its type names
+---@param src string the callee's source
+---@return string
+local function build_bind(param, arg, name, rename, src)
+  local decl = param.node:field("declarator")[1]
+  local ident = decl and csrc.decl_identifier(decl)
+  if not ident or ident:type() ~= "identifier" then
+    return string.format("__auto_type %s = (%s);", name, arg)
+  end
+  local edit = decay_edit(ident, name, src)
+  local edits = { edit }
+  -- Another parameter's name in the type, as the n of `int m[][n]`.
+  for _, id in ipairs(csrc.query_nodes(param.node, src, "(identifier) @i")) do
+    local r = rename[csrc.text(id, src)]
+    if r and (csrc.end_byte(id) <= edit[1] or csrc.start_byte(id) >= edit[2]) then
+      edits[#edits + 1] = { csrc.start_byte(id), csrc.end_byte(id), r }
+    end
+  end
+  local text = csrc.apply_edits(src, csrc.start_byte(param.node), csrc.end_byte(param.node), edits)
+  return string.format("%s = (%s);", text, arg)
+end
+
+-- The lines that bind ir's arguments to its parameters.
+---@param ir inline_explorer.IR with args
+---@return string[]
+local function binds(ir)
+  local out = {}
+  for i, p in ipairs(ir.params) do
+    out[i] = build_bind(p, ir.args[i], ir.bind_names[i], ir.param_rename, ir.src)
+  end
+  return out
+end
+
+-- The declaration of ir.ret_var, without its `;`.
+---@param ir inline_explorer.IR
+---@return string
+function M.ret_decl(ir)
+  return result_decl(ir.fn_def, ir.src, ir.ret_var, ir.ret_type)
+end
+
+-- One level of indentation, in the style of `indent`.
+---@param indent string
+---@return string
+function M.indent_unit(indent)
+  return indent:find("\t") and "\t" or "    "
+end
 
 local function splice(caller_src, edits)
   return csrc.apply_edits(caller_src, 0, #caller_src, edits)
@@ -56,14 +185,14 @@ local function body_text(ir, last_i, extra)
   return csrc.apply_edits(ir.src, from, stop, edits)
 end
 
--- print_hoisted where lines cannot go above target: a new block replaces
--- target and holds the `hoist` lines, then target.
+-- print_hoisted with placement "wrap": a new block replaces target and holds
+-- the `hoist` lines, then target.
 local function print_wrapped(caller_src, ctx, hoist, replacement)
   local target_start = csrc.start_byte(ctx.target)
   local target_end = csrc.end_byte(ctx.target)
   local call_edit = { csrc.start_byte(ctx.call), csrc.end_byte(ctx.call), replacement }
   local modified = csrc.apply_edits(caller_src, target_start, target_end, { call_edit })
-  local inner = ctx.indent .. ctx.indent_unit
+  local inner = ctx.indent .. M.indent_unit(ctx.indent)
   local out = { "{" }
   for _, l in ipairs(hoist) do
     out[#out + 1] = inner .. l
@@ -80,8 +209,10 @@ local function print_wrapped(caller_src, ctx, hoist, replacement)
   return splice(caller_src, { { target_start, target_end, table.concat(out, "\n") } })
 end
 
-local function print_hoisted(caller_src, ctx, hoist, replacement)
-  if not ctx.can_insert_above then
+-- The `hoist` lines where canalyze.decide's `placement` puts them, and
+-- `replacement` for the call.
+local function print_hoisted(caller_src, ctx, placement, hoist, replacement)
+  if placement == "wrap" then
     return print_wrapped(caller_src, ctx, hoist, replacement)
   end
   local block = {}
@@ -98,35 +229,36 @@ end
 -- target, and E of the final `return E;`, parenthesised to keep its
 -- precedence, replaces the call. Only for a simple callee (see decide).
 ---@param caller_src string
----@param ir inline_explorer.IR with binds
+---@param ir inline_explorer.IR with args
 ---@param ctx inline_explorer.Ctx
+---@param placement "above"|"wrap"
 ---@return string new_src
-local function print_pretty(caller_src, ir, ctx)
+local function print_pretty(caller_src, ir, ctx, placement)
   local hoist = {}
-  vim.list_extend(hoist, ir.binds)
+  vim.list_extend(hoist, binds(ir))
   if #ir.stmts >= 2 then
     vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts - 1), ""))
   end
   local expr = csrc.code_children(ir.stmts[#ir.stmts])[1]
   local expr_text = csrc.apply_edits(ir.src, csrc.start_byte(expr), csrc.end_byte(expr), ir.body_edits)
   local replacement = simplify.parens("(" .. expr_text .. ")")
-  return print_hoisted(caller_src, ctx, hoist, replacement)
+  return print_hoisted(caller_src, ctx, placement, hoist, replacement)
 end
 
 -- Canonical: a GNU statement expression replaces the call, every return
--- becoming a goto to its end.
+-- becoming a goto to its end. It hoists nothing, so it has no placement.
 ---@param caller_src string
----@param ir inline_explorer.IR with binds
+---@param ir inline_explorer.IR with args
 ---@param ctx inline_explorer.Ctx
 ---@return string new_src
 local function print_canonical(caller_src, ir, ctx)
-  local inner = ctx.indent .. ctx.indent_unit
+  local inner = ctx.indent .. M.indent_unit(ctx.indent)
   local parts = { "({" }
-  for _, b in ipairs(ir.binds) do
+  for _, b in ipairs(binds(ir)) do
     parts[#parts + 1] = inner .. b
   end
   if ir.has_value then
-    parts[#parts + 1] = inner .. ir.ret_decl .. ";"
+    parts[#parts + 1] = inner .. M.ret_decl(ir) .. ";"
   end
   vim.list_extend(parts, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "goto")), inner))
   parts[#parts + 1] = inner .. ir.end_label .. ":;"
@@ -141,17 +273,18 @@ end
 -- and __ie_retN replaces the call. An early return no longer stops the rest
 -- of the body, so this is unfaithful to a callee that has one.
 ---@param caller_src string
----@param ir inline_explorer.IR with binds
+---@param ir inline_explorer.IR with args
 ---@param ctx inline_explorer.Ctx
+---@param placement "above"|"wrap"
 ---@return string new_src
-local function print_readable_multi(caller_src, ir, ctx)
+local function print_readable_multi(caller_src, ir, ctx, placement)
   local hoist = {}
-  vim.list_extend(hoist, ir.binds)
+  vim.list_extend(hoist, binds(ir))
   if ir.has_value then
-    hoist[#hoist + 1] = ir.ret_decl .. ";"
+    hoist[#hoist + 1] = M.ret_decl(ir) .. ";"
   end
   vim.list_extend(hoist, csrc.reindent(body_text(ir, #ir.stmts, return_edits(ir, "assign")), ""))
-  return print_hoisted(caller_src, ctx, hoist, ir.ret_var)
+  return print_hoisted(caller_src, ctx, placement, hoist, ir.ret_var)
 end
 
 M.PRINTERS = {

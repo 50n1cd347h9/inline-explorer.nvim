@@ -279,8 +279,10 @@ Span names read as `stage:variant`, and the end-to-end numbers all start with
 `total:`, so they group together in the report. `extract:cold` means the plugin
 made the server open a definition file it did not have open yet — the case that
 costs a preamble build; `extract:warm` is one that was already open.
-`substitute:rejected-variadic` and friends say why an in-place inline was
-declined instead of just that it was.
+`substitute:rejected-<code>` says why an in-place inline was declined
+instead of just that it was: the code of the engine's refusal (`variadic`,
+`arity`, `not-found`, `capture`, ...), or `other` for an error raised inside
+the engine.
 
 `:InlineExplorerProfile` aggregates the same data in memory:
 

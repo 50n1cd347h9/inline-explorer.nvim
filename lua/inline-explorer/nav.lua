@@ -9,14 +9,11 @@ local function notify(msg)
   util.notify(msg, vim.log.levels.INFO)
 end
 
--- view.block_ranges, sorted by first row. Rows are 0-based and inclusive.
+-- view.block_ranges, sorted by first row.
 local function sorted_blocks(st, bufnr)
-  local blocks = {}
-  for _, range in ipairs(view.block_ranges(st, bufnr)) do
-    blocks[#blocks + 1] = { name = range.name, first_row = range.s, last_row = range.e }
-  end
+  local blocks = view.block_ranges(st, bufnr)
   table.sort(blocks, function(a, b)
-    return a.first_row < b.first_row
+    return a.s < b.s
   end)
   return blocks
 end
@@ -36,8 +33,8 @@ function M.next()
     return
   end
   for _, block in ipairs(sorted_blocks(st, bufnr)) do
-    if block.first_row > cursor_row then
-      vim.api.nvim_win_set_cursor(0, { block.first_row + 1, 0 })
+    if block.s > cursor_row then
+      vim.api.nvim_win_set_cursor(0, { block.s + 1, 0 })
       return
     end
   end
@@ -52,8 +49,8 @@ function M.prev()
   end
   local blocks = sorted_blocks(st, bufnr)
   for i = #blocks, 1, -1 do
-    if blocks[i].first_row < cursor_row then
-      vim.api.nvim_win_set_cursor(0, { blocks[i].first_row + 1, 0 })
+    if blocks[i].s < cursor_row then
+      vim.api.nvim_win_set_cursor(0, { blocks[i].s + 1, 0 })
       return
     end
   end
@@ -70,8 +67,8 @@ function M.list()
   for _, block in ipairs(sorted_blocks(st, bufnr)) do
     items[#items + 1] = {
       bufnr = bufnr,
-      lnum = block.first_row + 1,
-      text = string.format("%s (%d lines)", block.name, block.last_row - block.first_row + 1),
+      lnum = block.s + 1,
+      text = string.format("%s (%d lines)", block.name, block.e - block.s + 1),
     }
   end
   if #items == 0 then
@@ -91,10 +88,8 @@ function M.breadcrumb()
     return ""
   end
   local names = {}
-  for _, block in ipairs(sorted_blocks(st, bufnr)) do
-    if cursor_row >= block.first_row and cursor_row <= block.last_row then
-      names[#names + 1] = block.name
-    end
+  for _, block in ipairs(view.blocks_at(st, bufnr, cursor_row)) do
+    names[#names + 1] = block.name
   end
   return table.concat(names, " > ")
 end

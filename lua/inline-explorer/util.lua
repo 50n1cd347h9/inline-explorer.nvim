@@ -1,3 +1,6 @@
+-- Small helpers the modules share: a notification with the plugin's prefix,
+-- column conversion between bytes and LSP offset encodings, and eviction
+-- from the LRU caches.
 local M = {}
 
 ---@param msg string

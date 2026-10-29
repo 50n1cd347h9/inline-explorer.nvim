@@ -1,9 +1,13 @@
--- Smart inline, the primary expansion action. In a C buffer a function call
--- is substituted in place and a macro use replaced by clangd's expansion of
--- it. Anything else, or a failure, block-pastes the definition
--- (expander.expand), as in any other language.
+-- Smart inline (<leader>ei), the primary expansion action. In a C buffer, a
+-- call of a function whose definition is found is substituted in place.
+-- Any other name with a definition is offered to clangd as a macro use and
+-- replaced by its expansion: clangd expands only macros, so for anything
+-- else that step finds nothing. A name found only as a declaration, and
+-- every failure, block-pastes the definition (expander.expand), as in any
+-- other language.
 local resolver = require("inline-explorer.resolver")
 local substitute = require("inline-explorer.substitute")
+local csrc = require("inline-explorer.csrc")
 local macro = require("inline-explorer.macro")
 local expander = require("inline-explorer.expander")
 local view = require("inline-explorer.view")
@@ -13,10 +17,10 @@ local util = require("inline-explorer.util")
 
 local M = {}
 
-local function has_c_parser()
-  local ok = pcall(vim.treesitter.get_string_parser, "int __ie;", "c")
-  return ok
-end
+-- Calls inlined so far in each view, by its state: an inline numbers the
+-- names it injects with it. Weak keys: a closed view's count goes with it.
+---@type table<inline_explorer.ViewState, integer>
+local inlined = setmetatable({}, { __mode = "k" })
 
 -- The view buffer's tree, which the highlighter keeps parsed incrementally,
 -- so a keypress does not parse the whole file. nil on failure; substitute and
@@ -31,16 +35,11 @@ local function buffer_root(bufnr)
   return root
 end
 
--- The profile span name for a failed substitution. The keys are words of the
--- reasons that canalyze and substitute return.
+-- The profile span name for a failed substitution: the refusal's code, or
+-- "other" for an error raised inside the engine.
 local function rejection_label(reason)
-  local message = tostring(reason)
-  for _, key in ipairs({ "variadic", "arity", "not found", "empty" }) do
-    if message:find(key, 1, true) then
-      return "substitute:rejected-" .. (key:gsub(" ", "-"))
-    end
-  end
-  return "substitute:rejected-other"
+  local code = type(reason) == "table" and reason.code or "other"
+  return "substitute:rejected-" .. code
 end
 
 -- One smart-inline keypress, as M.smart sets it up.
@@ -66,11 +65,11 @@ end
 
 local function inline_function(action, prefetched)
   local st = action.st
-  local expansion_id = (st.subst_n or 0) + 1
+  local expansion_id = (inlined[st] or 0) + 1
   local finish_substitute = profile.start()
   local callee_src = table.concat(prefetched.body, "\n")
   local ok, result, reason = pcall(
-    substitute.inline_in_buffer,
+    substitute.inline_at,
     action.view_text,
     action.row,
     action.col,
@@ -95,7 +94,7 @@ local function inline_function(action, prefetched)
   end
   vim.schedule(function()
     view.end_fetch(st)
-    st.subst_n = expansion_id
+    inlined[st] = expansion_id
     view.rewrite(st, action.bufnr, new_text, action.row)
     action.finish_total("total:inline-function", action.ident)
   end)
@@ -105,13 +104,14 @@ local function expand_macro(action, prefetched)
   local st = action.st
   -- clangd knows only the source file.
   local src_row = view.src_line(st, action.row)
-  macro.fetch_expansion(st, src_row, action.col, function(expansion)
+  macro.fetch_expansion(st.source_bufnr, src_row, action.col, function(expansion)
     if not expansion or #expansion == 0 then
       block_fallback(action, prefetched)
       return
     end
     vim.schedule(function()
-      local ok, new_text = pcall(macro.replace_in_src, action.view_text, action.row, action.col, expansion, action.root)
+      local ok, new_text =
+        pcall(substitute.replace_macro_use, action.view_text, action.row, action.col, expansion, action.root)
       if ok and new_text then
         view.end_fetch(st)
         view.rewrite(st, action.bufnr, new_text, action.row)
@@ -133,7 +133,7 @@ function M.smart()
     util.notify("open a reading view first (:InlineExplorerOpen)", vim.log.levels.INFO)
     return
   end
-  if vim.bo.filetype ~= "c" or not has_c_parser() then
+  if vim.bo.filetype ~= "c" or not csrc.has_parser() then
     expander.expand()
     return
   end
@@ -154,7 +154,10 @@ function M.smart()
     return
   end
 
-  if not view.begin_fetch(st) then
+  -- An inline that goes on to macro.fetch_expansion adds up to 2000ms each
+  -- for the tweak and the hover. That fits the fetch's budget: only a
+  -- declaration is chased, and no expansion is asked for one.
+  if not view.begin_fetch(st, resolver.fetch_budget_ms()) then
     util.notify("a lookup is already in flight", vim.log.levels.INFO)
     return
   end
@@ -173,7 +176,12 @@ function M.smart()
     finish_total = profile.start(),
   }
 
-  resolver.fetch(ident, st.source_bufnr, function(lines, label)
+  resolver.fetch(ident, st.source_bufnr, function(lines, label, _, note)
+    if note then
+      vim.schedule(function()
+        util.notify(note, vim.log.levels.WARN)
+      end)
+    end
     if not lines then
       block_fallback(action) -- expand looks up <cword> itself, and reports a failure
       return

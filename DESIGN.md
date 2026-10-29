@@ -38,18 +38,29 @@ heuristic.
 ## Components
 
 - **View** (`view.lua`) — open/close the copy buffer, track per-view expansion
-  blocks (extmarks).
+  blocks (extmarks), map source rows to view rows, undo and redo. It requires
+  nothing above it: it fires `User InlineExplorerViewOpen` when a view opens.
+- **LSP plumbing** (`lsp.lua`) — load a file and attach a client to it for a
+  request, and put it back as it was once unused; pick the server for a
+  location and the position to send. A view pins its source buffer here.
 - **Resolver** (`resolver.lua`) — `name -> definition location` via the attached
   server's `workspace/symbol` (any language), then `location -> body lines`:
   tree-sitter first for C/C++, the server's `textDocument/documentSymbol` range
-  first for other languages, a brace heuristic last.
+  first for other languages, a brace heuristic last. It only looks up: what to
+  tell the user is its callers' call.
 - **Expander** (`expander.lua`) — splice the body below the call's statement, indent,
   wrap in a fold, guard against self-recursion.
-- **Config / init** — options, user commands, keymaps.
+- **Navigation** (`nav.lua`, `pick.lua`, `trail.lua`, `select.lua`) — move
+  between blocks, jump to a definition or a caller, the trail of views those
+  jumps leave, and the picker.
+- **Config / init / keymaps** — options, user commands, the global keymaps and
+  those a view gets when it opens.
 
 ## Inline substitution (C-only)
 
-A second, stronger mode (`substitute.lua` + `inliner.lua`): instead of pasting the
+A second, stronger mode (`substitute.lua` + `inliner.lua`; the engine is
+`canalyze.lua`, which makes every judgement, `cprint.lua`, which writes the C,
+and `csrc.lua`, the tree-sitter helpers): instead of pasting the
 definition below the call, rewrite the call into the effect of the body — true
 compiler-style inlining — so the surrounding statement reads on its own.
 
@@ -131,7 +142,9 @@ form. Counterexamples shrink greedily and reproduce from a printed seed.
 
 Macros have no type and no guaranteed statement/expression structure, so the
 substitution engine cannot handle them — a faithful expansion means running the
-preprocessor. `macro.lua` therefore delegates to the live clangd, preferring its
+preprocessor. `macro.lua` therefore delegates to the live clangd (reading its
+replies with `macro_reply.lua`; `substitute.replace_macro_use` splices the
+result), preferring its
 `ExpandMacro` tweak: the tweak is discovered via `textDocument/codeAction`,
 executed via `workspace/executeCommand`, and the `workspace/applyEdit` it sends
 back is intercepted — kept out of the real file (a reply straggling past the

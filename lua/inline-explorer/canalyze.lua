@@ -4,6 +4,44 @@ local csrc = require("inline-explorer.csrc")
 
 local M = {}
 
+-- Why a call cannot be inlined: a stable `code`, for callers that sort
+-- refusals, and the message, which tostring() and `..` give.
+---@class inline_explorer.Refusal
+---@field code string
+---@field message string
+local Refusal = {}
+Refusal.__tostring = function(r)
+  return r.message
+end
+Refusal.__concat = function(a, b)
+  return tostring(a) .. tostring(b)
+end
+
+---@param code string
+---@param message string
+---@return inline_explorer.Refusal
+function M.refuse(code, message)
+  return setmetatable({ code = code, message = message }, Refusal)
+end
+
+-- The names an expansion injects or renames to. N, an id unique to each
+-- expansion, keeps them apart.
+local INJECTED = {
+  renamed = function(name, N)
+    return name .. "__ie" .. N
+  end,
+  ret_var = function(N)
+    return "__ie_ret" .. N
+  end,
+  end_label = function(N)
+    return "__ie_end" .. N
+  end,
+  -- A parameter without a name, by its position.
+  arg = function(idx, N)
+    return "__ie_arg" .. idx .. "_" .. N
+  end,
+}
+
 local NAMES = "[(identifier) (type_identifier)] @i"
 
 -- Struct, union and enum tags are a namespace of their own.
@@ -249,7 +287,7 @@ local function plan_renames(params, stmts, body, callee_src, spelled, N)
   local rename = {}
   local function maybe_rename(nm)
     if nm and spelled[nm] then
-      rename[nm] = nm .. "__ie" .. N
+      rename[nm] = INJECTED.renamed(nm, N)
     end
   end
   for _, p in ipairs(params) do
@@ -279,7 +317,7 @@ local function plan_body_edits(body, callee_src, rename, N, decls)
   -- Labels have function scope, so the callee's could clash with the caller's
   -- own labels or with another expansion's.
   local function suffix_label(n)
-    edits[#edits + 1] = { csrc.start_byte(n), csrc.end_byte(n), csrc.text(n, callee_src) .. "__ie" .. N }
+    edits[#edits + 1] = { csrc.start_byte(n), csrc.end_byte(n), INJECTED.renamed(csrc.text(n, callee_src), N) }
   end
   for _, n in ipairs(csrc.query_nodes(body, callee_src, "(labeled_statement label: (statement_identifier) @l)")) do
     suffix_label(n)
@@ -300,6 +338,110 @@ local function plan_body_edits(body, callee_src, rename, N, decls)
     end
   end
   return edits
+end
+
+local TYPE_KEYWORDS = {
+  void = true,
+  char = true,
+  short = true,
+  int = true,
+  long = true,
+  float = true,
+  double = true,
+  signed = true,
+  unsigned = true,
+  ["_Bool"] = true,
+  struct = true,
+  union = true,
+  enum = true,
+  const = true,
+  volatile = true,
+}
+
+local TAG_KEYWORDS = { struct = true, union = true, enum = true }
+
+local function tokenize(text)
+  local tokens = {}
+  for tok in text:gmatch("%S+") do
+    tokens[#tokens + 1] = tok
+  end
+  return tokens
+end
+
+local function contains_type_keyword(text)
+  for tok in text:gmatch("%S+") do
+    if TYPE_KEYWORDS[tok] then
+      return true
+    end
+  end
+  return false
+end
+
+-- The base type in a run of tokens: from the first type keyword (else the
+-- first token) through the keywords and struct/union/enum tag after it. In
+-- `local unsigned long ZEXPORT`, that is "unsigned long".
+local function base_type_from_run(text)
+  local tokens = tokenize(text)
+  if #tokens == 0 then
+    return "int" -- C's implicit int
+  end
+  local first = 1
+  for i, tok in ipairs(tokens) do
+    if TYPE_KEYWORDS[tok] then
+      first = i
+      break
+    end
+  end
+  local last = first
+  while last < #tokens and (TYPE_KEYWORDS[tokens[last + 1]] or TAG_KEYWORDS[tokens[last]]) do
+    last = last + 1
+  end
+  return table.concat(tokens, " ", first, last)
+end
+
+-- Identifiers that a project #defines to a storage class, such as zlib's
+-- `#define local static`. See return_base_type.
+local KNOWN_LEADING_MACROS = { ["local"] = true }
+
+-- Calling-convention and export macros, which are not types.
+local KNOWN_DECORATOR_MACROS = { ZEXPORT = true, WINAPI = true }
+
+local function is_single_known_decorator(text)
+  local tokens = tokenize(text)
+  return #tokens == 1 and KNOWN_DECORATOR_MACROS[tokens[1]] == true
+end
+
+-- The base of `def`'s return type, without the declarator's `*`s. The type
+-- field is right as it is (even for `CJSON_PUBLIC(cJSON *) f()`), except
+-- around zlib's macros. A sized_type_specifier absorbs one on either side, as
+-- in `local unsigned long f()` or `unsigned long ZEXPORT f()`, so every
+-- sized_type_specifier is rescanned. In `local block_state f()`, the type is
+-- `local` and the real one is in the ERROR node after it. That is used if it
+-- has a type keyword, or if the type is a known leading macro and the ERROR is
+-- not a lone known decorator: `local WINAPI f()` parses the same way, and
+-- there `local` may be a real typedef. An unlisted decorator, as in
+-- `local DLLEXPORT f()`, is taken for the type.
+local function return_base_type(def, src)
+  local ty = def:field("type")[1]
+  if not ty then
+    return "int" -- C's implicit int
+  end
+  local ty_text = csrc.text(ty, src)
+  if ty:type() == "sized_type_specifier" then
+    return base_type_from_run(ty_text)
+  end
+  if ty:type() == "type_identifier" and not TYPE_KEYWORDS[ty_text] then
+    local sib = ty:next_sibling()
+    if sib and sib:type() == "ERROR" then
+      local sib_text = csrc.text(sib, src)
+      local sib_has_keyword = contains_type_keyword(sib_text)
+      local macro_before_typedef = KNOWN_LEADING_MACROS[ty_text] and not is_single_known_decorator(sib_text)
+      if sib_has_keyword or macro_before_typedef then
+        return base_type_from_run(sib_text)
+      end
+    end
+  end
+  return ty_text
 end
 
 -- Error recovery can leave a `return` outside any return_statement, as the
@@ -323,42 +465,45 @@ end
 ---@field stmts TSNode[] the body's top-level named nodes, comments and preprocessor blocks included
 ---@field returns TSNode[] every return_statement in the body
 ---@field body_edits inline_explorer.Edit[] the label suffixes and renames on src (see plan_body_edits)
----@field ret_decl string the declaration of ret_var, of the callee's return type, without its `;`
+---@field fn_def TSNode the callee's function_definition in src
+---@field ret_type string the base of its return type, without the declarator's `*`s (see return_base_type)
 ---@field has_value boolean whether the first return carries a value (false when there is none)
 ---@field simple boolean exactly one return, carrying a value and last of stmts: a trailing comment makes it false
 ---@field ret_var string __ie_retN, which holds the result
 ---@field end_label string __ie_endN, which the returns jump to
----@field binds string[]? one `T name = (arg);` per parameter, set by analyze_call_node after the arity check
+---@field args string[]? each parameter's argument text, set by analyze_call_node after the arity check
+---@field param_rename table<string, string>? the parameters' renames: only parameters are in scope in their types
+---@field bind_names string[]? each parameter's declared name: its new name, its own, or one made up for it
 
 ---@param callee_src string
 ---@param fname string
 ---@param N integer
 ---@param caller inline_explorer.CallerNames
 ---@return inline_explorer.IR? ir without binds
----@return string? err
+---@return inline_explorer.Refusal? err
 function M.analyze_callee(callee_src, fname, N, caller)
   local fn_def, fn_declarator = csrc.find_function_def(csrc.parse(callee_src), callee_src, fname)
   if not fn_def then
-    return nil, "definition of '" .. fname .. "' not found"
+    return nil, M.refuse("not-found", "definition of '" .. fname .. "' not found")
   end
   ---@cast fn_declarator -nil
   local params, variadic = csrc.get_params(fn_declarator, callee_src)
   if variadic then
-    return nil, "cannot inline variadic function '" .. fname .. "'"
+    return nil, M.refuse("variadic", "cannot inline variadic function '" .. fname .. "'")
   end
   -- What it declares is out of sight: no name in it can be checked or renamed.
   if #csrc.query_nodes(fn_def, callee_src, "(preproc_include) @i") > 0 then
-    return nil, fname .. " has an #include in its body"
+    return nil, M.refuse("include", fname .. " has an #include in its body")
   end
   local body = fn_def:field("body")[1]
   if has_stray_return(body, callee_src) then
-    return nil, "a `return` in " .. fname .. " does not parse as a return statement"
+    return nil, M.refuse("stray-return", "a `return` in " .. fname .. " does not parse as a return statement")
   end
   local decls = callee_declarations(fn_def, fn_declarator, callee_src)
   -- Pasted into the caller, such a use would mean the caller's declaration.
   for _, nm in ipairs(free_names(fn_def, fn_declarator, callee_src, decls)) do
     if caller.declared[nm] then
-      return nil, ("'%s' in %s would mean the caller's own '%s'"):format(nm, fname, nm)
+      return nil, M.refuse("capture", ("'%s' in %s would mean the caller's own '%s'"):format(nm, fname, nm))
     end
   end
 
@@ -367,7 +512,7 @@ function M.analyze_callee(callee_src, fname, N, caller)
     stmts[#stmts + 1] = body:named_child(i)
   end
   if #stmts == 0 then
-    return nil, "empty function body"
+    return nil, M.refuse("empty", "empty function body")
   end
   local returns = csrc.query_nodes(body, callee_src, "(return_statement) @r")
 
@@ -382,11 +527,12 @@ function M.analyze_callee(callee_src, fname, N, caller)
     stmts = stmts,
     returns = returns,
     body_edits = body_edits,
-    ret_decl = csrc.result_decl(fn_def, callee_src, "__ie_ret" .. N),
+    fn_def = fn_def,
+    ret_type = return_base_type(fn_def, callee_src),
     has_value = returns[1] ~= nil and #csrc.code_children(returns[1]) > 0,
     simple = #returns == 1 and last:type() == "return_statement" and #csrc.code_children(last) > 0,
-    ret_var = "__ie_ret" .. N,
-    end_label = "__ie_end" .. N,
+    ret_var = INJECTED.ret_var(N),
+    end_label = INJECTED.end_label(N),
   }
 end
 
@@ -501,7 +647,6 @@ end
 ---@field unconditional boolean hoisting the call above target keeps its meaning (see is_unconditional)
 ---@field stmt_bol integer the byte offset of the start of target's line
 ---@field indent string the leading spaces and tabs of that line
----@field indent_unit string one level of indentation
 
 ---@param caller_src string
 ---@param call TSNode
@@ -531,7 +676,6 @@ function M.analyze_context(caller_src, call)
     unconditional = unconditional,
     stmt_bol = stmt_bol,
     indent = indent,
-    indent_unit = indent:find("\t") and "\t" or "    ",
   }
 end
 
@@ -541,44 +685,44 @@ end
 -- picks "pretty" for a simple callee whose call is unconditional, else
 -- "canonical", which is valid in any expression context; readable mode avoids
 -- ({...}) and goto: "pretty" for any simple callee, else "readable_multi".
+--
+-- The second value says where the hoisting forms, "pretty" and
+-- "readable_multi", put their lines: "above" target, or "wrap", in a new
+-- block that holds them and then target (see M.placement).
 ---@param ir inline_explorer.IR
 ---@param ctx inline_explorer.Ctx
 ---@param mode "correct"|"readable"
----@return "pretty"|"canonical"|"readable_multi"
+---@return "pretty"|"canonical"|"readable_multi" printer
+---@return "above"|"wrap" placement
 function M.decide(ir, ctx, mode)
+  local placement = M.placement(ctx)
   -- Wrapping a declaration in a block would end its scope early: later code
   -- would see whatever it shadowed. Canonical leaves it in place. So it does
   -- with a misparsed target, such as `WHEN(c) x = f(a);` where WHEN expands
   -- to an `if`: hoisted, f would run whatever c is.
   if ctx.wrap_unsafe or ctx.parse_error then
-    return "canonical"
+    return "canonical", placement
   end
   if ir.simple and (mode == "readable" or ctx.unconditional) then
-    return "pretty"
+    return "pretty", placement
   end
   if mode == "readable" then
-    return "readable_multi"
+    return "readable_multi", placement
   end
-  return "canonical"
+  return "canonical", placement
 end
 
--- analyze_call_node for the occ-th call to fname in caller_src.
----@param caller_src string
----@param callee_src string
----@param fname string
----@param N integer
----@param occ integer
----@return inline_explorer.IR? ir
----@return inline_explorer.Ctx? ctx
----@return string? err
-function M.analyze_call(caller_src, callee_src, fname, N, occ)
-  local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ)[occ]
-  if not call then
-    return nil, nil, "call to '" .. fname .. "' not found"
-  end
-  return M.analyze_call_node(caller_src, callee_src, fname, N, call)
+-- Where hoisted lines go: directly "above" target where they can, else
+-- "wrap": a new block replaces target, holding them and then target.
+---@param ctx inline_explorer.Ctx
+---@return "above"|"wrap"
+function M.placement(ctx)
+  return ctx.can_insert_above and "above" or "wrap"
 end
 
+-- Analyses `call`, a call to fname in caller_src, with callee_src as
+-- fname's definition: the callee's IR with the arguments bound, and the call
+-- site's ctx.
 ---@param caller_src string
 ---@param callee_src string
 ---@param fname string
@@ -586,12 +730,12 @@ end
 ---@param call TSNode
 ---@return inline_explorer.IR? ir with binds
 ---@return inline_explorer.Ctx? ctx nil when ir is
----@return string? err
+---@return inline_explorer.Refusal? err
 function M.analyze_call_node(caller_src, callee_src, fname, N, call)
   -- Its arguments cannot be told apart: in `f(a, 2 ADD)` the 2 is in an
   -- ERROR node.
   if call:has_error() then
-    return nil, nil, "the call to " .. fname .. " does not parse cleanly"
+    return nil, nil, M.refuse("parse", "the call to " .. fname .. " does not parse cleanly")
   end
   local ir, err = M.analyze_callee(callee_src, fname, N, M.caller_names(call, caller_src))
   if not ir then
@@ -603,7 +747,7 @@ function M.analyze_call_node(caller_src, callee_src, fname, N, call)
     args[#args + 1] = csrc.text(arg, caller_src)
   end
   if #args ~= #ir.params then
-    return nil, nil, string.format("arity mismatch (%d args, %d params)", #args, #ir.params)
+    return nil, nil, M.refuse("arity", string.format("arity mismatch (%d args, %d params)", #args, #ir.params))
   end
   -- Only the parameters are in scope in a parameter's declaration.
   local param_rename = {}
@@ -612,10 +756,11 @@ function M.analyze_call_node(caller_src, callee_src, fname, N, call)
       param_rename[p.name] = ir.rename[p.name]
     end
   end
-  ir.binds = {}
+  local bind_names = {}
   for i, p in ipairs(ir.params) do
-    ir.binds[i] = csrc.build_bind(p, args[i], param_rename, N, i, callee_src)
+    bind_names[i] = p.name and (param_rename[p.name] or p.name) or INJECTED.arg(i, N)
   end
+  ir.args, ir.param_rename, ir.bind_names = args, param_rename, bind_names
 
   return ir, M.analyze_context(caller_src, call)
 end

@@ -6,6 +6,7 @@
 -- apart.
 local async = require("inline-explorer.async")
 local csrc = require("inline-explorer.csrc")
+local lsp = require("inline-explorer.lsp")
 local resolver = require("inline-explorer.resolver")
 
 local M = {}
@@ -37,6 +38,10 @@ local function sort_items(items)
   return items
 end
 
+-- The line of a call-hierarchy item, from the buffer when it is loaded: the
+-- server answered about the buffer's text, which can differ from the disk's.
+-- (A grep hit is read from the disk instead, as grep read it: see
+-- add_confirmed_calls.)
 local function trimmed_line(path, lnum0)
   local buf = vim.fn.bufnr(path)
   if buf ~= -1 and vim.api.nvim_buf_is_loaded(buf) then
@@ -91,6 +96,8 @@ end
 
 -- Adds to `items` the hits that are the callee of a call of `name`. A hit
 -- elsewhere in a call (in an argument, a comment or a string) is not one.
+-- The file is read from the disk, where grep found the hits, so their rows
+-- and columns hold even when a loaded buffer of it has unsaved edits.
 local function add_confirmed_calls(items, file, hits, name)
   local read_ok, file_lines = pcall(vim.fn.readfile, file)
   if not read_ok then
@@ -229,15 +236,15 @@ function M.get(name, bufnr, cb)
   -- locate, not locate_definition: call hierarchy accepts a declaration, so no
   -- extract or chase is needed.
   resolver.locate(name, bufnr, function(loc)
-    local client = loc and resolver.client_for(loc, bufnr, method)
+    local client = loc and lsp.client_for(loc, bufnr, method)
     if not (loc and client) then
       grep_callers(name, root_dir, cb)
       return
     end
-    local target_bufnr = resolver.ensure_attached(loc.uri, client)
+    local target_bufnr = lsp.ensure_attached(loc.uri, client)
     local params = {
       textDocument = { uri = loc.uri },
-      position = resolver.name_position(target_bufnr, loc, client.offset_encoding),
+      position = lsp.name_position(target_bufnr, loc, client.offset_encoding),
     }
     call_hierarchy(client, target_bufnr, params, name, root_dir, cb)
   end)

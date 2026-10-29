@@ -171,6 +171,40 @@ do
   trail.clear()
 end
 
+-- view.close closes the view on screen and nothing else; trail.close also
+-- drops the views the trail keeps hidden. view.close used to clear the whole
+-- trail, a view-level call reaching up into navigation.
+do
+  trail.clear()
+  vim.cmd.edit(paths[1])
+  view.open()
+  trail.goto_location(loc_of(2))
+  local first = trail._stack[1].buf
+  view.close()
+  check("view.close: the hidden view on the trail stays", vim.api.nvim_buf_is_valid(first) and view.state[first] ~= nil)
+  vim.cmd.edit(paths[1])
+  local v = view.open()
+  trail.goto_location(loc_of(2))
+  trail.close()
+  check(
+    "trail.close: the views the trail kept are wiped",
+    not vim.api.nvim_buf_is_valid(first) and not vim.api.nvim_buf_is_valid(v)
+  )
+  trail.clear()
+end
+
+-- A view gets its keymaps from keymaps.lua, through the event view.open
+-- fires: view.lua requires nothing above it.
+do
+  require("inline-explorer.config").setup({})
+  require("inline-explorer.keymaps").setup(require("inline-explorer.config").options.keymaps)
+  vim.cmd.edit(paths[3])
+  view.open()
+  local mapped = vim.fn.maparg("<C-o>", "n", false, true)
+  check("keymaps: a view opened gets its own <C-o>", mapped.buffer == 1 and mapped.desc ~= nil, mapped)
+  view.close()
+end
+
 -- Without a FileType autostart, a file a jump opens has no server. It gets
 -- the servers of the file the jump came from: lookups from its view go
 -- through them, and before definition files were attached only on demand,

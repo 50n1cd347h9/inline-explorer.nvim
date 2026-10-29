@@ -11,10 +11,8 @@ local M = {}
 -- The names of the blocks that contain row `row` (0-based), as a set.
 local function ancestor_names(st, bufnr, row)
   local names = {}
-  for _, range in ipairs(view.block_ranges(st, bufnr)) do
-    if row >= range.s and row <= range.e then
-      names[range.name] = true
-    end
+  for _, range in ipairs(view.blocks_at(st, bufnr, row)) do
+    names[range.name] = true
   end
   return names
 end
@@ -174,15 +172,18 @@ function M.expand(prefetched)
     return
   end
 
-  if not view.begin_fetch(st) then
+  if not view.begin_fetch(st, resolver.fetch_budget_ms()) then
     return notify("a lookup is already in flight", vim.log.levels.INFO)
   end
 
   profile.begin_action()
   local stop_timer = profile.start()
-  resolver.fetch(name, st.source_bufnr, function(body, label, err)
+  resolver.fetch(name, st.source_bufnr, function(body, label, err, note)
     vim.schedule(function()
       view.end_fetch(st)
+      if note then
+        notify(note, vim.log.levels.WARN)
+      end
       if not body or #body == 0 then
         stop_timer("total:expand-failed", name)
         return notify(err or ("could not extract a body for '" .. name .. "'"))

@@ -2,6 +2,8 @@
 -- times one stage of the work (see M.start); while profiling is off, the
 -- default, it costs two calls, plus the stop call's arguments, which the call
 -- site still evaluates.
+local util = require("inline-explorer.util")
+
 local M = {}
 
 M.enabled = false
@@ -174,6 +176,37 @@ function M.report()
     lines[#lines + 1] = "log: " .. M.logfile
   end
   return table.concat(lines, "\n")
+end
+
+-- :InlineExplorerProfile [sub]: on, off, clear, path, open, or report (the
+-- default, and what an unknown argument gets).
+---@param sub string
+function M.command(sub)
+  if sub == "" then
+    sub = "report"
+  end
+  if sub == "on" or sub == "off" then
+    M.enabled = sub == "on"
+    M.clear()
+    local msg = "profiling " .. sub
+    if sub == "on" and M.logfile then
+      msg = msg .. " -> " .. M.logfile
+    end
+    util.notify(msg)
+  elseif sub == "clear" then
+    M.clear(true)
+    util.notify("profile cleared")
+  elseif sub == "path" then
+    util.notify(M.logfile or "logging to file is disabled")
+  elseif sub == "open" then
+    if M.logfile then
+      vim.cmd.tabedit(vim.fn.fnameescape(M.logfile))
+    else
+      util.notify("logging to file is disabled", vim.log.levels.WARN)
+    end
+  else
+    vim.api.nvim_echo({ { M.report() } }, true, {})
+  end
 end
 
 return M

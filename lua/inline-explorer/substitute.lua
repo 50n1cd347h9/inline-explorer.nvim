@@ -1,85 +1,27 @@
 -- C inline substitution: rewrites a call `f(args)` into the effect of f's
--- body, as a GNU C source transform on text and tree-sitter trees. canalyze
+-- body, as a GNU C source transform on text and tree-sitter trees, and a
+-- macro use into clangd's expansion of it (replace_macro_use). canalyze
 -- analyses the call and decides on a layout, cprint prints it, and this module
--- holds the public API and the test hooks. `N`, an id unique to each
--- expansion, suffixes the names it injects or renames. See DESIGN.md.
+-- holds the public API. `N`, an id unique to each expansion, suffixes the
+-- names it injects or renames. See DESIGN.md. The specs reach the analysis
+-- and the printers through tests/lib/inline.lua.
 local csrc = require("inline-explorer.csrc")
 local canalyze = require("inline-explorer.canalyze")
 local cprint = require("inline-explorer.cprint")
+local simplify = require("inline-explorer.simplify")
 
 local M = {}
 
-local function print_call(caller_src, ir, ctx, mode)
-  local printer_name = canalyze.decide(ir, ctx, mode or "correct")
-  return cprint.PRINTERS[printer_name](caller_src, ir, ctx)
-end
-
--- Inlines the occ-th call to fname in caller_src; callee_src holds fname's
--- definition.
+-- The caller's text with the analysed call printed in the form, and at the
+-- placement, canalyze.decide picks for `mode`.
 ---@param caller_src string
----@param callee_src string
----@param fname string
----@param N? integer default 1
----@param occ? integer default 1
+---@param ir inline_explorer.IR with args
+---@param ctx inline_explorer.Ctx
 ---@param mode? "correct"|"readable" default "correct"
----@return string? new_src
----@return string? err
-function M.inline_call(caller_src, callee_src, fname, N, occ, mode)
-  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
-  if not ir then
-    return nil, err
-  end
-  return print_call(caller_src, ir, ctx, mode)
-end
-
--- Test hook: analyses the occ-th call to fname without printing it. Unlike
--- analyze_call it binds no arguments: no arity check, and ir.binds is nil.
----@param caller_src string
----@param callee_src string
----@param fname string
----@param occ? integer default 1
----@param mode? "correct"|"readable" default "correct"
----@return { ir: inline_explorer.IR, ctx: inline_explorer.Ctx, decision: string }?
----@return string? err
-function M._probe(caller_src, callee_src, fname, occ, mode)
-  occ = occ or 1
-  local call = csrc.find_calls(csrc.parse(caller_src), caller_src, fname, occ)[occ]
-  if not call then
-    return nil, "call to '" .. fname .. "' not found"
-  end
-  local expansion_id = 1
-  local ir, err = canalyze.analyze_callee(callee_src, fname, expansion_id, canalyze.caller_names(call, caller_src))
-  if not ir then
-    return nil, err
-  end
-  local ctx = canalyze.analyze_context(caller_src, call)
-  return { ir = ir, ctx = ctx, decision = canalyze.decide(ir, ctx, mode or "correct") }
-end
-
--- The property suites test csrc's layout helpers through these hooks.
-M._rebase = csrc.reindent
-M._common_ws_prefix = csrc.common_ws_prefix
-
--- Test hook: inline_call with the printer named printer_name, not decide()'s.
----@param caller_src string
----@param callee_src string
----@param fname string
----@param N? integer default 1
----@param occ? integer default 1
----@param printer_name string
----@return string? new_src
----@return string? err
-function M._render(caller_src, callee_src, fname, N, occ, printer_name)
-  local printer = cprint.PRINTERS[printer_name]
-  if not printer then
-    return nil, "unknown printer '" .. tostring(printer_name) .. "'"
-  end
-  local ir, ctx, err = canalyze.analyze_call(caller_src, callee_src, fname, N or 1, occ or 1)
-  if not ir then
-    return nil, err
-  end
-  ---@cast ctx -nil
-  return printer(caller_src, ir, ctx)
+---@return string new_src
+function M.print(caller_src, ir, ctx, mode)
+  local printer_name, placement = canalyze.decide(ir, ctx, mode or "correct")
+  return cprint.PRINTERS[printer_name](caller_src, ir, ctx, placement)
 end
 
 -- The innermost call at (row, col) and the name it calls, or nil and the
@@ -87,11 +29,11 @@ end
 local function named_call_at(caller_src, row, col, root)
   local call = csrc.ancestor_at(root or csrc.parse(caller_src), row, col, "call_expression")
   if not call then
-    return nil, "no call under the cursor"
+    return nil, canalyze.refuse("no-call", "no call under the cursor")
   end
   local fn = call:field("function")[1]
   if not fn or fn:type() ~= "identifier" then
-    return nil, "call target is not a plain function name"
+    return nil, canalyze.refuse("not-plain", "call target is not a plain function name")
   end
   return call, csrc.text(fn, caller_src)
 end
@@ -110,7 +52,8 @@ function M.call_name_at(caller_src, row, col, root)
   return name_or_reason
 end
 
--- inline_call for the call at (row, col); see named_call_at.
+-- Inlines the call at (row, col), see named_call_at; callee_src holds the
+-- definition of the function it calls.
 ---@param caller_src string
 ---@param row integer 0-based
 ---@param col integer 0-based, in bytes
@@ -119,8 +62,8 @@ end
 ---@param mode? "correct"|"readable" default "correct"
 ---@param root? TSNode caller_src's tree, if already parsed
 ---@return string? new_src
----@return string? err
-function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)
+---@return inline_explorer.Refusal? err
+function M.inline_at(caller_src, row, col, callee_src, N, mode, root)
   local call, name_or_reason = named_call_at(caller_src, row, col, root)
   if not call then
     return nil, name_or_reason
@@ -130,7 +73,70 @@ function M.inline_in_buffer(caller_src, row, col, callee_src, N, mode, root)
   if not ir then
     return nil, err
   end
-  return print_call(caller_src, ir, ctx, mode)
+  return M.print(caller_src, ir, ctx, mode)
+end
+
+-- The macro use at (row, col), and whether it is a whole expression statement.
+-- The use is the call_expression when the identifier there is its callee, else
+-- the identifier.
+local function find_invocation(root, row, col)
+  local node = csrc.ancestor_at(root, row, col, "identifier")
+  if not node then
+    return nil
+  end
+  local invocation = node
+  local parent = node:parent()
+  if parent and parent:type() == "call_expression" then
+    local callee = parent:field("function")[1]
+    if callee and csrc.start_byte(callee) == csrc.start_byte(node) then
+      invocation = parent
+    end
+  end
+  local outer = invocation:parent()
+  local is_statement = outer ~= nil and outer:type() == "expression_statement"
+  return invocation, is_statement
+end
+
+-- `src` with the macro use at (row, col) replaced by `exp_lines`, its
+-- expansion (see macro.fetch_expansion). `root` is
+-- src's parsed root, when the caller has it.
+---@param src string
+---@param row integer 0-based
+---@param col integer 0-based, in bytes
+---@param exp_lines string[]
+---@param root? TSNode
+---@return string? new_src
+---@return inline_explorer.Refusal? err
+function M.replace_macro_use(src, row, col, exp_lines, root)
+  local invocation, is_statement = find_invocation(root or csrc.parse(src), row, col)
+  if not invocation then
+    return nil, canalyze.refuse("no-macro", "no macro use under the cursor")
+  end
+  local parts = {}
+  for i, l in ipairs(exp_lines) do
+    parts[i] = l
+  end
+  if #parts > 1 then
+    -- The indent of the use's line, not all text before the use, which would
+    -- repeat `foo = ` on each line.
+    local indent = csrc.line_indent(src, invocation)
+    for i = 2, #parts do
+      parts[i] = indent .. parts[i]
+    end
+  end
+  -- Trimmed because clangd's text can start with a space, which would fail
+  -- the anchored `^%b()$` check below.
+  local exp = vim.trim(simplify.parens(table.concat(parts, "\n")))
+  local rep = exp
+  if not is_statement then
+    -- Parenthesized to keep its precedence in an expression; simplify.parens
+    -- then drops a pair if the wrap doubled one.
+    if not exp:match("^%b()$") then
+      rep = "(" .. exp .. ")"
+    end
+    rep = simplify.parens(rep)
+  end
+  return src:sub(1, csrc.start_byte(invocation)) .. rep .. src:sub(csrc.end_byte(invocation) + 1)
 end
 
 return M

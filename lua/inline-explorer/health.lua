@@ -23,7 +23,12 @@ local function check_client(client)
   if caps.documentSymbolProvider then
     health.ok(("%s: documentSymbol supported (definition ranges)"):format(client.name))
   else
-    health.warn(("%s: no documentSymbol -- falling back to tree-sitter extraction"):format(client.name))
+    health.warn(
+      (
+        "%s: no documentSymbol -- definitions come from tree-sitter (which C and C++ use first anyway),"
+        .. " else from a brace counter"
+      ):format(client.name)
+    )
   end
   if macro.supports_tweak(client) then
     health.ok(("%s: applyTweak supported (macro expansion)"):format(client.name))

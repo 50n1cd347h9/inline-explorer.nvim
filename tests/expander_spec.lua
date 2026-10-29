@@ -16,6 +16,17 @@ do
   assert(not ok, "config.setup accepted an invalid mode")
   local ok2 = pcall(config.setup, { indent = 4 })
   assert(not ok2, "config.setup accepted a non-string indent")
+  -- A mistyped keymap name warns, as a mistyped option does.
+  local warned = {}
+  local old_notify = vim.notify
+  vim.notify = function(msg)
+    warned[#warned + 1] = tostring(msg)
+  end
+  config.setup({ keymaps = { substitue = "<leader>x" }, modee = "correct" })
+  vim.notify = old_notify
+  local text = table.concat(warned, "\n")
+  assert(text:find("unknown keymap 'substitue'", 1, true), "no warning for a mistyped keymap: " .. text)
+  assert(text:find("unknown option 'modee'", 1, true), "no warning for a mistyped option: " .. text)
 end
 require("inline-explorer.config").setup({})
 
@@ -238,11 +249,13 @@ do
 end
 
 -- Re-entrancy guard: while a resolver round trip is in flight, a second
--- expand is refused; the stamp goes stale after FETCH_GUARD_MS so a leaked
--- flag self-heals.
+-- expand is refused; the stamp goes stale after the fetch's budget so a
+-- leaked flag self-heals.
 do
   resolver.locate = function() end -- swallow: the fetch never completes
-  view.FETCH_GUARD_MS = 200
+  resolver.fetch_budget_ms = function()
+    return 200
+  end
   local col2 = ("    int r = helper(1);"):find("helper") - 1
   vim.api.nvim_win_set_cursor(0, { 3, col2 })
 
@@ -277,7 +290,7 @@ do
       refused_again = true
     end
   end
-  check("stale guard self-heals after FETCH_GUARD_MS", not refused_again, table.concat(notes, " | "))
+  check("stale guard self-heals after the fetch budget", not refused_again, table.concat(notes, " | "))
 end
 
 -- Profiling: off by default records nothing; on, the real expand path

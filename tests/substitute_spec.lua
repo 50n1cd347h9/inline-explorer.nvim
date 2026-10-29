@@ -12,6 +12,7 @@ local root = vim.fn.fnamemodify(here, ":h:h")
 vim.opt.rtp:append(root)
 local H = require("tests.lib.harness")
 local S = require("inline-explorer.substitute")
+local T = require("tests.lib.inline")
 
 if vim.fn.executable("gcc") == 0 then
   print("SKIP: gcc not found")
@@ -38,7 +39,7 @@ end
 local function transform(caller, callee, fname, seq)
   local src = caller
   for _, step in ipairs(seq) do
-    local new, err = S.inline_call(src, callee, fname, step.N, step.occ or 1, step.mode)
+    local new, err = T.inline_call(src, callee, fname, step.N, step.occ or 1, step.mode)
     assert(new, ("inline_call failed (N=%d): %s"):format(step.N, tostring(err)))
     src = new
   end
@@ -163,7 +164,7 @@ do
     return sq(a) + sq(b);
 }]]
   local col2 = ("    return sq(a) + sq(b);"):find("sq%(b") - 1
-  local new = assert(S.inline_in_buffer(caller, 2, col2, callee, 1))
+  local new = assert(S.inline_at(caller, 2, col2, callee, 1))
   local main = "int main(void){ return (caller(3,4)==25)?0:1; }\n"
   check("case6 inlined only the 2nd call", select(2, new:gsub("sq%(", "")) == 1, new)
   check("case6 compiles", (compiles(callee .. "\n" .. new .. main, "c6")))
@@ -365,19 +366,19 @@ do
   local caller = "static int caller(int n)\n{\n    return f(n);\n}"
 
   local variadic = "static int f(int x, ...)\n{\n    return x;\n}"
-  local new, err = S.inline_call(caller, variadic, "f", 1, 1)
+  local new, err = T.inline_call(caller, variadic, "f", 1, 1)
   check("case14 variadic -> error", new == nil and tostring(err):find("variadic") ~= nil, tostring(err))
 
   local two_params = "static int f(int a, int b)\n{\n    return a + b;\n}"
-  new, err = S.inline_call(caller, two_params, "f", 1, 1)
+  new, err = T.inline_call(caller, two_params, "f", 1, 1)
   check("case14 arity mismatch -> error", new == nil and tostring(err):find("arity") ~= nil, tostring(err))
 
   local empty = "static int f(int x)\n{\n}"
-  new, err = S.inline_call(caller, empty, "f", 1, 1)
+  new, err = T.inline_call(caller, empty, "f", 1, 1)
   check("case14 empty body -> error", new == nil and tostring(err):find("empty") ~= nil, tostring(err))
 
   local ok_callee = "static int g(int x)\n{\n    return x;\n}"
-  new, err = S.inline_call(caller, ok_callee, "g", 1, 1)
+  new, err = T.inline_call(caller, ok_callee, "g", 1, 1)
   check("case14 no call in caller -> error", new == nil and tostring(err):find("not found") ~= nil, tostring(err))
 end
 
@@ -463,7 +464,7 @@ do
       break
     end
   end
-  local t2 = assert(S.inline_in_buffer(t, grow, gcol, callee_g, 2))
+  local t2 = assert(S.inline_at(t, grow, gcol, callee_g, 2))
   local main = "int main(void){ return (caller(5)==31)?0:1; }\n"
   check("case16 nested inline removed the inner call", not t2:find("g(", 1, true), t2)
   check("case16 compiles (nested inline)", (compiles(callee_g .. "\n" .. callee_f .. "\n" .. t2 .. main, "c16")), t2)
@@ -1128,7 +1129,7 @@ do
 
   local add = "static int add(int a, int b)\n{\n    return a + b;\n}"
   local add_caller = "static int caller(void)\n{\n    int r = add(1, /* two */ 2);\n    return r;\n}"
-  local t4, err4 = S.inline_call(add_caller, add, "add", 1, 1)
+  local t4, err4 = T.inline_call(add_caller, add, "add", 1, 1)
   check("case33 a comment between arguments is not an argument", t4 ~= nil, tostring(err4))
   local main4 = "int main(void){ return (caller()==3)?0:1; }\n"
   check("case33 commented argument list runs equal", t4 ~= nil and (run_ok(add .. "\n" .. t4 .. main4, "c33d")), t4)
@@ -1175,7 +1176,7 @@ do
   local n_calls = #C.find_calls(tree, program, "bump")
   check("case34 original builds, one call per site", want ~= nil and n_calls == #sites, n_calls)
   for occ = 1, n_calls do
-    local t, err = S.inline_call(program, callee, "bump", 1, occ)
+    local t, err = T.inline_call(program, callee, "bump", 1, occ)
     local got = t and cc.build_run(t, tmp .. "/c34_" .. occ .. ".c", tmp .. "/c34_" .. occ .. ".out")
     check(("case34 %s prints what the original prints"):format(sites[occ][1]), got ~= nil and got == want, t or err)
   end
@@ -1207,7 +1208,7 @@ do
   local caller2 = "static int caller(void)\n{\n    int r = twice(scale);\n    return r;\n}"
   local main2 = "int main(void){ return (caller()==6)?0:1; }\n"
   for _, printer in ipairs({ "pretty", "canonical" }) do
-    local t2 = assert(S._render(caller2, twice, "twice", 1, 1, printer))
+    local t2 = assert(T.render(caller2, twice, "twice", 1, 1, printer))
     check(
       "case35 " .. printer .. " binds the argument to a renamed parameter",
       t2:find("int scale__ie1 = (scale);", 1, true),
@@ -1284,7 +1285,7 @@ do
     },
   }
   for _, c in ipairs(callees) do
-    local new, err = S.inline_call(caller, c[2], "f", 1, 1)
+    local new, err = T.inline_call(caller, c[2], "f", 1, 1)
     check(
       "case36 refused: callee " .. c[1],
       new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
@@ -1292,7 +1293,7 @@ do
     )
   end
   local attr_caller = caller:gsub("int limit = 7;", "u32 __maybe_unused limit = 7;")
-  local new, err = S.inline_call(attr_caller, callees[1][2], "f", 1, 1)
+  local new, err = T.inline_call(attr_caller, callees[1][2], "f", 1, 1)
   check(
     "case36 refused: the caller's name sits in an ERROR node",
     new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
@@ -1304,7 +1305,7 @@ do
   local far = "#define FAR\nstruct st { int v; };\n"
   local peek = "static int peek(struct st FAR *q)\n{\n    struct st FAR *r = q;\n    return r->v;\n}"
   local far_caller = "static int caller(struct st *s)\n{\n    struct st FAR *p = s;\n    return peek(p) + p->v;\n}"
-  local tf, ferr = S.inline_call(far_caller, peek, "peek", 1, 1)
+  local tf, ferr = T.inline_call(far_caller, peek, "peek", 1, 1)
   local far_main = "int main(void){ struct st s = { 4 }; return (caller(&s)==8)?0:1; }\n"
   check("case36 a macro both sides misparse is no reason to refuse", tf ~= nil, tostring(ferr))
   check(
@@ -1321,11 +1322,11 @@ do
   local wrapped = "static int limit = 5;\n"
     .. get
     .. "\nstatic int caller(int x)\n{\n#ifdef SOMETHING_UNDEFINED\n    if (x) {\n#endif\n%s    int r = get() + x;\n    return r;\n}\n"
-  local tw, werr = S.inline_call(wrapped:format(""), get, "get", 1, 1)
+  local tw, werr = T.inline_call(wrapped:format(""), get, "get", 1, 1)
   check("case36 a file-scope global is no reason to refuse", tw ~= nil, tostring(werr))
   local wrapped_main = "int main(void){ return (caller(1)==6)?0:1; }\n"
   check("case36 file-scope global runs equal", tw ~= nil and (run_ok(tw .. wrapped_main, "c36wrap")), tw)
-  local tl, lerr = S.inline_call(wrapped:format("    int limit = 7;\n"), get, "get", 1, 1)
+  local tl, lerr = T.inline_call(wrapped:format("    int limit = 7;\n"), get, "get", 1, 1)
   check(
     "case36 refused: a local of a function without a function node",
     tl == nil and tostring(lerr):find("'limit'", 1, true) ~= nil,
@@ -1396,7 +1397,7 @@ do
     return lenfix[v];
 }]]
   local tables_caller = "static int caller(int v)\n{\n    int lenfix = fixed(v);\n    return lenfix;\n}"
-  local tnew, terr = S.inline_call(tables_caller, tables, "fixed", 1, 1)
+  local tnew, terr = T.inline_call(tables_caller, tables, "fixed", 1, 1)
   check(
     "case37 refused: an #include in the callee's body",
     tnew == nil and tostring(terr):find("#include", 1, true) ~= nil,
@@ -1406,7 +1407,7 @@ do
   local get = "static int get(void)\n{\n    return limit;\n}"
   local caller2 =
     "static int caller(int x)\n{\n#ifdef WIDE\n    long limit = 7;\n#else\n    int limit = 7;\n#endif\n    return get() + limit + x;\n}"
-  local new, err = S.inline_call(caller2, get, "get", 1, 1)
+  local new, err = T.inline_call(caller2, get, "get", 1, 1)
   check(
     "case37 refused: the caller declares the name in an #if block",
     new == nil and tostring(err):find("'limit'", 1, true) ~= nil,
@@ -1533,7 +1534,7 @@ int main(void)
     local callee = def and C.text(def, program) or ""
     for occ = 1, #C.find_calls(tree, program, fname) do
       local label = ("case38 %s (call %d)"):format(fname, occ)
-      local t, err = S.inline_call(program, callee, fname, 1, occ)
+      local t, err = T.inline_call(program, callee, fname, 1, occ)
       if expect[fname] then
         check(
           label .. " writes `" .. expect[fname] .. "`",
@@ -1563,7 +1564,7 @@ out: __maybe_unused
     return 0;
 }]]
   local caller = "static int caller(int v)\n{\n    int r = f(v);\n    return r + 1;\n}"
-  local new, err = S.inline_call(caller, stray, "f", 1, 1)
+  local new, err = T.inline_call(caller, stray, "f", 1, 1)
   check(
     "case39 refused: a `return` that is not a return statement",
     new == nil and tostring(err):find("return", 1, true) ~= nil,
@@ -1594,7 +1595,7 @@ out: __maybe_unused
   end
 
   local added = "static int caller(int a)\n{\n    int r = step(a, 2 ADD);\n    return r;\n}"
-  local new2, err2 = S.inline_call(added, step, "step", 1, 1)
+  local new2, err2 = T.inline_call(added, step, "step", 1, 1)
   check(
     "case39 refused: a call with an ERROR among its arguments",
     new2 == nil and tostring(err2):find("parse", 1, true) ~= nil,
@@ -1677,7 +1678,7 @@ do
   for i, c in ipairs(callees) do
     local main = ("int main(void){ return (caller()==%d)?0:1; }\n"):format(c[4])
     for _, printer in ipairs({ "pretty", "canonical" }) do
-      local t = assert(S._render(caller, c[2], "f", 1, 1, printer))
+      local t = assert(T.render(caller, c[2], "f", 1, 1, printer))
       local label = ("case42 global read %s, %s,"):format(c[1], printer)
       check(label .. " keeps its name", t:find(c[3], 1, true) ~= nil, t)
       check(label .. " runs equal", (run_ok(prelude .. c[2] .. "\n" .. t .. main, "c42" .. i .. printer)), t)
@@ -1686,7 +1687,7 @@ do
 
   local doubled = "static int doubled(int x)\n{\n    int ret __maybe_unused = x * 2;\n    return ret + 1;\n}"
   local caller2 = "static int caller(int n)\n{\n    int ret = doubled(n);\n    return ret;\n}"
-  local t2, err = S.inline_call(caller2, doubled, "doubled", 1, 1)
+  local t2, err = T.inline_call(caller2, doubled, "doubled", 1, 1)
   local main2 = "int main(void){ return (caller(1)==3)?0:1; }\n"
   check("case42 a local named inside an ERROR node is no reason to refuse", t2 ~= nil, tostring(err))
   check(
@@ -1717,7 +1718,7 @@ do
   local tree = vim.treesitter.get_parser(buf, "c"):parse()[1]:root()
   local col = ("    int b = g(a);"):find("g%(") - 1
 
-  local from_string = S.inline_in_buffer(caller, 3, col, callee, 1)
+  local from_string = S.inline_at(caller, 3, col, callee, 1)
   local real = vim.treesitter.get_string_parser
   local parsed = {}
   vim.treesitter.get_string_parser = function(text, ...)
@@ -1725,7 +1726,7 @@ do
     return real(text, ...)
   end
   C._parse_cache = {}
-  local from_tree = S.inline_in_buffer(caller, 3, col, callee, 1, nil, tree)
+  local from_tree = S.inline_at(caller, 3, col, callee, 1, nil, tree)
   local name_from_tree = S.call_name_at(caller, 3, col, tree)
   vim.treesitter.get_string_parser = real
   check("buffer tree: same transform as parsing the text", from_tree ~= nil and from_tree == from_string, from_tree)
@@ -1742,7 +1743,7 @@ end
 -- a different source must not be answered from the first. Counted by
 -- instrumenting the tree-sitter entry point rather than by timing -- a cache
 -- that merely got lucky would pass a timing assertion. Smart-inline used to
--- parse the same caller source three times (call_name_at, inline_in_buffer,
+-- parse the same caller source three times (call_name_at, inline_at,
 -- analyze_call), which on a 15,005-line file measured 154.0ms without the
 -- cache against 40.6ms with it; it now hands over the view's own tree, and
 -- the cache serves string callers -- the real-source and property suites,
@@ -1808,13 +1809,31 @@ do
   local callee = "static int f(int x)\n{\n    int t = x + 1;\n    return t;\n}"
   local caller = "int g(int a)\n{\n    if (a)\n        a = f(a) +\n            1;\n    return a;\n}"
   for _, mode in ipairs({ "correct", "readable" }) do
-    local new = S.inline_call(caller, callee, "f", 1, 1, mode) or ""
+    local new = T.inline_call(caller, callee, "f", 1, 1, mode) or ""
     check(
       "wrapped target: a continuation line keeps its place (" .. mode .. ")",
       new:find("\n            a = %(t%) %+\n                1;\n        }") ~= nil,
       new
     )
   end
+end
+
+-- A refusal carries a stable code, which the inliner's profile labels use,
+-- besides its message: rewording a message used to change the label.
+do
+  local caller = "int g(int a)\n{\n    return f(a, 1);\n}"
+  local _, variadic = T.inline_call(caller, "static int f(int x, ...)\n{\n    return x;\n}", "f", 1, 1)
+  local _, arity = T.inline_call(caller, "static int f(int x)\n{\n    return x;\n}", "f", 1, 1)
+  local _, none = S.inline_at(caller, 0, 0, "static int f(int x)\n{\n    return x;\n}", 1)
+  check("refusal: variadic code", type(variadic) == "table" and variadic.code == "variadic", variadic)
+  check("refusal: arity code", type(arity) == "table" and arity.code == "arity", arity)
+  check("refusal: no call under the cursor", type(none) == "table" and none.code == "no-call", none)
+  check(
+    "refusal: reads as its message",
+    tostring(variadic):find("variadic function 'f'", 1, true) ~= nil
+      and ("x: " .. arity):find("arity mismatch", 1, true),
+    tostring(variadic)
+  )
 end
 
 H.finish("SUBSTITUTE")

@@ -1,10 +1,11 @@
 -- Unit tests for the substitute engine's analysis layer: the callee IR, the
--- call-site context, and the single printer decision (M._probe).
+-- call-site context, and the single printer decision (tests/lib/inline.lua's probe).
 --   nvim --headless --clean -u NONE -c "luafile tests/ir_spec.lua" -c "qa!"
 local here = debug.getinfo(1, "S").source:sub(2)
 vim.opt.rtp:append(vim.fn.fnamemodify(here, ":h:h"))
 local H = require("tests.lib.harness")
-local S = require("inline-explorer.substitute")
+local T = require("tests.lib.inline")
+local cprint = require("inline-explorer.cprint")
 
 if not H.require_c_parser() then
   return
@@ -26,7 +27,7 @@ local multi_callee = [[static int cls(int x)
 
 -- Simple callee in a plain statement -> pretty.
 do
-  local p = assert(S._probe(
+  local p = assert(T.probe(
     [[static int caller(int n)
 {
     return acc(n) + 1;
@@ -38,13 +39,13 @@ do
   check("simple+plain: ctx.unconditional", p.ctx.unconditional == true, p.ctx)
   check("simple+plain: ctx.can_insert_above", p.ctx.can_insert_above == true, p.ctx)
   check("simple+plain: decision pretty", p.decision == "pretty", p.decision)
-  check("ir.ret_decl reconstructed", p.ir.ret_decl == "int __ie_ret1", p.ir.ret_decl)
+  check("ret_decl reconstructed", cprint.ret_decl(p.ir) == "int __ie_ret1", cprint.ret_decl(p.ir))
   check("ir.has_value", p.ir.has_value == true)
 end
 
 -- Same callee under && -> not unconditional -> canonical.
 do
-  local p = assert(S._probe(
+  local p = assert(T.probe(
     [[static int caller(int a, int b)
 {
     return a && acc(b);
@@ -58,7 +59,7 @@ end
 
 -- Ternary arm -> canonical.
 do
-  local p = assert(S._probe(
+  local p = assert(T.probe(
     [[static int caller(int c, int n)
 {
     return c ? acc(n) : 0;
@@ -84,7 +85,7 @@ do
   }
   for _, sh in ipairs(shapes) do
     local p =
-      assert(S._probe(("static int caller(int n)\n{\n    %s\n    return 0;\n}"):format(sh[1]), simple_callee, "acc"))
+      assert(T.probe(("static int caller(int n)\n{\n    %s\n    return 0;\n}"):format(sh[1]), simple_callee, "acc"))
     check(("hoist guard: `%s` -> %s"):format(sh[1], sh[2]), p.decision == sh[2], p.decision)
   end
 end
@@ -94,7 +95,7 @@ end
 do
   local caller = "static int caller(int n)\n{\n    int x = 0;\n    WHEN(n > 0) x = acc(n);\n    return x;\n}"
   for _, mode in ipairs({ "correct", "readable" }) do
-    local p = assert(S._probe(caller, simple_callee, "acc", 1, mode))
+    local p = assert(T.probe(caller, simple_callee, "acc", 1, mode))
     check("misparsed target, " .. mode .. ": ctx.parse_error", p.ctx.parse_error == true, p.ctx)
     check("misparsed target, " .. mode .. ": decision canonical", p.decision == "canonical", p.decision)
   end
@@ -107,16 +108,16 @@ do
     int r = cls(n);
     return r;
 }]]
-  local p = assert(S._probe(caller, multi_callee, "cls"))
+  local p = assert(T.probe(caller, multi_callee, "cls"))
   check("multi-return: ir.simple false", p.ir.simple == false)
   check("multi-return: decision canonical", p.decision == "canonical", p.decision)
-  local pr = assert(S._probe(caller, multi_callee, "cls", 1, "readable"))
+  local pr = assert(T.probe(caller, multi_callee, "cls", 1, "readable"))
   check("multi-return readable: decision readable_multi", pr.decision == "readable_multi", pr.decision)
 end
 
 -- Simple callee in readable mode is pretty even where hoisting is unsafe.
 do
-  local p = assert(S._probe(
+  local p = assert(T.probe(
     [[static int caller(int a, int b)
 {
     return a && acc(b);
@@ -131,7 +132,7 @@ end
 
 -- Unbraced if body -> ctx.can_insert_above false (printer must wrap).
 do
-  local p = assert(S._probe(
+  local p = assert(T.probe(
     [[static int caller(int a)
 {
     if (a > 0)
@@ -147,7 +148,7 @@ end
 
 -- Caller locals colliding with callee locals -> rename planned in the IR.
 do
-  local p = assert(S._probe(
+  local p = assert(T.probe(
     [[static int caller(int t)
 {
     int r = g(t);
@@ -163,20 +164,20 @@ do
   check("collision: rename planned", p.ir.rename.t == "t__ie1", p.ir.rename)
 end
 
--- Tab-indented caller -> ctx.indent_unit is a tab.
+-- Tab-indented caller -> its indent unit is a tab.
 do
-  local p = assert(S._probe("static int caller(int n)\n{\n\treturn acc(n) + 1;\n}", simple_callee, "acc"))
-  check("tab caller: ctx.indent_unit is tab", p.ctx.indent_unit == "\t", p.ctx.indent_unit)
+  local p = assert(T.probe("static int caller(int n)\n{\n\treturn acc(n) + 1;\n}", simple_callee, "acc"))
+  check("tab caller: the indent unit is a tab", cprint.indent_unit(p.ctx.indent) == "\t", p.ctx.indent)
 end
 
 -- Errors surface as nil, err.
 do
   local _, err =
-    S._probe("static int caller(int n)\n{\n    return f(n);\n}", "static int f(int x, ...)\n{\n    return x;\n}", "f")
+    T.probe("static int caller(int n)\n{\n    return f(n);\n}", "static int f(int x, ...)\n{\n    return x;\n}", "f")
   check("variadic: nil + err", err ~= nil and tostring(err):find("variadic") ~= nil, tostring(err))
 end
 
--- _render: force a specific printer, bypassing decide().
+-- render: force a specific printer, bypassing decide().
 do
   local callee = [[static int acc(int x)
 {
@@ -187,23 +188,17 @@ do
 {
     return acc(n) + 1;
 }]]
-  local S2 = require("inline-explorer.substitute")
-  local pretty = assert(S2._render(caller, callee, "acc", 1, 1, "pretty"))
-  local canon = assert(S2._render(caller, callee, "acc", 1, 1, "canonical"))
+  local pretty = assert(T.render(caller, callee, "acc", 1, 1, "pretty"))
+  local canon = assert(T.render(caller, callee, "acc", 1, 1, "canonical"))
   check(
-    "_render pretty == inline_call on a pretty-decided case",
-    pretty == (S2.inline_call(caller, callee, "acc", 1, 1, "correct")),
+    "render pretty == inline_call on a pretty-decided case",
+    pretty == (T.inline_call(caller, callee, "acc", 1, 1, "correct")),
     pretty
   )
-  check("_render canonical emits a statement expression", canon:find("({", 1, true) ~= nil, canon)
-  check("_render canonical differs from pretty", canon ~= pretty)
-  local _, err = S2._render(caller, callee, "acc", 1, 1, "bogus")
-  check("_render rejects unknown printer", err ~= nil and tostring(err):find("printer") ~= nil, tostring(err))
-
-  check(
-    "_rebase/_common_ws_prefix exported",
-    type(S2._rebase) == "function" and type(S2._common_ws_prefix) == "function"
-  )
+  check("render canonical emits a statement expression", canon:find("({", 1, true) ~= nil, canon)
+  check("render canonical differs from pretty", canon ~= pretty)
+  local _, err = T.render(caller, callee, "acc", 1, 1, "bogus")
+  check("render rejects unknown printer", err ~= nil and tostring(err):find("printer") ~= nil, tostring(err))
 end
 
 H.finish("IR")

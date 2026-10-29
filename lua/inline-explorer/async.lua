@@ -1,3 +1,6 @@
+-- Callbacks with a deadline, and the requests to language servers built on
+-- them: once_with_timeout, then cancel and request, which send a request,
+-- give up on it after a budget, and cancel it only while it is pending.
 local M = {}
 
 -- The first call to the returned `finish(...)` passes its arguments to `cb`,

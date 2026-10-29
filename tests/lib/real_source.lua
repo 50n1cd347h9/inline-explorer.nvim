@@ -494,7 +494,7 @@ function M.run(cfg)
           -- would report a transform as verified that gcc never compiled.
           dead_branch = dead_branch + 1
         else
-          local sok, new = pcall(S.inline_in_buffer, src0, call.row, call.col, defs[call.name], i, "correct")
+          local sok, new = pcall(S.inline_at, src0, call.row, call.col, defs[call.name], i, "correct")
           if sok and new and new ~= src0 then
             accepted = accepted + 1
             occurrence_of[call.name] = (occurrence_of[call.name] or 0) + 1
