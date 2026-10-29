@@ -16,10 +16,13 @@ local M = {}
 -- have several entries. A view is pushed when the window leaves it: right after
 -- goto_location(), _pos is the top entry, the view just left, not the one on
 -- screen. back() first pushes the view on screen; from then on _pos is the
--- entry on screen, and the entries above it are forward history.
+-- entry on screen, and the entries above it are forward history. _shown says
+-- which of the two _pos is: the buffer cannot, since a jump within a file
+-- leaves the window in the view it pushed.
 ---@type inline_explorer.TrailEntry[]
 M._stack = {}
 M._pos = 0
+M._shown = false
 -- The most entries; a module field so that tests can lower it.
 M._stack_max = 8
 
@@ -42,7 +45,7 @@ function M.clear()
     wipe_unless_shown(v)
   end
   local cur = vim.api.nvim_get_current_buf()
-  M._stack, M._pos = {}, 0
+  M._stack, M._pos, M._shown = {}, 0, false
   -- The stack no longer protects the view on screen: let it be wiped once the
   -- window leaves it.
   if view.is_view(cur) then
@@ -129,6 +132,7 @@ function M.goto_location(loc)
     view.open()
   end
   push_current()
+  M._shown = false
 
   local src_buf = vim.fn.bufadd(path)
   vim.fn.bufload(src_buf)
@@ -152,7 +156,7 @@ local function step(delta, edge_msg)
   end
   -- Save the cursor of the entry on screen, to restore it on return.
   local cur = vim.api.nvim_get_current_buf()
-  if M._stack[M._pos] and M._stack[M._pos].buf == cur then
+  if M._shown and M._stack[M._pos] and M._stack[M._pos].buf == cur then
     M._stack[M._pos].cursor = vim.api.nvim_win_get_cursor(0)
   end
   if not show(M._stack[target]) then
@@ -160,6 +164,7 @@ local function step(delta, edge_msg)
     return false
   end
   M._pos = target
+  M._shown = true
   return true
 end
 
@@ -167,8 +172,9 @@ end
 function M.back()
   -- So that forward() can return to the view on screen (see M._stack).
   local cur = vim.api.nvim_get_current_buf()
-  if M._stack[M._pos] == nil or M._stack[M._pos].buf ~= cur then
+  if not M._shown or M._stack[M._pos] == nil or M._stack[M._pos].buf ~= cur then
     push_current()
+    M._shown = true
   end
   return step(-1, "already at the start of the trail")
 end

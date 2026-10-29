@@ -85,7 +85,9 @@ Mechanism:
 - Callee labels (function-scoped) are suffixed `name__ieN`, keyed by a
   per-expansion id N, and so are its parameters and top-level locals
   (typedefs and enumerators included) whose name appears anywhere in the
-  caller's function, so repeated and nested inlining stays correct.
+  caller's function, so repeated and nested inlining stays correct. A rename
+  takes along only the uses the callee's own declarations bind: a read of a
+  global ahead of a local of the same name keeps the global's name.
 - Calls the analysis rejects (variadic functions, a callee that reads a name
   the caller's function declares too, which a rename cannot keep apart, a
   callee with an `#include` in its body or a `return` that does not parse as
