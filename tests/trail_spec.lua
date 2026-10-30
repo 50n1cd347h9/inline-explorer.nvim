@@ -234,4 +234,88 @@ do
   end
 end
 
+-- K in a view: the view has no server, so the hover is asked of the source
+-- buffer's, at the file's own place for a line the view kept from it, and at
+-- the name's definition for an expansion's line.
+do
+  trail.clear()
+  local fake_lsp = require("tests.lib.fake_lsp")
+  local hpath = dir .. "/hover.c"
+  H.writef(hpath, "int helper(void)\n{\n    return 1;\n}\n\nint main(void)\n{\n    return helper();\n}\n")
+  vim.cmd.edit(hpath)
+  local src = vim.api.nvim_get_current_buf()
+  local asked = {}
+  local cid = fake_lsp.start({
+    name = "hoversrv",
+    buf = src,
+    root_dir = dir,
+    capabilities = { hoverProvider = true, workspaceSymbolProvider = true },
+    handle = function(method, params, callback)
+      if method == "textDocument/hover" then
+        asked[#asked + 1] = params.position
+        callback(nil, { contents = { kind = "markdown", value = "int helper(void)" } })
+      elseif method == "workspace/symbol" then
+        callback(nil, {
+          {
+            name = "helper",
+            kind = 12,
+            location = {
+              uri = vim.uri_from_fname(hpath),
+              range = { start = { line = 0, character = 0 }, ["end"] = { line = 3, character = 1 } },
+            },
+          },
+        })
+      else
+        callback(nil, nil)
+      end
+    end,
+    skip = "hover checks (in-process LSP server unavailable)",
+  })
+  if cid then
+    local hover = require("inline-explorer.hover")
+    local v = view.open()
+    -- Waits for the float the answer opens, and closes it.
+    local function floats()
+      local found = {}
+      vim.wait(2000, function()
+        for _, w in ipairs(vim.api.nvim_list_wins()) do
+          if vim.api.nvim_win_get_config(w).relative ~= "" then
+            found[#found + 1] = w
+          end
+        end
+        return #found > 0
+      end, 10)
+      for _, w in ipairs(found) do
+        vim.api.nvim_win_close(w, true)
+      end
+      return #found
+    end
+    vim.api.nvim_win_set_cursor(0, { 8, 11 })
+    hover.hover()
+    vim.wait(2000, function()
+      return #asked == 1
+    end, 10)
+    check(
+      "hover: a file's own line asks at its place",
+      asked[1] and asked[1].line == 7 and asked[1].character == 11,
+      asked
+    )
+    check("hover: the answer is shown in a float", floats() == 1)
+    view.set_lines(v, 0, 0, { "    helper();" })
+    vim.api.nvim_win_set_cursor(0, { 1, 5 })
+    hover.hover()
+    vim.wait(2000, function()
+      return #asked == 2
+    end, 10)
+    check(
+      "hover: an expansion's line asks at the definition",
+      asked[2] and asked[2].line == 0 and asked[2].character == 4,
+      asked
+    )
+    check("hover: that answer is shown too", floats() == 1)
+    view.close()
+    vim.lsp.stop_client(cid, true)
+  end
+end
+
 H.finish("TRAIL")

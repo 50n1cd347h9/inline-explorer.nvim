@@ -3,6 +3,7 @@
 local config = require("inline-explorer.config")
 local expander = require("inline-explorer.expander")
 local history = require("inline-explorer.history")
+local hover = require("inline-explorer.hover")
 local inliner = require("inline-explorer.inliner")
 local nav = require("inline-explorer.nav")
 local pick = require("inline-explorer.pick")
@@ -35,6 +36,7 @@ local function set_view_keymaps(buf)
       end,
       desc = "go to the definition, in a view of its file",
     },
+    { key = km.hover, fn = hover.hover, desc = "the language server's hover" },
     { key = km.trail_back, fn = trail.back, desc = "back along the trail" },
     { key = km.trail_forward, fn = trail.forward, desc = "forward along the trail" },
   }
